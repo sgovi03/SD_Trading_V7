@@ -1,0 +1,3 @@
+Baseline codebase before Volume and OI Implementation
+
+This label marks the current state of the codebase as the baseline before any changes related to Volume and Open Interest (OI) implementation. All files and logic as of February 17, 2026, are considered the reference point for future development.

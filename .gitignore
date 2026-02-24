@@ -1,0 +1,116 @@
+# ============================================================
+# SD Trading System V4.0 - Git Ignore File
+# ============================================================
+
+# Build directories
+build/
+bin/
+obj/
+out/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+x64/
+x86/
+Win32/
+.vs/
+
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# IDE specific files
+.vscode/
+.idea/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Results and logs
+results/
+logs/
+*.log
+*.csv
+*.txt.bak
+backtest_results.txt
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# Test outputs
+test_results/
+coverage/
+
+# Documentation build
+docs/_build/
+docs/.buildinfo
+
+# Python (if any scripts)
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+
+# Data files (comment out if you want to commit data)
+# data/*.csv
+# data/*.txt
+
+# Config backups (keep originals)
+*.config.bak
+*_backup.txt
+
+# Dependencies (if managed externally)
+third_party/
+external/
+lib/
+
+# Package files
+*.zip
+*.tar.gz
+*.rar
+
+# Keep these files
+!.gitignore
+!README.md
+!LICENSE
+!CMakeLists.txt

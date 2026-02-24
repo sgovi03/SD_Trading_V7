@@ -1,0 +1,13 @@
+# Random search + walk-forward (3 splits)
+python scripts\optimize_two_stage_thresholds.py --trials 30 --seed 1337 --walk-forward-splits 3
+
+# Bayesian optimization (requires Optuna)
+pip install optuna
+python scripts\optimize_two_stage_thresholds.py --optimizer bayes --trials 50 --walk-forward-splits 3
+
+
+python scripts\apply_best_two_stage.py --best results\optimizer_runs\two_stage_YYYYMMDD_HHMMSS\best.json
+
+results:
+
+results/optimizer_runs/two_stage_YYYYMMDD_HHMMSS/

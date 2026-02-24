@@ -1,0 +1,1 @@
+python scripts/build_volume_baseline.py --input data/live_data_1_min.csv --lookback 0 --resolution 1 --output data/baselines/volume_baseline_1min.json

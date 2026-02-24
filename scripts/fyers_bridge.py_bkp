@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+Fyers-to-C++ Bridge Service
+WITH AUTOMATIC TOKEN REFRESH
+Streams live data from Fyers to C++ SD Engine
+"""
+
+from system_config import load_config
+import os
+import json
+import time
+import csv
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+import signal
+import sys
+
+# Import auto-refresh helper
+import fyers_helper
+
+try:
+    from fyers_apiv3 import fyersModel
+    import requests
+except ImportError:
+    print("❌ Missing dependencies. Install with:")
+    print("   pip3 install fyers-apiv3 requests")
+    sys.exit(1)
+
+# ============================================================
+# LOAD CONFIGURATION
+# ============================================================
+
+config = load_config()
+logger = config.setup_logging('python')
+
+# Get all paths from config
+CSV_FILE = config.get_path('live_data_csv')
+STATUS_FILE = config.get_path('bridge_status')
+TOKEN_FILE = config.get_path('fyers_token')
+
+# Get Fyers configuration
+CLIENT_ID = config.get_value('fyers', 'client_id')
+SECRET_KEY = config.get_value('fyers', 'secret_key')
+API_BASE = config.get_fyers_endpoint('api_base')
+
+# Get bridge configuration
+BRIDGE_CONFIG = config.get_bridge_config()
+UPDATE_INTERVAL = BRIDGE_CONFIG['update_interval_seconds']
+MAX_ROWS = BRIDGE_CONFIG['max_rows']
+HISTORICAL_DAYS = BRIDGE_CONFIG['historical_lookback_days']
+
+# Get trading configuration
+SYMBOL = config.get_value('trading', 'symbol')
+RESOLUTION = config.get_value('trading', 'resolution')
+
+logger.info("=" * 60)
+logger.info("FYERS-TO-C++ BRIDGE SERVICE (WITH AUTO-REFRESH)")
+logger.info("=" * 60)
+logger.info(f"CSV Output: {CSV_FILE}")
+logger.info(f"Symbol: {SYMBOL}")
+logger.info(f"Resolution: {RESOLUTION} min")
+logger.info(f"Update Interval: {UPDATE_INTERVAL}s")
+logger.info(f"API Endpoint: {API_BASE}")
+logger.info("=" * 60)
+
+
+# ============================================================
+# FYERS CLIENT WITH AUTO-REFRESH
+# ============================================================
+
+class SimpleFyersClient:
+    """Fyers client with automatic token refresh"""
+    
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+        self.access_token = None
+        self.fyers = None
+        self.last_token_check = None
+        self.token_check_interval = 3600  # Check every hour
+    
+    def ensure_valid_token(self) -> bool:
+        """Ensure we have a valid access token (auto-refresh if needed)"""
+        # Check token validity every hour
+        now = datetime.now()
+        if (self.last_token_check is None or 
+            (now - self.last_token_check).total_seconds() > self.token_check_interval):
+            
+            logger.info("🔍 Checking token validity...")
+            
+            # Get valid token (auto-refreshes if needed)
+            self.access_token = fyers_helper.get_valid_access_token()
+            
+            if not self.access_token:
+                logger.error("❌ Failed to get valid access token!")
+                logger.error("   Please run: python fyers_helper.py")
+                logger.error("   And complete initial token generation")
+                return False
+            
+            # Reinitialize Fyers client
+            self.fyers = fyersModel.FyersModel(
+                client_id=self.client_id,
+                is_async=False,
+                token=self.access_token,
+                log_path=""
+            )
+            
+            self.last_token_check = now
+            logger.info("✅ Token refreshed successfully")
+        
+        return True
+    
+    def validate_token(self) -> bool:
+        """Validate access token"""
+        if not self.ensure_valid_token():
+            return False
+        
+        try:
+            response = self.fyers.get_profile()
+            if response.get('s') == 'ok':
+                logger.info(f"✅ Token validated - User: {response['data']['name']}")
+                return True
+            else:
+                logger.error(f"❌ Token validation failed: {response}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Token validation error: {e}")
+            return False
+    
+    def get_historical_data(
+        self,
+        symbol: str,
+        resolution: str,
+        from_date: str,
+        to_date: str
+    ) -> (Optional[List], int):
+        """Fetch historical data with auto-token-refresh. Returns (candles, error_code)."""
+        if not self.ensure_valid_token():
+            return None, -1
+        
+        try:
+            data = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "date_format": "1",  # Unix timestamp
+                "range_from": from_date,
+                "range_to": to_date,
+                "cont_flag": "1"
+            }
+            
+            response = self.fyers.history(data)
+            
+            if response.get('s') == 'ok':
+                candles = response.get('candles', [])
+                logger.debug(f"Fetched {len(candles)} candles from {from_date} to {to_date}")
+                return candles, 0
+            else:
+                logger.warning(f"Historical data fetch failed: {response}")
+                
+                # Check if token issue
+                if response.get('code') in [-5, 401, 403]:
+                    logger.warning("Token might be invalid, forcing refresh...")
+                    self.last_token_check = None  # Force refresh on next call
+                
+                return None, response.get('code', -1)
+                
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return None, -1
+
+
+# ============================================================
+# BRIDGE SERVICE
+# ============================================================
+
+class FyersBridgeService:
+    """Bridge service with automatic token management"""
+    
+    def __init__(self):
+        self.client = None
+        self.running = False
+        self.last_update = None
+        self.last_written_ts: Optional[int] = None
+
+    def load_last_timestamp(self) -> Optional[int]:
+        """Get last written Unix timestamp from CSV (if present)."""
+        if not CSV_FILE.exists():
+            return None
+        try:
+            last_line = None
+            with open(CSV_FILE, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        last_line = line
+            if not last_line:
+                return None
+            parts = last_line.split(',')
+            if not parts:
+                return None
+            return int(parts[0])
+        except Exception as e:
+            logger.warning(f"Could not read last timestamp from CSV: {e}")
+            return None
+    
+    def initialize(self) -> bool:
+        """Initialize with auto-refreshing token"""
+        logger.info("🔄 Initializing Fyers client with auto-refresh...")
+        
+        # Create client
+        self.client = SimpleFyersClient(CLIENT_ID)
+        
+        # Validate token (will auto-refresh if needed)
+        if self.client.validate_token():
+            logger.info("✅ Fyers client initialized successfully")
+            return True
+        else:
+            logger.error("❌ Failed to initialize Fyers client")
+            logger.error("\nPLEASE RUN:")
+            logger.error("  python fyers_helper.py")
+            logger.error("\nAnd select option 1 (Initial Token Generation)")
+            return False
+    
+    def save_to_csv(self, candles: List, symbol: str):
+        """Save candles to CSV file"""
+        try:
+            CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            # Check if the file already exists
+            file_exists = CSV_FILE.exists()
+
+            with open(CSV_FILE, 'a', newline='') as f:  # Open in append mode
+                writer = csv.writer(f)
+
+                # Write header only if the file is new
+                if not file_exists:
+                    writer.writerow([
+                        'Timestamp', 'DateTime', 'Symbol',
+                        'Open', 'High', 'Low', 'Close', 'Volume', 'OI',
+                        'OI_Fresh', 'OI_Age_Seconds'
+                    ])
+
+                # Data rows
+                for candle in candles:
+                    timestamp = int(candle[0])
+                    dt_str = datetime.fromtimestamp(candle[0]).strftime('%Y-%m-%d %H:%M:%S')
+
+                    writer.writerow([
+                        timestamp,
+                        dt_str,
+                        symbol,
+                        candle[1],  # Open
+                        candle[2],  # High
+                        candle[3],  # Low
+                        candle[4],  # Close
+                        candle[5] if len(candle) > 5 else 0,  # Volume
+                        candle[6] if len(candle) > 6 else 0,  # OI (Open Interest from Fyers)
+                        1,  # OI_Fresh (1 = fresh/just received, 0 = stale)
+                        0   # OI_Age_Seconds (0 = just received)
+                    ])
+
+            logger.debug(f"Saved {len(candles)} candles to {CSV_FILE}")
+
+        except Exception as e:
+            logger.error(f"Error saving to CSV: {e}")
+    
+    def update_status(self, status: Dict):
+        """Update status file"""
+        try:
+            STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            
+            status['timestamp'] = datetime.now().isoformat()
+            
+            with open(STATUS_FILE, 'w') as f:
+                json.dump(status, f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Error updating status: {e}")
+    
+    def start_file_bridge(self):
+        """File-based bridge with auto-refresh"""
+        logger.info(f"📄 Starting file bridge with auto-refresh")
+        logger.info(f"   CSV Output: {CSV_FILE}")
+        logger.info(f"   Update interval: {UPDATE_INTERVAL}s")
+        logger.info(f"   Symbol: {SYMBOL}")
+        logger.info(f"   Resolution: {RESOLUTION} min")
+        logger.info(f"   🔄 Token auto-refresh: ENABLED (checks hourly)")
+        
+        self.running = True
+        
+        # Initial status
+        self.update_status({
+            'status': 'starting',
+            'symbol': SYMBOL,
+            'resolution': RESOLUTION,
+            'auto_refresh': True
+        })
+        
+        # Load last written timestamp (if CSV already exists)
+        self.last_written_ts = self.load_last_timestamp()
+        if self.last_written_ts:
+            logger.info(f"Resuming from last written bar: {self.last_written_ts}")
+        
+        
+        while self.running:
+            try:
+                # Fetch latest data (token will auto-refresh if needed)
+                now_dt = datetime.now()
+                if self.last_written_ts:
+                    # Start right after the last written bar to backfill gaps
+                    start_dt = datetime.fromtimestamp(self.last_written_ts) + timedelta(minutes=int(RESOLUTION))
+                else:
+                    # If no history, pull full configured lookback window
+                    start_dt = now_dt - timedelta(days=HISTORICAL_DAYS)
+
+                # Never request a range ending before it starts
+                if start_dt > now_dt:
+                    start_dt = now_dt - timedelta(days=1)
+
+                from_date = start_dt.strftime('%Y-%m-%d')
+                to_date = now_dt.strftime('%Y-%m-%d')
+                
+                logger.debug(f"Fetching data from {from_date} to {to_date}...")
+                
+                candles, err_code = self.client.get_historical_data(
+                    SYMBOL, RESOLUTION, from_date, to_date
+                )
+                
+                if err_code == -300:
+                    logger.error(f"❌ Invalid symbol provided: {SYMBOL}")
+                    self.update_status({
+                        'status': 'error',
+                        'message': f'invalid symbol {SYMBOL}',
+                        'symbol': SYMBOL,
+                        'auto_refresh': True
+                    })
+                    break
+
+                if candles and len(candles) > 0:
+                    # Keep only latest MAX_ROWS (after trimming duplication logic below)
+                    if len(candles) > MAX_ROWS:
+                        candles = candles[-MAX_ROWS:]
+
+                    # Deduplicate based on last_written_ts
+                    if self.last_written_ts is not None:
+                        new_candles = [c for c in candles if int(c[0]) > self.last_written_ts]
+                    else:
+                        new_candles = candles
+
+                    if not new_candles:
+                        logger.info(f"No new bars. Latest cached bar ts={self.last_written_ts}")
+                        self.update_status({
+                            'status': 'running',
+                            'last_update': datetime.now().isoformat(),
+                            'candles_count': 0,
+                            'symbol': SYMBOL,
+                            'latest_timestamp': self.last_written_ts if self.last_written_ts else 0,
+                            'auto_refresh': True
+                        })
+                    else:
+                        # Keep only latest MAX_ROWS for write
+                        if len(new_candles) > MAX_ROWS:
+                            new_candles = new_candles[-MAX_ROWS:]
+
+                        self.save_to_csv(new_candles, SYMBOL)
+                        self.last_update = datetime.now()
+                        self.last_written_ts = int(new_candles[-1][0])
+                        
+                        logger.info(
+                            f"✅ Updated CSV with {len(new_candles)} candles "
+                            f"(Latest: {datetime.fromtimestamp(new_candles[-1][0])})"
+                        )
+                        
+                        # Update status
+                        self.update_status({
+                            'status': 'running',
+                            'last_update': self.last_update.isoformat(),
+                            'candles_count': len(new_candles),
+                            'symbol': SYMBOL,
+                            'latest_timestamp': self.last_written_ts,
+                            'auto_refresh': True
+                        })
+                else:
+                    logger.warning("No data received, retrying...")
+                    
+                    self.update_status({
+                        'status': 'warning',
+                        'message': 'No data received',
+                        'symbol': SYMBOL,
+                        'auto_refresh': True
+                    })
+                
+                # Wait for next update
+                time.sleep(UPDATE_INTERVAL)
+                
+            except KeyboardInterrupt:
+                logger.info("Received shutdown signal")
+                self.running = False
+                break
+            except Exception as e:
+                logger.error(f"Error in bridge loop: {e}", exc_info=True)
+                
+                self.update_status({
+                    'status': 'error',
+                    'message': str(e),
+                    'symbol': SYMBOL,
+                    'auto_refresh': True
+                })
+                
+                time.sleep(UPDATE_INTERVAL)
+        
+        logger.info("🛑 File bridge stopped")
+        
+        self.update_status({
+            'status': 'stopped',
+            'symbol': SYMBOL,
+            'auto_refresh': True
+        })
+    
+    def start(self):
+        """Start the bridge service"""
+        logger.info("🚀 Starting Fyers Bridge Service with Auto-Refresh")
+        self.start_file_bridge()
+    
+    def stop(self):
+        """Stop the bridge service"""
+        logger.info("Stopping bridge service...")
+        self.running = False
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    """Main entry point"""
+    
+    # Initialize bridge
+    bridge = FyersBridgeService()
+    
+    # Initialize with auto-refresh
+    if not bridge.initialize():
+        logger.error("Failed to initialize bridge")
+        logger.error("\n" + "=" * 60)
+        logger.error("SETUP REQUIRED:")
+        logger.error("=" * 60)
+        logger.error("\n1. Run: python fyers_helper.py")
+        logger.error("2. Select option 1 (Initial Token Generation)")
+        logger.error("3. Complete the auth flow")
+        logger.error("4. This will give you 15-day refresh token")
+        logger.error("5. Then restart this bridge - it will auto-refresh!")
+        logger.error("\n" + "=" * 60)
+        sys.exit(1)
+    
+    # Handle signals
+    def signal_handler(sig, frame):
+        logger.info("\n⚠️ Received shutdown signal")
+        bridge.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start bridge
+    try:
+        bridge.start()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

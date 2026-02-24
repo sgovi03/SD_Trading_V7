@@ -1,0 +1,172 @@
+{
+  "_comment": "SD Engine V4.0 - System Configuration",
+  "_version": "1.0",
+
+  "system": {
+    "root_directory": "D:/SD_System/SD_Volume_OI/SD_Trading_V4",
+    "environment": "PRODUCTION",
+    "log_level": "ERROR"
+  },
+  
+  "directories": {
+    "conf": "conf",
+    "data": "data",
+    "logs": "logs",
+    "scripts": "scripts",
+    "backtest_results": "results/backtest",
+    "live_trade_logs": "results/live_trades"
+  },
+  
+  "files": {
+    "strategy_config": "conf/phase_6_config_v0.1_Tested_in_1_Mins.txt",
+    "fyers_token": "scripts/fyers_token.txt",
+    "fyers_config": "scripts/fyers_config.json",
+    "live_data_csv": "data/LiveTest/live_data-DRYRUN.csv",
+    "historical_data_cache": "data/cache/historical",
+    "bridge_status": "data/bridge_status.json",
+    "python_log": "logs/fyers_bridge.log",
+    "cpp_log": "logs/sd_engine.log",
+    "trade_log": "results/live_trades/trades.csv"
+  },
+
+  "fyers": {
+    "client_id": "CCJOKAUTF6-100",
+    "secret_key": "A2J9ADLH9N",
+    "redirect_uri": "http://127.0.0.1:5000/callback",
+    "environment": "production",
+	"api_base" : "https://api-t1.fyers.in",
+    "endpoints": {
+      "test": {
+        "api_base": "https://api-t1.fyers.in",
+        "ws_base": "wss://api-t1.fyers.in/socket/v3/dataSock"
+      },
+      "production": {
+        "api_base": "https://api.fyers.in",
+        "ws_base": "wss://api.fyers.in/socket/v3/dataSock"
+      }
+    }
+  },
+  
+  "trading": {
+    "symbol": "NSE:NIFTY26FEBFUT",
+    "resolution": "1",
+    "mode": "paper",
+    "starting_capital": 300000,
+    "lot_size": 65
+  },
+  
+  "bridge": {
+    "mode": "file",
+    "update_interval_seconds": 5,
+    "max_rows": 10000,
+    "historical_lookback_days": 30
+  },
+  
+  "strategy": {
+    "lookback_bars": 100,
+    "min_zone_strength": 60.0,
+    "max_concurrent_trades": 10,
+    "risk_per_trade_pct": 1.0
+  },
+  
+  "logging": {
+    "python": {
+      "level": "INFO",
+      "file": "logs/fyers_bridge.log",
+      "max_size_mb": 10,
+      "backup_count": 5
+    },
+    "cpp": {
+      "level": "INFO",
+      "file": "logs/sd_engine.log",
+      "max_size_mb": 10
+    }
+  },
+
+  "live_zone_filtering": {
+    "enabled": false,
+    "range_pct": 5.0,
+    "refresh_interval_minutes": 30
+  },
+
+  "zone_bootstrap": {
+    "enabled": true,
+    "ttl_hours": 24,
+    "refresh_time": "08:50",
+    "force_regenerate": true
+  },
+
+  "entry_filters": {
+    "max_zone_distance_atr": 1000,
+    "comments": "Multiplier for ATR to determine max zone distance from current price; increase to allow more distant zones"
+  },
+
+  "zone_detection": {
+    "live_zone_detection_interval_bars": 10,
+    "comments": "Run zone detection every N bars to maintain fresh zone pipeline (0 = bootstrap only). Default: 20-30"
+  }, 
+  
+  "volume_oi": {
+    "_comment": "SD Engine V6.0 - Volume & OI Integration",
+    "volume_config": {
+      "enable_volume_entry_filters": true,
+      "enable_volume_exit_signals": true,
+      "min_entry_volume_ratio": 0.8,
+      "institutional_volume_threshold": 2.0,
+      "extreme_volume_threshold": 3.0,
+      "volume_lookback_period": 20,
+      "volume_normalization_method": "time_of_day",
+      "volume_baseline_file": "data/baselines/volume_baseline_1min.json"
+    },
+    "oi_config": {
+      "enable_oi_entry_filters": true,
+      "enable_oi_exit_signals": true,
+      "enable_market_phase_detection": true,
+      "min_oi_change_threshold": 0.01,
+      "high_oi_buildup_threshold": 0.05,
+      "oi_lookback_period": 10,
+      "price_oi_correlation_window": 10
+    },
+    "scoring_weights": {
+      "base_score_weight": 0.50,
+      "volume_score_weight": 0.30,
+      "oi_score_weight": 0.20,
+      "institutional_volume_bonus": 30.0,
+      "oi_alignment_bonus": 25.0,
+      "low_volume_retest_bonus": 20.0
+    },
+    "expiry_day_handling": {
+      "trade_on_expiry_day": true,
+      "expiry_day_disable_oi_filters": true,
+      "expiry_day_position_multiplier": 0.5,
+      "expiry_day_min_zone_score": 75.0
+    },
+    "position_sizing": {
+      "low_volume_size_multiplier": 0.5,
+      "high_institutional_size_mult": 1.5,
+      "max_lot_size": 650
+    },
+    "volume_exit_signals": {
+      "volume_climax_exit_threshold": 3.0,
+      "volume_drying_up_threshold": 0.5,
+      "volume_drying_up_bar_count": 3,
+      "enable_volume_divergence_exit": true
+    },
+    "oi_exit_signals": {
+      "oi_unwinding_threshold": -0.01,
+      "oi_reversal_threshold": 0.02,
+      "oi_stagnation_threshold": 0.005,
+      "oi_stagnation_bar_count": 10
+    }
+  },
+  
+  "order_submitter": {
+    "enabled": true,              
+    "base_url": "http://localhost:8080",
+    "long_strategy_number": 13,
+    "short_strategy_number": 14,
+    "timeout_seconds": 10
+	}
+  
+
+}

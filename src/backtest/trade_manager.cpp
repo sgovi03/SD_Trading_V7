@@ -1,0 +1,895 @@
+#ifdef _WIN32
+#define NOMINMAX  // Prevent Windows min/max macros from conflicting with std::min/max
+#endif
+
+#include "trade_manager.h"
+#include "../live/broker_interface.h"
+#include "../utils/logger.h"
+#include "../analysis/market_analyzer.h"
+#include "../utils/volume_baseline.h"
+#include "../scoring/oi_scorer.h"
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+
+#ifdef _WIN32
+#include <windows.h>  // For Beep function
+#undef ERROR  // Remove Windows ERROR macro to avoid conflicts with LOG_ERROR
+#endif
+
+namespace SDTrading {
+namespace Backtest {
+
+using namespace Utils;
+using namespace Live;
+
+
+/**
+ * @brief Calculate potential loss for a trade
+ * ⭐ FIX #1: Max Loss Cap Enforcement
+ * @param entry_price Entry price
+ * @param stop_loss Stop loss price
+ * @param position_size Number of contracts
+ * @param lot_size Contract lot size
+ * @return Potential loss amount
+ */
+double calculate_potential_loss(double entry_price, 
+                                double stop_loss, 
+                                int position_size, 
+                                int lot_size) {
+    double stop_distance = std::abs(entry_price - stop_loss);
+    return stop_distance * position_size * lot_size;
+}
+
+// ============================================================
+// SOUND ALERT FUNCTIONS (LIVE MODE ONLY)
+// ============================================================
+
+/**
+ * Play sound alert for trade entry (only in LIVE mode)
+ */
+void play_entry_alert() {
+#ifdef _WIN32
+    // Play a rising tone sequence for entry
+    Beep(800, 150);   // First beep
+    Beep(1000, 150);  // Second beep (higher)
+    Beep(1200, 200);  // Third beep (even higher, longer)
+#endif
+}
+
+/**
+ * Play sound alert for trade exit (only in LIVE mode)
+ */
+void play_exit_alert() {
+#ifdef _WIN32
+    // Play a descending tone sequence for exit
+    Beep(1200, 150);  // First beep
+    Beep(1000, 150);  // Second beep (lower)
+    Beep(800, 200);   // Third beep (even lower, longer)
+#endif
+}
+
+// BACKTEST Constructor
+TradeManager::TradeManager(const Config& cfg, double start_cap)
+    : config(cfg), 
+      starting_capital(start_cap),  // ⭐ ADDED: Store starting capital
+      current_capital(start_cap),
+      in_position(false),
+      mode(ExecutionMode::BACKTEST),
+      broker(nullptr),
+      volume_baseline_(nullptr),
+      oi_scorer_(nullptr) {
+    LOG_INFO("TradeManager initialized in BACKTEST mode");
+}
+
+// LIVE Constructor
+TradeManager::TradeManager(const Config& cfg, 
+                          double start_cap,
+                          BrokerInterface* broker_interface)
+    : config(cfg),
+      starting_capital(start_cap),  // ⭐ ADDED: Store starting capital
+      current_capital(start_cap),
+      in_position(false),
+      mode(ExecutionMode::LIVE),
+      broker(broker_interface),
+      volume_baseline_(nullptr),
+      oi_scorer_(nullptr) {
+    LOG_INFO("TradeManager initialized in LIVE mode");
+}
+
+int TradeManager::calculate_position_size(double entry_price, double stop_loss) const {
+    // ⭐ CRITICAL FIX: Use starting_capital instead of current_capital
+    // This prevents position size explosion from compounding
+    // Safe for live trading - positions stay constant regardless of wins/losses
+    double risk_amount = starting_capital * (config.risk_per_trade_pct / 100.0);
+    
+    // Stop loss distance
+    double stop_distance = std::abs(entry_price - stop_loss);
+    
+    if (stop_distance < 0.01) {
+        LOG_WARN("Stop distance too small");
+        return 0;
+    }
+    
+    // Calculate position size
+    // Risk = Position Size * Lot Size * Stop Distance
+    int position_size = static_cast<int>(risk_amount / (config.lot_size * stop_distance));
+    
+    // ⭐ SAFETY CAP: Prevent excessive position sizes
+    // Hard limit at 2 contracts for risk control
+    const int MAX_POSITION_SIZE = 2;
+    position_size = std::min(position_size, MAX_POSITION_SIZE);
+    
+    // Minimum 1 lot
+    return std::max(1, position_size);
+}
+
+void TradeManager::calculate_pnl(Trade& trade) const {
+    double pnl_per_unit = 0.0;
+    
+    if (trade.direction == "LONG") {
+        pnl_per_unit = trade.exit_price - trade.entry_price;
+    } else {
+        pnl_per_unit = trade.entry_price - trade.exit_price;
+    }
+    
+    // Total P&L
+    trade.pnl = pnl_per_unit * trade.position_size * config.lot_size;
+    
+    // Subtract commissions
+    trade.pnl -= (2 * config.commission_per_trade);  // Entry + Exit
+    
+    // P&L percentage
+    double position_value = trade.entry_price * trade.position_size * config.lot_size;
+    trade.pnl_pct = (trade.pnl / position_value) * 100.0;
+    
+    // Return percentage
+    trade.return_pct = (trade.pnl / current_capital) * 100.0;
+    
+    // Risk amount
+    double stop_distance = std::abs(trade.entry_price - trade.stop_loss);
+    trade.risk_amount = stop_distance * trade.position_size * config.lot_size;
+    
+    // Reward amount
+    double target_distance = std::abs(trade.take_profit - trade.entry_price);
+    trade.reward_amount = target_distance * trade.position_size * config.lot_size;
+    
+    // Actual R:R
+    if (trade.risk_amount > 0) {
+        trade.actual_rr = trade.pnl / trade.risk_amount;
+    }
+}
+
+double TradeManager::execute_entry(const std::string& symbol,
+                                   const std::string& direction,
+                                   int quantity,
+                                   double price) {
+    if (mode == ExecutionMode::BACKTEST) {
+        // Simulated execution
+        LOG_INFO("SIMULATED: Entry " + direction + " " + std::to_string(quantity) + 
+                " @ " + std::to_string(price));
+        return price;  // Perfect fill in backtest
+    }
+
+    if (!broker) {
+        LOG_ERROR("Broker not available for live execution");
+        return 0.0;
+    }
+
+    OrderResponse response = broker->place_market_order(symbol, direction, quantity);
+
+    if (response.status != OrderStatus::FILLED) {
+        LOG_ERROR("Order failed: " + response.message);
+        return 0.0;
+    }
+
+    LOG_INFO("LIVE: Order filled @ " + std::to_string(response.filled_price));
+    return response.filled_price;
+}
+
+double TradeManager::execute_exit(const std::string& symbol,
+                                  const std::string& direction,
+                                  int quantity,
+                                  double price) {
+    if (mode == ExecutionMode::BACKTEST) {
+        // Simulated execution
+        LOG_INFO("SIMULATED: Exit " + direction + " " + std::to_string(quantity) + 
+                " @ " + std::to_string(price));
+        return price;  // Perfect fill in backtest
+    }
+
+    if (!broker) {
+        LOG_ERROR("Broker not available for live execution");
+        return 0.0;
+    }
+
+    OrderResponse response = broker->place_market_order(symbol, direction, quantity);
+
+    if (response.status != OrderStatus::FILLED) {
+        LOG_ERROR("Exit order failed: " + response.message);
+        return 0.0;
+    }
+
+    LOG_INFO("LIVE: Position closed @ " + std::to_string(response.filled_price));
+    return response.filled_price;
+}
+
+bool TradeManager::enter_trade(const EntryDecision& decision,
+                               const Zone& zone,
+                               const Bar& bar,
+                               int bar_index,
+                               MarketRegime regime,
+                               const std::string& symbol,
+                               const std::vector<Bar>* bars) {
+    // Console debug output
+    std::cout << "\n[TRADE_MGR] enter_trade() called\n";
+    std::cout << "  Already in position: " << (in_position ? "YES" : "NO") << "\n";
+    std::cout.flush();
+
+    // --- TIME FILTER: Block entries between configurable times ---
+    // Assumes bar.datetime is in format "YYYY-MM-DD HH:MM:SS"
+    if (config.enable_entry_time_block && !config.entry_block_start_time.empty() && !config.entry_block_end_time.empty() && bar.datetime.length() >= 16) {
+        std::string time_str = bar.datetime.substr(11, 5); // "HH:MM"
+        if (time_str >= config.entry_block_start_time && time_str < config.entry_block_end_time) {
+            LOG_WARN("Entry blocked by time filter: " + time_str + " (configurable: " + config.entry_block_start_time + "-" + config.entry_block_end_time + ")");
+            std::cout << "[TRADE_MGR] REJECTED: Entry blocked by time filter (" << time_str << ", config: " << config.entry_block_start_time << "-" << config.entry_block_end_time << ")\n";
+            std::cout.flush();
+            return false;
+        }
+    }
+
+    if (in_position) {
+        LOG_WARN("Already in position, cannot enter new trade");
+        std::cout << "[TRADE_MGR] REJECTED: Already in position\n";
+        std::cout.flush();
+        return false;
+    }
+
+    int position_size;
+    double sl_for_sizing = (decision.original_stop_loss != 0.0) ? decision.original_stop_loss : decision.stop_loss;
+    // V6.0: Use dynamic position sizing if available
+    if (decision.lot_size > 0) {
+        position_size = decision.lot_size;
+        LOG_INFO("✅ V6.0 dynamic position size: " + std::to_string(position_size) + " contracts");
+        std::cout << "  Position size (V6.0 dynamic): " << position_size << "\n";
+    } else {
+        // Fallback: Use V4.0 risk-based sizing
+        position_size = calculate_position_size(decision.entry_price, sl_for_sizing);
+        LOG_INFO("V4.0 risk-based position size: " + std::to_string(position_size) + " contracts");
+        std::cout << "  Position size (V4.0 risk): " << position_size << "\n";
+    }
+
+    if (position_size <= 0) {
+        LOG_WARN("Invalid position size calculated");
+        std::cout << "[TRADE_MGR] REJECTED: Invalid position size\n";
+        std::cout.flush();
+        return false;
+    }
+
+    // ⭐ FIX: Enforce max loss cap using THE ACTUAL STOP LOSS, not sizing SL
+    // In breakeven mode, decision.stop_loss is the REAL stop that will be hit
+    // We must check against this, not the "sl_for_sizing" used for position calculation
+    double potential_loss = calculate_potential_loss(
+        decision.entry_price,
+        decision.stop_loss,  // Use ACTUAL stop loss, not sl_for_sizing
+        position_size,
+        config.lot_size
+    );
+
+    std::cout << "  Max Loss Cap Check:\n";
+    std::cout << "    Entry: " << std::fixed << std::setprecision(2) << decision.entry_price << "\n";
+    std::cout << "    Stop Loss (sizing): " << sl_for_sizing << "\n";
+    std::cout << "    Stop Loss (actual): " << decision.stop_loss << "\n";
+    std::cout << "    Potential loss: " << potential_loss << "\n";
+    std::cout << "    Max loss cap: " << config.max_loss_per_trade << "\n";
+    std::cout << "    Position size: " << position_size << " lots\n";
+    std::cout << "    Lot size: " << config.lot_size << "\n";
+    std::cout.flush();
+
+    if (potential_loss > config.max_loss_per_trade) {
+        double actual_stop_distance = std::abs(decision.entry_price - decision.stop_loss);
+        int original_position_size = position_size;
+
+        if (actual_stop_distance > 0 && config.lot_size > 0) {
+            // ⭐ FIX: Correct formula
+            // max_loss = lots × lot_size × stop_distance
+            // → lots = floor(max_loss / (lot_size × stop_distance))
+            int affordable_lots = static_cast<int>(
+                config.max_loss_per_trade / (config.lot_size * actual_stop_distance));
+
+            if (affordable_lots < 1) {
+                // Even 1 lot exceeds the cap — reject outright
+                LOG_WARN("Trade REJECTED: 1 lot × " + std::to_string(config.lot_size) +
+                         " × " + std::to_string(actual_stop_distance) + "pts = ₹" +
+                         std::to_string(actual_stop_distance * config.lot_size) +
+                         " exceeds max_loss_per_trade ₹" +
+                         std::to_string(config.max_loss_per_trade));
+                std::cout << "[TRADE_MGR] REJECTED: 1 lot already exceeds max_loss_per_trade\n";
+                std::cout.flush();
+                return false;
+            }
+
+            position_size = affordable_lots;
+            std::cout << "  ⚠️  Position size adjusted: "
+                      << original_position_size << " → " << position_size
+                      << " lots (max_loss_per_trade cap)\n";
+            std::cout.flush();
+
+            potential_loss = calculate_potential_loss(
+                decision.entry_price, decision.stop_loss, position_size, config.lot_size);
+
+            LOG_INFO("Position size adjusted: " + std::to_string(original_position_size) +
+                     " → " + std::to_string(position_size) + " lots. New risk: ₹" +
+                     std::to_string(potential_loss));
+        }
+
+        // Final safety check — must always pass at this point
+        if (potential_loss > config.max_loss_per_trade) {
+            LOG_WARN("Trade REJECTED: Adjusted loss ₹" + std::to_string(potential_loss) +
+                     " still exceeds cap ₹" + std::to_string(config.max_loss_per_trade));
+            std::cout << "[TRADE_MGR] REJECTED: Loss cap exceeded after size adjustment\n";
+            return false;
+        }
+    } else {
+        std::cout << "  ✓ Within max loss cap\n";
+        std::cout.flush();
+    }
+    
+    // Determine direction
+    std::string direction = (zone.type == Core::ZoneType::DEMAND) ? "LONG" : "SHORT";
+    std::string order_direction = (direction == "LONG") ? "BUY" : "SELL";
+    
+    std::cout << "  Direction: " << direction << " (order: " << order_direction << ")\n";
+    std::cout << "  Calling execute_entry()...\n";
+    std::cout.flush();
+    
+    // Execute entry order (convert lots to units for broker)
+    int total_units = position_size * config.lot_size;
+    std::cout << "  Total units (lots x lot_size): " << total_units << "\n";
+    std::cout.flush();
+    // total_units = 1;
+    double fill_price = execute_entry(symbol, order_direction, total_units, decision.entry_price);
+    //fill_price = decision.entry_price; // HARDCODED TEMPORARY OVERRIDE FOR TESTING
+    std::cout << "  execute_entry() returned fill_price: " << fill_price << "\n";
+    std::cout.flush();
+    
+    if (fill_price == 0.0) {
+        LOG_ERROR("Failed to execute entry order");
+        std::cout << "[TRADE_MGR] REJECTED: execute_entry() failed (returned 0.0)\n";
+        std::cout.flush();
+        return false;
+    }
+
+    // ⭐ POST-FILL CAP CHECK: Revalidate risk using ACTUAL fill price
+    // Breakeven mode: decision.entry_price is the intended SL level, NOT the actual fill.
+    // Broker fills at market price (inside zone), making actual risk larger than pre-fill estimate.
+    // effective_stop_loss starts as decision.stop_loss; the tightening path below may override it.
+    double effective_stop_loss = decision.stop_loss;
+    {
+        double actual_fill_risk = std::abs(fill_price - decision.stop_loss) * position_size * config.lot_size;
+        std::cout << "  Post-fill Cap Recheck:\n";
+        std::cout << "    Fill price:     " << std::fixed << std::setprecision(2) << fill_price << "\n";
+        std::cout << "    Stop loss:      " << decision.stop_loss << "\n";
+        std::cout << "    Actual risk:    Rs" << actual_fill_risk << "\n";
+        std::cout << "    Max loss cap:   Rs" << config.max_loss_per_trade << "\n";
+        std::cout.flush();
+
+        if (actual_fill_risk > config.max_loss_per_trade) {
+            double fill_stop_dist = std::abs(fill_price - decision.stop_loss);
+            int affordable_at_fill = static_cast<int>(
+                config.max_loss_per_trade / (config.lot_size * fill_stop_dist));
+
+            if (affordable_at_fill < 1) {
+                // ⭐ FIX: SL TIGHTENING — save the trade instead of squaring off.
+                //
+                // Root cause: In breakeven entry mode, decision.entry_price is set to
+                // the zone's breakeven level (e.g. 25597.22), but the broker fills at
+                // the actual market price deeper inside the zone (e.g. 25511.50).
+                // The SL was correctly sized against the decision entry, but the real
+                // fill makes the actual SL distance slightly wider than the cap allows
+                // (e.g. 169 pts vs 153 pt cap — only 15 pts over).
+                //
+                // Old behaviour: square off → trade completely lost (Rs0 outcome).
+                // New behaviour: tighten SL to exactly max_allowed_distance from fill
+                //               → trade proceeds at capped risk (Rs10,000 max).
+                //
+                // For SHORT: adjusted_sl = fill + max_sl_distance  (SL stays above fill)
+                // For LONG:  adjusted_sl = fill - max_sl_distance  (SL stays below fill)
+                //
+                double max_sl_distance = config.max_loss_per_trade /
+                                         (config.lot_size * static_cast<double>(position_size));
+                double adjusted_sl = 0.0;
+
+                if (direction == "LONG") {
+                    adjusted_sl = fill_price - max_sl_distance;
+                } else {
+                    // SHORT: SL must remain above fill price
+                    adjusted_sl = fill_price + max_sl_distance;
+                }
+
+                // Safety guard: adjusted SL must be on the protective side,
+                // and the distance must be meaningful (> 5 pts minimum).
+                bool sl_valid = (direction == "LONG")
+                    ? (adjusted_sl < fill_price)
+                    : (adjusted_sl > fill_price);
+
+                if (!sl_valid || max_sl_distance < 5.0) {
+                    // SL distance is trivially small — genuinely unsafe to trade
+                    LOG_WARN("Post-fill REJECTED (SL too tight): fill=" + std::to_string(fill_price) +
+                             " max_sl_dist=" + std::to_string(max_sl_distance) +
+                             " pts — squaring off");
+                    std::cout << "[TRADE_MGR] POST-FILL REJECT: Max SL distance too small ("
+                              << std::fixed << std::setprecision(2) << max_sl_distance
+                              << " pts) — squaring off\n";
+                    std::cout.flush();
+                    std::string exit_dir = (direction == "LONG") ? "SELL" : "BUY";
+                    execute_exit(symbol, exit_dir, total_units, fill_price);
+                    return false;
+                }
+
+                // Accept the trade with tightened SL.
+                // decision is const — we cannot write to it. Instead we record the
+                // adjusted SL in effective_stop_loss (declared before this block)
+                // and use it when writing current_trade.stop_loss further below.
+                double old_sl       = decision.stop_loss;
+                double tightened_by = std::abs(fill_price - old_sl) - max_sl_distance;
+                double new_risk     = max_sl_distance * config.lot_size * position_size;
+                effective_stop_loss = adjusted_sl;   // ← overrides decision.stop_loss for trade record
+
+                LOG_WARN("Post-fill SL TIGHTENED (cap rescue): fill=" + std::to_string(fill_price) +
+                         " original_sl=" + std::to_string(old_sl) +
+                         " adjusted_sl=" + std::to_string(effective_stop_loss) +
+                         " tightened=" + std::to_string(tightened_by) + " pts" +
+                         " new_risk=Rs" + std::to_string(new_risk));
+                std::cout << "  ⚠️  Post-fill SL TIGHTENED (cap rescue):\n";
+                std::cout << "    Original SL:     " << std::fixed << std::setprecision(2) << old_sl
+                          << "  (dist " << std::abs(fill_price - old_sl) << " pts"
+                          << ", risk Rs" << actual_fill_risk << ")\n";
+                std::cout << "    Adjusted SL:     " << effective_stop_loss
+                          << "  (dist " << max_sl_distance << " pts"
+                          << ", risk Rs" << new_risk << ")\n";
+                std::cout << "    SL tightened by: " << tightened_by << " pts\n";
+                std::cout << "    Trade SAVED: proceeding with " << position_size << " lot(s) at capped risk\n";
+                std::cout.flush();
+            } else {
+                // affordable_at_fill >= 1: reduce position size to fit cap at actual fill
+                int old_size = position_size;
+                position_size = affordable_at_fill;
+                total_units = position_size * config.lot_size;
+
+                std::cout << "  ⚠️  Post-fill position size adjusted: "
+                          << old_size << " → " << position_size
+                          << " lots (actual fill risk cap)\n";
+                std::cout.flush();
+                LOG_WARN("Post-fill size adjusted: " + std::to_string(old_size) +
+                         " → " + std::to_string(position_size) + " lots");
+
+                // Note: In a real live trading scenario, you would also need to partially
+                // close the excess lots here via broker API. For paper trading this is
+                // handled by using the adjusted position_size in the trade record.
+            }
+        } else {
+            std::cout << "  ✓ Post-fill risk within cap\n";
+            std::cout.flush();
+        }
+    }
+    
+    // Initialize trade record
+    current_trade = Trade();
+    current_trade.trade_num = bar_index;
+    current_trade.direction = direction;
+    current_trade.entry_date = bar.datetime;
+    current_trade.entry_price = fill_price;
+    current_trade.stop_loss = effective_stop_loss;
+    current_trade.take_profit = decision.take_profit;
+    current_trade.position_size = position_size;
+    current_trade.zone_score = decision.score.total_score;
+    current_trade.entry_aggressiveness = decision.entry_location_pct;
+    current_trade.score_base_strength = decision.score.base_strength_score;
+    current_trade.score_elite_bonus = decision.score.elite_bonus_score;
+    current_trade.score_swing_position = decision.score.swing_position_score;
+    current_trade.score_regime_alignment = decision.score.regime_alignment_score;
+    current_trade.score_state_freshness = decision.score.state_freshness_score;
+    current_trade.score_rejection_confirmation = decision.score.rejection_confirmation_score;
+    current_trade.score_recommended_rr = decision.score.recommended_rr;
+    current_trade.score_rationale = decision.score.entry_rationale;
+    current_trade.regime = (regime != Core::MarketRegime::RANGING) ? "TRENDING" : "RANGING";
+    current_trade.zone_id = zone.zone_id;
+    current_trade.zone_formation_time = zone.formation_datetime;
+    current_trade.zone_distal = zone.distal_line;
+    current_trade.zone_proximal = zone.proximal_line;
+    // Populate volume and OI fields
+    current_trade.entry_volume = bar.volume;
+    current_trade.entry_oi = bar.oi;
+    current_trade.entry_volume_ratio = bar.norm_volume_ratio;
+    // --- Entry bar volume metrics from EntryDecision ---
+    current_trade.entry_pullback_vol_ratio = decision.entry_pullback_vol_ratio;
+    current_trade.entry_volume_score = decision.entry_volume_score;
+    current_trade.entry_volume_pattern = decision.entry_volume_pattern;
+    current_trade.entry_position_lots = decision.lot_size;
+    current_trade.position_size_reason = ""; // TODO: assign if available
+    current_trade.zone_volume_ratio = zone.volume_profile.volume_ratio;
+    current_trade.zone_departure_volume_ratio = zone.volume_profile.departure_volume_ratio;
+    current_trade.zone_peak_volume = zone.volume_profile.peak_volume;
+    current_trade.zone_departure_peak_volume = zone.volume_profile.departure_peak_volume;
+    current_trade.zone_touch_volumes = zone.volume_profile.touch_volumes;
+    current_trade.zone_volume_rising_on_retests = zone.volume_profile.volume_rising_on_retests;
+    current_trade.zone_oi_phase = SDTrading::Core::market_phase_to_string(zone.oi_profile.market_phase);
+    current_trade.zone_oi_score = zone.oi_profile.oi_score;
+    current_trade.zone_volume_score = zone.volume_profile.volume_score;
+        current_trade.zone_is_initiative = zone.volume_profile.is_initiative;
+        current_trade.zone_has_volume_climax = zone.volume_profile.has_volume_climax;
+        current_trade.zone_institutional_index = zone.institutional_index;
+    // ⭐ Initialize trailing stop state
+    current_trade.original_stop_loss = decision.stop_loss;  // Save original SL for R calculation
+    current_trade.highest_price = fill_price;                // Initialize to entry price
+    current_trade.lowest_price = fill_price;                 // Initialize to entry price
+    current_trade.trailing_activated = false;
+    current_trade.current_trail_stop = 0.0;
+    current_trade.bars_in_trade = 0;
+    // ⭐ Calculate Technical Indicators at Entry
+    if (bars != nullptr && !bars->empty() && bar_index >= 0) {
+        using Core::MarketAnalyzer;
+        
+        // Calculate Fast and Slow EMAs
+        current_trade.fast_ema = MarketAnalyzer::calculate_ema(
+            *bars,
+            config.ema_fast_period,
+            bar_index
+        );
+        current_trade.slow_ema = MarketAnalyzer::calculate_ema(
+            *bars,
+            config.ema_slow_period,
+            bar_index
+        );
+        
+        // Calculate RSI
+        current_trade.rsi = MarketAnalyzer::calculate_rsi(*bars, config.rsi_period, bar_index);
+        
+        // Calculate Bollinger Bands
+        auto bb = MarketAnalyzer::calculate_bollinger_bands(
+            *bars,
+            config.bb_period,
+            config.bb_stddev,
+            bar_index
+        );
+        current_trade.bb_upper = bb.upper;
+        current_trade.bb_middle = bb.middle;
+        current_trade.bb_lower = bb.lower;
+        current_trade.bb_bandwidth = bb.bandwidth;
+        
+        // Calculate ADX
+        auto adx = MarketAnalyzer::calculate_adx(*bars, config.adx_period, bar_index);
+        current_trade.adx = adx.adx;
+        current_trade.plus_di = adx.plus_di;
+        current_trade.minus_di = adx.minus_di;
+        
+        // Calculate MACD
+        auto macd = MarketAnalyzer::calculate_macd(
+            *bars,
+            config.macd_fast_period,
+            config.macd_slow_period,
+            config.macd_signal_period,
+            bar_index
+        );
+        current_trade.macd_line = macd.macd_line;
+        current_trade.macd_signal = macd.signal_line;
+        current_trade.macd_histogram = macd.histogram;
+        
+        LOG_INFO("📊 Indicators calculated - RSI:" + std::to_string(current_trade.rsi) + 
+                " ADX:" + std::to_string(current_trade.adx) + 
+                " MACD:" + std::to_string(current_trade.macd_line));
+    } else {
+        // No bars available - set indicators to neutral/zero values
+        current_trade.fast_ema = 0.0;
+        current_trade.slow_ema = 0.0;
+        current_trade.rsi = 50.0;  // Neutral RSI
+        current_trade.bb_upper = 0.0;
+        current_trade.bb_middle = 0.0;
+        current_trade.bb_lower = 0.0;
+        current_trade.bb_bandwidth = 0.0;
+        current_trade.adx = 0.0;
+        current_trade.plus_di = 0.0;
+        current_trade.minus_di = 0.0;
+        current_trade.macd_line = 0.0;
+        current_trade.macd_signal = 0.0;
+        current_trade.macd_histogram = 0.0;
+        LOG_WARN("⚠️ Indicators not calculated - bars not available");
+    }
+    
+    in_position = true;
+
+    LOG_INFO("✅ Trade entered: " + direction + " @ " + std::to_string(fill_price));
+
+    // 🔔 SOUND ALERT (LIVE MODE ONLY)
+    if (mode == ExecutionMode::LIVE) {
+        play_entry_alert();
+        LOG_INFO("🔔 Entry alert played");
+    }
+    
+    return true;
+}
+
+// SHARED LOGIC: Check stop loss (same for both modes)
+bool TradeManager::check_stop_loss(const Bar& bar) const {
+    if (!in_position) return false;
+    
+    if (current_trade.direction == "LONG") {
+        return (bar.low <= current_trade.stop_loss);
+    } else {
+        return (bar.high >= current_trade.stop_loss);
+    }
+}
+
+bool TradeManager::check_stop_loss(double current_price) const {
+    if (!in_position) return false;
+    
+    if (current_trade.direction == "LONG") {
+        return (current_price <= current_trade.stop_loss);
+    } else {
+        return (current_price >= current_trade.stop_loss);
+    }
+}
+
+// SHARED LOGIC: Check take profit (same for both modes)
+bool TradeManager::check_take_profit(const Bar& bar) const {
+    if (!in_position) return false;
+    
+    if (current_trade.direction == "LONG") {
+        return (bar.high >= current_trade.take_profit);
+    } else {
+        return (bar.low <= current_trade.take_profit);
+    }
+}
+
+bool TradeManager::check_take_profit(double current_price) const {
+    if (!in_position) return false;
+    
+    if (current_trade.direction == "LONG") {
+        return (current_price >= current_trade.take_profit);
+    } else {
+        return (current_price <= current_trade.take_profit);
+    }
+}
+
+Trade TradeManager::close_trade(const Bar& bar, 
+                                const std::string& exit_reason,
+                                double exit_price) {
+    if (!in_position) {
+        LOG_WARN("No position to close");
+        return Trade();
+    }
+    
+    // Determine exit direction (opposite of entry)
+    std::string exit_direction = (current_trade.direction == "LONG") ? "SELL" : "BUY";
+    
+    // Execute exit order (convert lots to units for broker)
+    int total_units = current_trade.position_size * config.lot_size;
+    double fill_price = execute_exit("", exit_direction, total_units, exit_price);
+    
+    // Complete trade record
+    current_trade.exit_date = bar.datetime;
+    current_trade.exit_price = fill_price;
+    current_trade.exit_reason = exit_reason;
+    // Populate exit volume and OI fields
+    current_trade.exit_volume = bar.volume;
+    current_trade.exit_oi = bar.oi;
+    current_trade.exit_volume_ratio = bar.norm_volume_ratio;
+    // Set exit_was_volume_climax if exit_reason is VOL_CLIMAX
+    current_trade.exit_was_volume_climax = (exit_reason == "VOL_CLIMAX");
+    // Calculate P&L
+    calculate_pnl(current_trade);
+    // Update capital
+    update_capital(current_trade.pnl);
+    in_position = false;
+    LOG_INFO("✅ Trade closed: " + exit_reason + ", P&L: $" + std::to_string(current_trade.pnl));
+    // 🔔 SOUND ALERT (LIVE MODE ONLY)
+    if (mode == ExecutionMode::LIVE) {
+        play_exit_alert();
+        LOG_INFO("🔔 Exit alert played");
+    }
+    return current_trade;
+}
+
+Trade TradeManager::close_trade(const std::string& exit_datetime,
+                                const std::string& exit_reason,
+                                double exit_price) {
+    if (!in_position) {
+        LOG_WARN("No position to close");
+        return Trade();
+    }
+    
+    // Determine exit direction (opposite of entry)
+    std::string exit_direction = (current_trade.direction == "LONG") ? "SELL" : "BUY";
+    
+    // Execute exit order (convert lots to units for broker)
+    int total_units = current_trade.position_size * config.lot_size;
+    double fill_price = execute_exit("", exit_direction, total_units, exit_price);
+    
+    // Complete trade record
+    current_trade.exit_date = exit_datetime;
+    current_trade.exit_price = fill_price;
+    current_trade.exit_reason = exit_reason;
+    
+    // Calculate P&L
+    calculate_pnl(current_trade);
+    // ⭐ FIX #1: SAFETY NET - Log if loss exceeds cap
+    // This should never happen if entry checks work, but log for monitoring
+    if (current_trade.pnl < 0 && 
+        std::abs(current_trade.pnl) > config.max_loss_per_trade) {
+        LOG_WARN("⚠️  ALERT: Loss ₹" + std::to_string(std::abs(current_trade.pnl)) + 
+                " exceeded max loss cap of ₹" + 
+                std::to_string(config.max_loss_per_trade) +
+                " - This should not happen!");
+    }
+    // Update capital
+    update_capital(current_trade.pnl);
+    
+    in_position = false;
+    
+    LOG_INFO("✅ Trade closed: " + exit_reason + ", P&L: $" + std::to_string(current_trade.pnl));
+    
+    // 🔔 SOUND ALERT (LIVE MODE ONLY)
+    if (mode == ExecutionMode::LIVE) {
+        play_exit_alert();
+        LOG_INFO("🔔 Exit alert played");
+    }
+    
+    return current_trade;
+}
+
+void TradeManager::update_capital(double pnl) {
+    current_capital += pnl;
+    LOG_DEBUG("Capital updated: $" + std::to_string(current_capital));
+}
+
+// ========================================
+// V6.0: Volume/OI Integration Methods
+// ========================================
+
+void TradeManager::set_volume_baseline(const Utils::VolumeBaseline* baseline) {
+    volume_baseline_ = baseline;
+    LOG_INFO("TradeManager: Volume baseline set");
+}
+
+void TradeManager::set_oi_scorer(const Core::OIScorer* scorer) {
+    oi_scorer_ = scorer;
+    LOG_INFO("TradeManager: OI scorer set");
+}
+
+TradeManager::VolumeExitSignal TradeManager::check_volume_exit_signals(
+    const Trade& trade,
+    const Bar& current_bar
+) const {
+    // Skip if volume baseline not available
+    if (volume_baseline_ == nullptr || !volume_baseline_->is_loaded()) {
+        return VolumeExitSignal::NONE;
+    }
+    
+    // Skip if V6.0 not enabled or volume exits disabled
+    if (!config.v6_fully_enabled) {
+        return VolumeExitSignal::NONE;
+    }
+    
+    // Get normalized volume
+    std::string time_slot = extract_time_slot(current_bar.datetime);
+    double norm_ratio = volume_baseline_->get_normalized_ratio(
+        time_slot,
+        current_bar.volume
+    );
+    
+    // Signal 1: Volume Climax (>3.0x average + in profit)
+    // Calculate unrealized PnL
+    double unrealized_pnl = 0.0;
+    if (trade.direction == "LONG") {
+        unrealized_pnl = (current_bar.close - trade.entry_price) * trade.position_size;
+    } else {
+        unrealized_pnl = (trade.entry_price - current_bar.close) * trade.position_size;
+    }
+    
+    if (norm_ratio > config.volume_climax_exit_threshold && unrealized_pnl > 0) {
+        LOG_INFO("🚨 VOLUME CLIMAX detected: " + std::to_string(norm_ratio) + "x");
+        return VolumeExitSignal::VOLUME_CLIMAX;
+    }
+    
+    // Future: Add VOLUME_DRYING_UP and VOLUME_DIVERGENCE signals
+    
+    return VolumeExitSignal::NONE;
+}
+
+TradeManager::OIExitSignal TradeManager::check_oi_exit_signals(
+    const Trade& trade,
+    const Bar& current_bar,
+    const std::vector<Bar>& bars,
+    int current_index
+) const {
+    // Skip if OI scorer not available
+    if (oi_scorer_ == nullptr) {
+        return OIExitSignal::NONE;
+    }
+    
+    // Skip if V6.0 not enabled
+    if (!config.v6_fully_enabled) {
+        return OIExitSignal::NONE;
+    }
+    
+    // Only process if OI data is fresh
+    if (!current_bar.oi_fresh) {
+        return OIExitSignal::NONE;
+    }
+    
+    // Need at least 10 bars for analysis
+    if (current_index < 10 || bars.size() == 0) {
+        return OIExitSignal::NONE;
+    }
+    
+    // Calculate recent price and OI changes
+    int lookback = 10;
+    int start_index = current_index - lookback;
+    if (start_index < 0) {
+        return OIExitSignal::NONE;
+    }
+    
+    double price_change = ((current_bar.close - bars[start_index].close) / 
+                          bars[start_index].close) * 100.0;
+    
+    double oi_start = bars[start_index].oi;
+    double oi_current = current_bar.oi;
+    
+    if (oi_start <= 0) {
+        return OIExitSignal::NONE;
+    }
+    
+    double oi_change = ((oi_current - oi_start) / oi_start) * 100.0;
+    
+    // Signal 1: OI Unwinding (CRITICAL - exit immediately)
+    if (trade.direction == "LONG") {
+        // LONG + price rising + OI falling = longs exiting (smart money out)
+        if (price_change > 0.2 && oi_change < config.oi_unwinding_threshold) {
+            LOG_INFO("🚨 OI UNWINDING detected (LONG): OI " + std::to_string(oi_change) + "%");
+            return OIExitSignal::OI_UNWINDING;
+        }
+    } else { // SHORT
+        // SHORT + price falling + OI falling = shorts covering
+        if (price_change < -0.2 && oi_change < config.oi_unwinding_threshold) {
+            LOG_INFO("🚨 OI UNWINDING detected (SHORT): OI " + std::to_string(oi_change) + "%");
+            return OIExitSignal::OI_UNWINDING;
+        }
+    }
+    
+    // Future: Add OI_REVERSAL and OI_STAGNATION signals
+    
+    return OIExitSignal::NONE;
+}
+
+std::string TradeManager::extract_time_slot(const std::string& datetime) const {
+    // Expected format: "2024-02-08 09:15:00"
+    if (datetime.length() >= 16) {
+        std::string time_hhmm = datetime.substr(11, 5);  // Extract "HH:MM"
+        
+        try {
+            // Parse hour and minute
+            int hour = std::stoi(time_hhmm.substr(0, 2));
+            int min = std::stoi(time_hhmm.substr(3, 2));
+            
+            // Round down to nearest 5-minute interval
+            // 09:32 -> 09:30, 09:33 -> 09:30, 09:34 -> 09:30, 09:35 -> 09:35
+            min = (min / 5) * 5;
+            
+            // Format back to string
+            std::ostringstream oss;
+            oss << std::setfill('0') << std::setw(2) << hour << ":"
+                << std::setfill('0') << std::setw(2) << min;
+            
+            return oss.str();
+        } catch (...) {
+            // Fallback if parsing fails
+            return "00:00";
+        }
+    }
+    return "00:00"; // Fallback
+}
+
+} // namespace Backtest
+} // namespace SDTrading

@@ -1,0 +1,103 @@
+================================================================================
+GIT COMMANDS EXPLANATION
+================================================================================
+
+The following git commands were used to safely update the repository while
+preserving local modifications:
+
+================================================================================
+1. GIT STATUS
+================================================================================
+Command: git status
+
+Purpose:
+  - Shows the current state of the working directory and staging area
+  - Displays which files are modified but not staged
+  - Displays which files are staged but not committed
+  - Shows untracked files
+
+Use Case:
+  Identify what changes you have made locally so they can be preserved during
+  an update. In this workflow, it revealed:
+    - build_release.bat (modified)
+    - scripts/live_test_data_provider.py (modified)
+    - system_config.json (modified)
+    - system_config.json_bkp (untracked)
+
+================================================================================
+2. GIT STASH
+================================================================================
+Command: git stash
+
+Purpose:
+  - Temporarily saves (stashes) all uncommitted changes
+  - Clears the working directory to a clean state
+  - Stores changes in a temporary "stash" for later retrieval
+
+Use Case:
+  Before pulling latest code from GitHub, stashing your changes prevents
+  merge conflicts and ensures a clean working directory. The changes are
+  saved safely and can be restored later without any loss.
+
+Example Output:
+  "Saved working directory and index state WIP on scoring-revamp: 745d928"
+
+================================================================================
+3. GIT PULL
+================================================================================
+Command: git pull
+
+Purpose:
+  - Fetches the latest updates from the remote repository (GitHub)
+  - Automatically merges those updates into your current branch
+  - Essentially combines "git fetch" + "git merge"
+
+Use Case:
+  Brings in all the latest code changes from the team's repository. In this
+  workflow, it pulled 8 new commits that included:
+    - Configuration adjustments
+    - Touch count calculation fixes
+    - Retest speed clarifications in documentation
+
+Notes:
+  - Safe to run when working directory is clean (hence the stash first)
+  - Updates your local branch to match the remote
+
+================================================================================
+4. GIT STASH POP
+================================================================================
+Command: git stash pop
+
+Purpose:
+  - Retrieves and applies the most recently stashed changes
+  - Reintroduces your saved modifications back into the working directory
+  - Removes the stash after applying it (use "git stash apply" to keep it)
+
+Use Case:
+  After pulling the latest code, restore your local modification on top of
+  the newly updated codebase. This results in your changes being preserved
+  while having the latest code.
+
+Final State:
+  Your modified files are now back in the working directory, combined with
+  all the latest updates from the repository.
+
+================================================================================
+WORKFLOW SUMMARY
+================================================================================
+
+Step 1: git status
+   └─> Check what you've changed locally
+
+Step 2: git stash
+   └─> Save your changes temporarily
+
+Step 3: git pull
+   └─> Get latest code from GitHub
+
+Step 4: git stash pop
+   └─> Restore your changes on top of latest code
+
+Result: Your local modifications are preserved, and you have the latest code!
+
+================================================================================

@@ -1,0 +1,298 @@
+================================================================================
+ZONE SCORING SYSTEM - DETAILED EXPLANATION
+================================================================================
+
+Overview:
+---------
+The trading system uses a multi-dimensional zone scoring system to evaluate the
+quality of supply/demand zones. The maximum score is 100 points (can exceed in
+rare cases), distributed across 6 key components.
+
+Implementation Location: src/scoring/zone_scorer.cpp
+
+
+================================================================================
+SCORE COMPONENTS (6 Categories - Total 100 Points)
+================================================================================
+
+1. BASE STRENGTH SCORE (0-20 points)
+   Weight: 0.40 (40% of 100 = 40 points normalized to 20)
+   ---------------------------------------------------------------------------
+   - Measures zone consolidation tightness
+   - Formula: (zone.strength / 100.0) * 20
+   - Tighter consolidation = higher score
+   - Example:
+     * Zone strength = 85% → Score = 17.0 points
+     * Zone strength = 50% → Score = 10.0 points
+
+
+2. ELITE BONUS SCORE (0-20 points)
+   Weight: 0.25 (25% of 100 = 25 points normalized to 20)
+   ---------------------------------------------------------------------------
+   - Only applies to ELITE zones (non-elite zones get 0)
+   - Three sub-components:
+   
+   a) Departure Imbalance (40% of elite score = 8 points max)
+      - Measures strength of institutional move away from zone
+      - Higher departure ratio = stronger zone
+      - Formula: min(zone.departure_imbalance / 5.0, 1.0) * 8
+      
+   b) Retest Speed (30% of elite score = 6 points max)
+      - Measures how quickly price returned to zone
+      - SLOWER retest = MORE patience = STRONGER zone
+      - Formula: (1.0 - min(zone.retest_speed / 1.0, 1.0)) * 6
+      
+   c) Bars to Retest (30% of elite score = 6 points max)
+      - Number of bars before price retested zone
+      - More bars = institutional patience = stronger zone
+      - Formula: min(zone.bars_to_retest / 15.0, 1.0) * 6
+   
+   Example Elite Zone:
+   * Departure = 4.0 → 16% score (0.8 * 8 = 6.4 points)
+   * Retest speed = 0.5 → 15% score (0.5 * 6 = 3.0 points)
+   * Bars to retest = 12 → 24% score (0.8 * 6 = 4.8 points)
+   * Total Elite Bonus = 14.2 points
+
+
+3. SWING POSITION SCORE (0-30 points)
+   Weight: 0.30 (30% of 100 = 30 points)
+   ---------------------------------------------------------------------------
+   - Pre-calculated by ZoneDetector module
+   - Bonus points for zones at swing highs/lows
+   - Additional persistence bonus if held for many bars
+   - This score is read directly from: zone.swing_analysis.swing_score
+
+
+4. REGIME ALIGNMENT SCORE (0-20 points)
+   Weight: 0.20 (20% of 100 = 20 points)
+   ---------------------------------------------------------------------------
+   Scoring Rules:
+   
+   PERFECT ALIGNMENT → 20 points (100% score)
+   - DEMAND zone in BULL market
+   - SUPPLY zone in BEAR market
+   
+   RANGING MARKET → 8 points (40% score)
+   - Any zone in RANGING market gets partial credit
+   
+   COUNTER-TREND → 0 points (0% score)
+   - DEMAND zone in BEAR market
+   - SUPPLY zone in BULL market
+
+
+5. STATE FRESHNESS SCORE (0-15 points)
+   Weight: 0.10 (10% of 100 = 10 points normalized to 15)
+   ---------------------------------------------------------------------------
+   Based on zone state:
+   
+   FRESH → 7.5 points (50% score)
+   - Untested zone, never touched by price
+   
+   TESTED → 15 points (100% score)
+   - Zone was tested and price respected it (BEST!)
+   
+   VIOLATED → 0 points (0% score)
+   - Zone was broken, invalid for trading
+
+
+6. REJECTION CONFIRMATION SCORE (0-15 points)
+   Weight: 0.05 (5% of 100 = 5 points normalized to 15)
+   ---------------------------------------------------------------------------
+   - Based on current bar's wick-to-body ratio
+   - Measures immediate price rejection at zone
+   
+   For DEMAND zones (look for bullish rejection):
+   - Wick length = close - low (long lower wick)
+   
+   For SUPPLY zones (look for bearish rejection):
+   - Wick length = high - close (long upper wick)
+   
+   Wick Ratio = wick_length / total_range
+   
+   Scoring Thresholds:
+   - Strong rejection (wick ≥ 60% of range) → 15 points
+   - Moderate rejection (wick ≥ 40% of range) → 9 points
+   - Weak rejection (wick ≥ 25% of range) → 3 points
+   - No significant rejection → 0 points
+
+
+================================================================================
+FINAL SCORE CALCULATION
+================================================================================
+
+Total Score Formula:
+-------------------
+total_score = base_strength_score 
+            + elite_bonus_score 
+            + swing_position_score 
+            + regime_alignment_score 
+            + state_freshness_score 
+            + rejection_confirmation_score
+
+Entry Aggressiveness:
+--------------------
+entry_aggressiveness = total_score / 100.0
+
+Example: Total score = 78 → Aggressiveness = 0.78 (78%)
+
+
+Recommended Risk/Reward Ratio (if RR scaling enabled):
+------------------------------------------------------
+score_factor = total_score / 100.0
+recommended_rr = base_rr + (score_factor * (max_rr - base_rr))
+
+Example with base_rr=2.0, max_rr=5.0, score=78:
+- score_factor = 0.78
+- recommended_rr = 2.0 + (0.78 * 3.0) = 4.34:1
+
+
+================================================================================
+ENTRY RATIONALE CATEGORIES
+================================================================================
+
+Based on entry_aggressiveness value:
+
+≥ 0.80 (80 points+)  → VERY AGGRESSIVE
+≥ 0.60 (60-79 points) → AGGRESSIVE
+≥ 0.40 (40-59 points) → BALANCED
+≥ 0.20 (20-39 points) → CONSERVATIVE
+<  0.20 (<20 points)  → VERY CONSERVATIVE
+
+
+================================================================================
+EXAMPLE CALCULATION
+================================================================================
+
+Zone Properties:
+- Type: DEMAND
+- Strength: 85%
+- Is Elite: Yes
+- Departure Imbalance: 4.0
+- Retest Speed: 0.5
+- Bars to Retest: 12
+- Swing Score: 25 (pre-calculated)
+- Market Regime: BULL
+- State: TESTED
+- Current Bar: Strong lower wick (70% of range)
+
+Calculation:
+-----------
+1. Base Strength:       (85/100) * 20 = 17.0 points
+2. Elite Bonus:         
+   - Departure: (4.0/5.0) * 8 = 6.4
+   - Speed: (1 - 0.5/1.0) * 6 = 3.0
+   - Patience: (12/15) * 6 = 4.8
+   - Total = 14.2 points
+3. Swing Position:      25.0 points (from zone data)
+4. Regime Alignment:    20.0 points (DEMAND + BULL = perfect)
+5. State Freshness:     15.0 points (TESTED = 100%)
+6. Rejection:           15.0 points (70% wick = strong)
+
+TOTAL SCORE = 17.0 + 14.2 + 25.0 + 20.0 + 15.0 + 15.0 = 106.2 points
+Entry Aggressiveness = 106.2 / 100 = 1.062 (106%)
+Entry Rationale = "VERY AGGRESSIVE"
+
+(Note: Scores can exceed 100 when all factors align perfectly)
+
+
+================================================================================
+CONFIGURATION WEIGHTS (Default Values)
+================================================================================
+
+Located in Config.scoring structure:
+
+weight_base_strength             = 0.40  (40%)
+weight_elite_bonus               = 0.25  (25%)
+weight_swing_position            = 0.30  (30%)
+weight_regime_alignment          = 0.20  (20%)
+weight_state_freshness           = 0.10  (10%)
+weight_rejection_confirmation    = 0.05  (5%)
+
+Note: Weights are used to calculate max_score for each component.
+Formula: max_score = weight * 100.0
+
+These weights should sum to approximately 1.0 (100%) for normalization,
+though the actual point distribution is adjusted per component.
+
+
+================================================================================
+REJECTION THRESHOLDS (Configurable)
+================================================================================
+
+rejection_strong_threshold       = 0.60  (60% wick ratio)
+rejection_moderate_threshold     = 0.40  (40% wick ratio)
+rejection_weak_threshold         = 0.25  (25% wick ratio)
+
+entry_minimum_score             = 40.0 points (minimum to consider entry)
+
+
+================================================================================
+KEY INSIGHTS
+================================================================================
+
+1. TESTED zones score higher than FRESH zones
+   - Tested zones have proven they can hold price
+
+2. Elite zones get significant bonus (up to 20 points)
+   - This can make a major difference in total score
+
+3. Regime alignment is crucial (0 vs 20 points)
+   - Counter-trend zones get NO alignment points
+
+4. Swing position carries the most weight (30 points max)
+   - Zones at key swing levels are highly valued
+
+5. Rejection confirmation is real-time
+   - Scores can change bar-by-bar based on current price action
+
+6. Base strength is foundational
+   - Even the best zones need tight consolidation
+
+
+================================================================================
+CODE REFERENCES
+================================================================================
+
+Main Implementation:
+- src/scoring/zone_scorer.cpp       (scoring logic)
+- src/scoring/zone_scorer.h         (class definition)
+- include/common_types.h            (ZoneScore struct, lines 102-142)
+
+Configuration:
+- include/common_types.h            (ScoringConfig struct, lines 195-262)
+
+Tests:
+- tests/unit/test_config.cpp        (unit tests for scoring)
+
+Documentation:
+- docs/MILESTONE_3_REPORT.md        (detailed feature documentation)
+- docs/MILESTONE_3_QUICKSTART.md    (usage examples)
+
+
+================================================================================
+USAGE IN CODE
+================================================================================
+
+#include "scoring/zone_scorer.h"
+
+// Initialize scorer with configuration
+ZoneScorer scorer(config);
+
+// Evaluate a zone
+ZoneScore score = scorer.evaluate_zone(zone, regime, current_bar);
+
+// Check if zone meets threshold
+if (scorer.meets_entry_threshold(score)) {
+    std::cout << "Total: " << score.total_score << "/100" << std::endl;
+    std::cout << "Breakdown: " << score.score_breakdown << std::endl;
+    std::cout << "R/R: " << score.recommended_rr << ":1" << std::endl;
+    std::cout << "Strategy: " << score.entry_rationale << std::endl;
+}
+
+// Score breakdown string format:
+// "Base:17.0 Elite:14.2 Swing:25.0 Regime:20.0 State:15.0 Reject:15.0 = 106.2"
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
