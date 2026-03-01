@@ -1,0 +1,86 @@
+# ============================================================================
+# LIVE ZONE DETECTION - FULL LOOKBACK MODE (MARCH 2026 FIX)
+# ============================================================================
+# 
+# Problem: Periodic detection was only scanning last 5-25 bars incrementally
+#          Missing zones that require longer pattern recognition (50+ bars)
+#
+# Solution: Rescan last N bars every cycle (like backtest does)
+# ============================================================================
+
+# Enable relaxed detection for live trading
+use_relaxed_live_detection = YES
+
+# Relaxed thresholds for live
+live_min_zone_width_atr = 0.9
+live_min_zone_strength = 40
+
+# Run periodic detection every N bars
+live_zone_detection_interval_bars = 5
+
+# ⭐ NEW: Lookback window for periodic detection
+# How many bars to rescan during each periodic detection cycle
+# 
+# Options:
+# - 0 = Incremental only (scan bars since last detection) ← OLD BEHAVIOR
+# - 100 = Rescan last 100 bars every cycle
+# - 200 = Rescan last 200 bars every cycle ← RECOMMENDED
+# - 500 = Rescan last 500 bars (very thorough but slower)
+#
+# Recommendation: 200 bars = ~16 hours of 5-min data
+# This matches typical zone formation patterns
+live_zone_detection_lookback_bars = 200
+
+# ============================================================================
+# HOW IT WORKS:
+# ============================================================================
+# 
+# OLD BEHAVIOR (lookback = 0):
+# - Bar 100: Scan bars 95-100 (5 bars since last scan)
+# - Bar 105: Scan bars 100-105 (5 bars since last scan)
+# - PROBLEM: Misses zones that started forming 20+ bars ago
+#
+# NEW BEHAVIOR (lookback = 200):
+# - Bar 100: Scan bars 0-100 (all 100 bars available)
+# - Bar 105: Scan bars 0-105 (all 105 bars, but limited to last 200)
+# - Bar 500: Scan bars 300-500 (last 200 bars)
+# - RESULT: Detects zones just like backtest!
+#
+# ============================================================================
+
+# Duplicate Prevention (existing settings)
+duplicate_prevention_enabled = YES
+zone_existence_tolerance_atr = 0.35
+check_existing_before_create = YES
+merge_strategy = update_if_stronger
+strength_improvement_threshold = 15.0
+
+# Zone Pattern Requirements
+consolidation_min_bars = 2
+consolidation_max_bars = 25
+min_impulse_atr = 1.2
+min_zone_width_atr = 1.3  # Backtest uses strict threshold
+min_zone_strength = 50    # Backtest uses strict threshold
+
+# ============================================================================
+# EXPECTED BEHAVIOR:
+# ============================================================================
+# 
+# Bootstrap (Aug 1 - Oct 31):
+# - Scans all bootstrap bars
+# - Detects 4 zones (matches backtest)
+#
+# Live Period (Nov 1 - Feb 20):
+# - Every 5 bars: Rescans last 200 bars
+# - Uses relaxed thresholds (0.9 ATR, strength 40)
+# - Detects 4-5 new zones (matches backtest on same period!)
+#
+# Console Output:
+# 🔄 Running periodic zone detection (5 bars since last scan)
+# 📉 Using RELAXED live thresholds: width=0.9 (vs 1.3), strength=40 (vs 50)
+# 🔍 Scanning last 200 bars (lookback=200)
+# ✅ Added Zone 10 @ 2025-11-15 14:30:00
+#    Type: DEMAND | State: FRESH
+#    Width: 45.3 pts (1.12 ATR)
+#    Strength: 48.5 | Score: 52.3
+# ============================================================================

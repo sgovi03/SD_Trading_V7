@@ -1,7 +1,7 @@
 # Require minimum EMA separation for LONG (in percent)
 ema_min_separation_pct_long = 0.1
 # Require minimum EMA separation for SHORT (in percent)
-ema_min_separation_pct_short = 0.1
+ema_min_separation_pct_short = 0.05
 # ====================
 # COMPREHENSIVE ENTRY SCORING SYSTEM (V2.0)
 # ====================
@@ -86,7 +86,7 @@ starting_capital = 300000
 # ZONE DETECTION
 # ====================
 base_height_max_atr = 1.9
-consolidation_min_bars = 1          # Strict base (3+ bars minimum)
+consolidation_min_bars = 1        # Strict base (3+ bars minimum)
 consolidation_max_bars = 25         # Moderate - allow 25 bars (was 20, too restrictive)
 min_impulse_atr = 1.4               # Balanced - 1.4 vs 1.5 (was 1.2, allows more variety)
 atr_period = 14
@@ -299,10 +299,7 @@ enable_ema_exit = NO
 exit_ema_fast_period = 9
 exit_ema_slow_period = 20
 
-# Risk/Reward Scaling
-rr_base_ratio = 2.0
-rr_scale_with_score = YES
-rr_max_ratio = 5.0
+
 
 # Rejection Wick Thresholds
 rejection_strong_threshold = 0.6
@@ -350,10 +347,6 @@ ema_fast_period = 20
 ema_slow_period = 50
 ema_ranging_threshold_pct = 0.5
 
-# Directional Protection  
-require_ema_alignment_for_longs = YES
-require_ema_alignment_for_shorts = YES
-
 # ====================
 # STOP LOSS & POSITION SIZING
 # ====================
@@ -382,17 +375,14 @@ entry_buffer_pct = 0.1
 #   - Trail protects only after meaningful profit
 #   - Winners can reach natural 3.96 RR targets
 
-trail_atr_multiplier = 1.0
-trail_ema_period = 20
-trail_ema_buffer_pct = 0.2
-trail_use_hybrid = YES
+
 
 # ====================
 # LOSS PROTECTION
 # ====================
 # max_consecutive_losses = 4
 # pause_bars_after_losses = 80
-max_retries_per_zone = 15000
+max_retries_per_zone = 5000
 enable_per_zone_retry_limit = YES
 
 # ====================
@@ -502,8 +492,8 @@ volume_baseline_file = data/baselines/volume_baseline_5min.json
 # ====================
 # OI CONFIGURATION
 # ====================
-enable_oi_entry_filters = NO
-enable_oi_exit_signals = NO
+enable_oi_entry_filters = YES
+enable_oi_exit_signals = YES
 enable_market_phase_detection = YES
 min_oi_change_threshold = 0.01
 high_oi_buildup_threshold = 0.05
@@ -578,10 +568,16 @@ high_score_threshold = 65.0           # Add this!
 # ====================
 # RISK & TRADE MANAGEMENT
 # ====================
-#max_loss_per_trade = 5000.0          # was 10500 — cut max loss in half
+#max_loss_per_trade = 10000.0          # was 10500 — cut max loss in half
 risk_per_trade_pct = 1.0
 max_consecutive_losses = 3
-pause_bars_after_losses = 100
+pause_bars_after_losses = 30
+
+# Risk/Reward Scaling
+rr_base_ratio = 1.20
+rr_scale_with_score = YES
+rr_max_ratio = 5.0
+
 
 # ====================
 # STOP LOSS SETTINGS
@@ -589,8 +585,8 @@ pause_bars_after_losses = 100
 #sl_buffer_zone_pct = 8.0
 #sl_buffer_atr = 0.3
 use_breakeven_stop_loss = YES
-max_loss_per_trade = 3000.0          # was 10500 — cut max loss in half
-sl_buffer_zone_pct = 35.0            # was 20% — increase buffer for 5-min volatility
+max_loss_per_trade = 10000.0          # was 10500 — cut max loss in half
+sl_buffer_zone_pct = 25.0            # was 20% — increase buffer for 5-min volatility
 sl_buffer_atr = 2.5                  # was 1.5 — 2.5× ATR accounts for bar gaps
 # ====================
 # TRAILING STOP SYSTEM
@@ -598,4 +594,15 @@ sl_buffer_atr = 2.5                  # was 1.5 — 2.5× ATR accounts for bar ga
 use_trailing_stop = YES
 trail_fallback_tp_rr = 6.0
 trail_activation_rr = 0.5
+
 trailing_stop_activation_r = 0.5
+
+# Directional Protection  
+require_ema_alignment_for_longs = YES
+require_ema_alignment_for_shorts = YES
+
+trail_atr_multiplier = 0.70
+trail_ema_period = 9
+trail_ema_buffer_pct = 0.1
+trail_use_hybrid = YES
+

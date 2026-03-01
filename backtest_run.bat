@@ -1,1 +1,0 @@
-build\bin\release\sd_trading_unified.exe --mode=backtest

@@ -73,23 +73,30 @@ bool ZoneDetector::is_consolidation(int start_index, int length, double& high, d
 }
 
 bool ZoneDetector::has_impulse_before(int index) const {
-    if (index < 6) return false;
+    // Need at least min_bars of history to check impulse before the base
+    int lookback = std::max(config.consolidation_min_bars, 3);
+    if (index < lookback + 1) return false;
     
-    double price_start = bars[index - 5].close;
-    double price_end = bars[index].close;
+    // Measure move ending at bars[index-1] (the bar just before base start)
+    // starting from bars[index-1-lookback]
+    double price_start = bars[index - 1 - lookback].close;
+    double price_end = bars[index - 1].close;
     double move = std::abs(price_end - price_start);
-    double atr = get_cached_atr(index);  // Use cached ATR
+    double atr = get_cached_atr(index);
     
     return (move >= config.min_impulse_atr * atr);
 }
 
 bool ZoneDetector::has_impulse_after(int index) const {
-    if (index + 6 >= (int)bars.size()) return false;
+    // index is the last bar of the consolidation base (bars[i + len - 1])
+    // Impulse starts at bars[index+1] and we look forward by lookback bars
+    int lookforward = std::max(config.consolidation_min_bars, 3);
+    if (index + lookforward + 1 >= (int)bars.size()) return false;
     
-    double price_start = bars[index].close;
-    double price_end = bars[index + 5].close;
+    double price_start = bars[index].close;          // Last base bar
+    double price_end = bars[index + lookforward].close;  // N bars after base
     double move = std::abs(price_end - price_start);
-    double atr = get_cached_atr(index);  // Use cached ATR
+    double atr = get_cached_atr(index);
     
     return (move >= config.min_impulse_atr * atr);
 }
@@ -137,10 +144,19 @@ void ZoneDetector::analyze_elite_quality(Zone& zone) {
     double departure_distance = std::abs(bars[departure_bar].close - zone_mid);
     zone.departure_imbalance = departure_distance / atr;
     
-    // Find first retest
+    // Find first retest: price re-enters the zone from the correct direction
     int retest_bar = -1;
     for (int i = zone.formation_bar + 5; i < std::min(zone.formation_bar + 100, (int)bars.size()); i++) {
-        bool touches = (bars[i].low <= zone.proximal_line && bars[i].high >= zone.distal_line);
+        bool touches = false;
+        if (zone.type == ZoneType::DEMAND) {
+            // Demand: retest = price pulls back down into the zone (bar low <= proximal line)
+            touches = (bars[i].low <= zone.proximal_line && bars[i].low >= zone.distal_line - 
+                       0.5 * (zone.proximal_line - zone.distal_line));
+        } else {
+            // Supply: retest = price rallies back up into the zone (bar high >= proximal line)
+            touches = (bars[i].high >= zone.proximal_line && bars[i].high <= zone.distal_line + 
+                       0.5 * (zone.distal_line - zone.proximal_line));
+        }
         if (touches) {
             retest_bar = i;
             break;
@@ -443,7 +459,13 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
 
     LOG_DEBUG("Detecting zones from bar " + std::to_string(search_start));
 
-    for (int i = search_start; i < (int)bars.size() - 5; i += detection_interval) {
+    // Guard: we access bars[i+len-1+lookforward] where:
+    //   len up to consolidation_max_bars, lookforward = max(consolidation_min_bars,3)
+    // Max index = i + consolidation_max_bars - 1 + 3 = i + consolidation_max_bars + 2
+    // So: i must be < bars.size() - consolidation_max_bars - 3
+    int lookforward_max = std::max(config.consolidation_min_bars, 3);
+    int detect_no_dup_end = (int)bars.size() - config.consolidation_max_bars - lookforward_max;
+    for (int i = search_start; i < detect_no_dup_end; i += detection_interval) {
         std::vector<Zone> candidates;
 
         for (int len = config.consolidation_min_bars; len <= config.consolidation_max_bars; len++) {
@@ -452,14 +474,19 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
             if (!has_impulse_before(i)) continue;
             if (!has_impulse_after(i + len - 1)) continue;
 
-            double price_before = bars[i - 5].close;
-            double price_at_base = bars[i].close;
-            double price_after = bars[i + len - 1 + 5].close;
+            // Directional check: compare last base bar vs pre-base bar (approach direction),
+            // and departure over a multi-bar window (same span as has_impulse_after).
+            // Using a single bar[i+len] for direction is too noisy — one counter-candle
+            // would flip the classification. A lookforward-bar span gives a stable signal.
+            int lookforward = std::max(config.consolidation_min_bars, 3);
+            double price_before    = bars[i - 1].close;                      // Bar before base
+            double last_base_close = bars[i + len - 1].close;                // Last base bar
+            double price_departure = bars[i + len - 1 + lookforward].close;  // N bars after base end
 
-            bool rally_before = (price_at_base > price_before);
-            bool drop_before = (price_at_base < price_before);
-            bool rally_after = (price_after > price_at_base);
-            bool drop_after = (price_after < price_at_base);
+            bool rally_before  = (last_base_close > price_before);
+            bool drop_before   = (last_base_close < price_before);
+            bool rally_after   = (price_departure > last_base_close);
+            bool drop_after    = (price_departure < last_base_close);
 
             ZoneType zone_type;
             if (rally_before && drop_after) {
@@ -470,9 +497,11 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
                 continue;
             }
 
-            if (zone_type == ZoneType::SUPPLY) {
+            // Rejection strength filter: departure must be 1.5× min_impulse_atr
+            // Measured over same lookforward span as has_impulse_after for consistency
+            {
                 double atr = get_cached_atr(i);
-                double rejection_move = std::abs(price_after - price_at_base);
+                double rejection_move = std::abs(price_departure - last_base_close);
                 if (rejection_move < 1.5 * config.min_impulse_atr * atr) {
                     continue;
                 }
@@ -484,6 +513,11 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
             zone.base_high = high;
             zone.distal_line = (zone.type == ZoneType::DEMAND) ? low : high;
             zone.proximal_line = (zone.type == ZoneType::DEMAND) ? high : low;
+            // Validation: distal_line must be positive and non-zero
+            if (zone.distal_line <= 0) {
+                LOG_ERROR("❌ Zone distal_line corrupt (<= 0) at bar " + std::to_string(i) + ". Setting to 0.01.");
+                zone.distal_line = 0.01;
+            }
             zone.formation_bar = i;
             zone.formation_datetime = bars[i].datetime;
             zone.state = ZoneState::FRESH;
@@ -605,8 +639,12 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
     // Calculate search range - SCAN ENTIRE DATASET (FIX for V3.x Ghost bug)
     int min_bar = config.atr_period + 10;  // Need ATR + some history
     
-    // ✅ CRITICAL FIX: Account for consolidation_max_bars AND impulse check needs
-    int max_bar = (int)bars.size() - config.consolidation_max_bars - 10;
+    // ✅ CRITICAL FIX: Account for consolidation_max_bars AND lookforward span
+    // We access bars[i+len-1+lf] where lf = max(consolidation_min_bars,3)
+    // Max index = i + consolidation_max_bars - 1 + lf
+    // So max_bar = bars.size() - consolidation_max_bars - lf
+    int lf_guard = std::max(config.consolidation_min_bars, 3);
+    int max_bar = (int)bars.size() - config.consolidation_max_bars - lf_guard;
     
     if (max_bar <= min_bar) {
         LOG_WARN("Not enough bars for zone detection (need at least " + 
@@ -716,15 +754,20 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
             }
             
             // Directional validation
-            double price_before = bars[i - 5].close;
-            double price_at_base = bars[i].close;
-            double price_after = bars[i + len - 1 + 5].close;
+            // Directional check and rejection filter use a multi-bar departure window
+            // (same span as has_impulse_after) rather than a single bar[i+len].
+            // A single bar after the base is too noisy — one counter-candle flips the
+            // classification. lookforward bars gives a stable, institutional-grade signal.
+            int lf = std::max(config.consolidation_min_bars, 3);
+            double price_before    = bars[i - 1].close;
+            double last_base_close = bars[i + len - 1].close;
+            double price_departure = bars[i + len - 1 + lf].close;  // N bars after base end
             
-            // Determine directions
-            bool rally_before = (price_at_base > price_before);
-            bool drop_before = (price_at_base < price_before);
-            bool rally_after = (price_after > price_at_base);
-            bool drop_after = (price_after < price_at_base);
+            // Determine directions using base-boundary anchors
+            bool rally_before = (last_base_close > price_before);
+            bool drop_before  = (last_base_close < price_before);
+            bool rally_after  = (price_departure > last_base_close);
+            bool drop_after   = (price_departure < last_base_close);
             
             // Validate zone type with proper directional logic
             ZoneType zone_type;
@@ -744,16 +787,18 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
                 continue;
             }
             
-            // Additional validation for SUPPLY zones
-            if (zone_type == ZoneType::SUPPLY) {
-                double atr = get_cached_atr(i);  // Use cached ATR
-                double rejection_move = std::abs(price_after - price_at_base);
+            // Departure rejection strength filter: applies to BOTH SUPPLY and DEMAND
+            // Measured over same lookforward span as has_impulse_after (1.5× stricter)
+            {
+                double atr = get_cached_atr(i);
+                double rejection_move = std::abs(price_departure - last_base_close);
                 
                 if (rejection_move < 1.5 * config.min_impulse_atr * atr) {
-                    fail_supply_rejection++;
+                    fail_supply_rejection++;  // counter covers both types
                     if (is_sample && len == config.consolidation_min_bars) {
-                        LOG_DEBUG("Bar " + std::to_string(i) + " FAIL supply rejection: move=" + 
-                                 std::to_string(rejection_move) + " min=" + 
+                        LOG_DEBUG("Bar " + std::to_string(i) + " FAIL rejection (" +
+                                 std::string(zone_type == ZoneType::SUPPLY ? "SUPPLY" : "DEMAND") +
+                                 "): move=" + std::to_string(rejection_move) + " min=" + 
                                  std::to_string(1.5 * config.min_impulse_atr * atr));
                     }
                     continue;
@@ -891,7 +936,7 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
              " (" + std::to_string(100.0 * fail_impulse_after / total_checked) + "%)");
     LOG_INFO("  ❌ Wrong direction pattern: " + std::to_string(fail_direction) + 
              " (" + std::to_string(100.0 * fail_direction / total_checked) + "%)");
-    LOG_INFO("  ❌ Supply rejection weak: " + std::to_string(fail_supply_rejection) + 
+    LOG_INFO("  ❌ Departure rejection weak (SUPPLY+DEMAND): " + std::to_string(fail_supply_rejection) + 
              " (" + std::to_string(100.0 * fail_supply_rejection / total_checked) + "%)");
     LOG_INFO("  ❌ Strength too low: " + std::to_string(fail_strength) + 
              " (" + std::to_string(100.0 * fail_strength / total_checked) + "%)");
@@ -913,24 +958,29 @@ int ZoneDetector::calculate_initial_touch_count(const Zone& zone,
                                                 const std::vector<Bar>& bars, 
                                                 int formation_index) const {
     int touch_count = 0;
+    bool was_inside = false;   // Track whether previous bar was inside the zone
     
-    // Count touches from formation onwards
     for (int i = formation_index + 1; i < (int)bars.size(); i++) {
         const Bar& bar = bars[i];
         
-        // Check if bar touches the zone
-        bool touches = false;
+        // A bar is "inside" the zone if it overlaps the zone body
+        bool is_inside = false;
         if (zone.type == ZoneType::SUPPLY) {
-            // SUPPLY: bar high touches proximal line
-            touches = (bar.high >= zone.proximal_line);
+            // SUPPLY zone: price enters from below, touches proximal_line (low boundary)
+            is_inside = (bar.high >= zone.proximal_line && bar.low <= zone.distal_line + 
+                         (zone.distal_line - zone.proximal_line) * 0.5);
         } else {
-            // DEMAND: bar low touches proximal line
-            touches = (bar.low <= zone.proximal_line);
+            // DEMAND zone: price enters from above, touches proximal_line (high boundary)
+            is_inside = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line - 
+                         (zone.proximal_line - zone.distal_line) * 0.5);
         }
         
-        if (touches) {
+        // Count a touch only on the FIRST bar entering the zone (transition: outside → inside)
+        if (is_inside && !was_inside) {
             touch_count++;
         }
+        
+        was_inside = is_inside;
     }
     
     return touch_count;

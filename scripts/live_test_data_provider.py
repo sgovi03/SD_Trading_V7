@@ -21,12 +21,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Append rows from test_data to live_data-DRYRUN at a given speed.")
     parser.add_argument(
            "--source_file",
-           default="D:/SD_System/SD_Volume_OI/data/LiveTest/test_data_5Mins.csv",
+           default="D:/SD_System/SD_Volume_OI/SD_Trading_V6/data/LiveTest/test_data_5Mins.csv",
            help="Path to the test_data CSV file. Default: d:/SD_System/DEV/data/LiveTest/test_data.csv"
     )
     parser.add_argument(
            "--target_file",
-           default="D:/SD_System/SD_Volume_OI/data/LiveTest/Live_Data_5Mins_20Feb2026_test.csv",
+           default="D:/SD_System/SD_Volume_OI/SD_Trading_V6/data/LiveTest/Live_Data_5Mins_Sep05_Feb26.csv",
            help="Path to the live_data-DRYRUN CSV file. Default: d:/SD_System/DEV/data/LiveTest/live_data-DRYRUN.csv"
     )
     parser.add_argument("--interval", type=float, default=1.0, help="Interval between appends in seconds (default: 1.0)")

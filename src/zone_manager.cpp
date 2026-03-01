@@ -39,7 +39,7 @@ void ZoneManager::update(const std::vector<Bar>& bars, int current_idx,
     double atr = calculate_atr(bars, config.atr_period, current_idx);
     
     // Update existing zones first
-    update_zone_states(current_bar, atr);
+    update_zone_states(current_bar, atr, config);
     
     // Detect new zones using the core engine
     std::vector<Zone> new_zones;
@@ -69,12 +69,15 @@ void ZoneManager::update(const std::vector<Bar>& bars, int current_idx,
         }
         
         try {
-            // Simple, clean copy using compiler-generated copy constructor
-            active_zones_.push_back(zone);  // That's it! No manual copying!
+            // Assign zone_id BEFORE pushing to active_zones_
+            Zone zone_with_id = zone;  // Copy to get a mutable instance
+            zone_with_id.zone_id = next_zone_id_++;
             
-            // Create metadata for this zone
+            active_zones_.push_back(zone_with_id);
+            
+            // Create metadata for this zone — use same ID
             ZoneMetadata metadata;
-            metadata.zone_id = next_zone_id_++;
+            metadata.zone_id = zone_with_id.zone_id;
             metadata.bars_since_formation = 0;
             metadata.bars_since_last_touch = 0;
             metadata.currently_active = true;
@@ -82,10 +85,10 @@ void ZoneManager::update(const std::vector<Bar>& bars, int current_idx,
             zone_metadata_[metadata.zone_id] = metadata;
             
             if (config.enable_debug_logging) {
-                std::cout << "[ZM] Added zone ID=" << metadata.zone_id 
-                         << " type=" << zone_type_to_string(zone.type)
-                         << " base=" << zone.base_low << "-" << zone.base_high
-                         << " strength=" << zone.strength << std::endl;
+                std::cout << "[ZM] Added zone ID=" << zone_with_id.zone_id 
+                         << " type=" << zone_type_to_string(zone_with_id.type)
+                         << " base=" << zone_with_id.base_low << "-" << zone_with_id.base_high
+                         << " strength=" << zone_with_id.strength << std::endl;
             }
             
         } catch (const std::exception& e) {
@@ -95,17 +98,15 @@ void ZoneManager::update(const std::vector<Bar>& bars, int current_idx,
         }
     }
     
-    // Remove deactivated zones
+    // Remove deactivated zones — match by zone_id to avoid cross-contamination
     auto remove_iter = std::remove_if(active_zones_.begin(), active_zones_.end(),
-        [this, &config](const Zone& zone) {
-            // Find zone metadata (simplified - in production would use zone ID)
-            // ⚠️ CRITICAL BUG: This logic is wrong! It checks ALL metadata entries
-            for (const auto& pair : zone_metadata_) {
-                if (!pair.second.currently_active) {
-                    return true;
-                }
+        [this](const Zone& zone) {
+            // Only remove if THIS zone's own metadata says it's inactive
+            auto it = zone_metadata_.find(zone.zone_id);
+            if (it == zone_metadata_.end()) {
+                return false;  // No metadata found — keep zone (safety)
             }
-            return false;
+            return !it->second.currently_active;
         });
     
     int zones_removed = std::distance(remove_iter, active_zones_.end());
@@ -116,16 +117,23 @@ void ZoneManager::update(const std::vector<Bar>& bars, int current_idx,
 // ZONE STATE MANAGEMENT
 // ============================================================
 
-void ZoneManager::update_zone_states(const Bar& current_bar, double atr) {
+void ZoneManager::update_zone_states(const Bar& current_bar, double atr, const BacktestConfig& config) {
     for (Zone& zone : active_zones_) {
-        // Update touch count if price enters zone
+        // Skip zones already dead — remove_if hasn't run yet this cycle
+        if (zone.state == ZoneState::VIOLATED) {
+            continue;
+        }
+
+        // Detect zone touch: price enters zone from correct direction
+        // DEMAND: approached from above — bar low drops at or below proximal line (top of demand zone)
+        // SUPPLY: approached from below — bar high rises at or above proximal line (bottom of supply zone)
         bool in_zone = false;
         if (zone.type == ZoneType::DEMAND) {
-            in_zone = current_bar.low <= zone.base_high && 
-                     current_bar.high >= zone.base_low;
+            // Price retracing down INTO demand zone: low <= proximal and NOT fully through distal
+            in_zone = (current_bar.low <= zone.proximal_line && current_bar.high >= zone.distal_line);
         } else {
-            in_zone = current_bar.high >= zone.base_low && 
-                     current_bar.low <= zone.base_high;
+            // Price rallying up INTO supply zone: high >= proximal and NOT fully through distal
+            in_zone = (current_bar.high >= zone.proximal_line && current_bar.low <= zone.distal_line);
         }
         
         if (in_zone) {
@@ -139,9 +147,22 @@ void ZoneManager::update_zone_states(const Bar& current_bar, double atr) {
         } else if (zone.type == ZoneType::SUPPLY && current_bar.close > zone.base_high) {
             violated = true;
         }
-        
+
         if (violated) {
             mark_zone_as_violated(zone, "Body close through zone");
+            continue;  // No need to check deactivation — already marked
+        }
+
+        // Increment age counters per bar
+        auto meta_it = zone_metadata_.find(zone.zone_id);
+        if (meta_it != zone_metadata_.end()) {
+            meta_it->second.bars_since_formation++;
+            meta_it->second.bars_since_last_touch++;
+
+            // Check if zone should be deactivated (touch exhaustion / age-out)
+            if (should_deactivate_zone(zone, meta_it->second, config)) {
+                mark_zone_as_violated(zone, "Auto-deactivated: exhausted or aged out");
+            }
         }
     }
 }
@@ -170,24 +191,23 @@ void ZoneManager::mark_zone_as_tested(Zone& zone, double touch_price, const Bar*
         }
     }
 
-    // Update metadata
-    for (auto& pair : zone_metadata_) {
-        if (pair.second.currently_active) {
-            pair.second.last_touch_price = touch_price;
-            pair.second.bars_since_last_touch = 0;
-        }
+    // FIX: Update metadata only for THIS specific zone (match by zone_id)
+    auto it = zone_metadata_.find(zone.zone_id);
+    if (it != zone_metadata_.end()) {
+        it->second.last_touch_price = touch_price;
+        it->second.bars_since_last_touch = 0;
     }
 }
 
 void ZoneManager::mark_zone_as_violated(Zone& zone, const std::string& reason) {
     zone.state = ZoneState::VIOLATED;
     
-    // Update metadata - only mark specific zone as violated
-    for (auto& pair : zone_metadata_) {
-        if (pair.second.currently_active) {
-            pair.second.currently_active = false;
-            pair.second.deactivation_reason = reason;
-        }
+    // FIX: Deactivate only THIS zone's metadata (match by zone_id)
+    // Previously iterated ALL active metadata and deactivated everything
+    auto it = zone_metadata_.find(zone.zone_id);
+    if (it != zone_metadata_.end()) {
+        it->second.currently_active = false;
+        it->second.deactivation_reason = reason;
     }
 }
 
@@ -298,12 +318,16 @@ bool ZoneManager::save_state_to_file(const std::string& filename) {
         for (const Zone& zone : active_zones_) {
             Json::Value zone_json;
             zone_json["type"] = (zone.type == ZoneType::DEMAND) ? "DEMAND" : "SUPPLY";
+            zone_json["zone_id"] = zone.zone_id;
             zone_json["base_low"] = zone.base_low;
             zone_json["base_high"] = zone.base_high;
+            zone_json["distal_line"] = zone.distal_line;
+            zone_json["proximal_line"] = zone.proximal_line;
             zone_json["strength"] = zone.strength;
             zone_json["state"] = static_cast<int>(zone.state);
             zone_json["formation_datetime"] = zone.formation_datetime;
             zone_json["is_elite"] = zone.is_elite;
+            zone_json["touch_count"] = zone.touch_count;
             
             zones_json.append(zone_json);
         }
@@ -357,7 +381,30 @@ bool ZoneManager::load_state_from_file(const std::string& filename) {
             zone.formation_datetime = zone_json["formation_datetime"].asString();
             zone.is_elite = zone_json["is_elite"].asBool();
             
-            active_zones_.push_back(zone);  // Uses copy constructor
+            // Restore proximal/distal from base bounds (consistent with zone creation)
+            zone.distal_line   = (zone.type == ZoneType::DEMAND) ? zone.base_low  : zone.base_high;
+            zone.proximal_line = (zone.type == ZoneType::DEMAND) ? zone.base_high : zone.base_low;
+
+            // Restore zone_id — use persisted value if present, else assign fresh
+            if (zone_json.isMember("zone_id") && zone_json["zone_id"].asInt() > 0) {
+                zone.zone_id = zone_json["zone_id"].asInt();
+                // Keep next_zone_id_ ahead of any restored id
+                if (zone.zone_id >= next_zone_id_) {
+                    next_zone_id_ = zone.zone_id + 1;
+                }
+            } else {
+                zone.zone_id = next_zone_id_++;
+            }
+
+            active_zones_.push_back(zone);
+
+            // Rebuild metadata entry so mark_zone_as_tested/violated work correctly
+            ZoneMetadata metadata;
+            metadata.zone_id = zone.zone_id;
+            metadata.bars_since_formation = 0;
+            metadata.bars_since_last_touch = 0;
+            metadata.currently_active = (zone.state != ZoneState::VIOLATED);
+            zone_metadata_[metadata.zone_id] = metadata;
         }
         
         return true;
@@ -498,33 +545,36 @@ void ZoneManager::scan_full_dataset(const std::vector<Bar>& bars,
             zone.formation_bar = i;
             zone.formation_datetime = bars[i].datetime;
             
-            // Determine zone type
+            // Determine zone type from impulse direction
             double impulse_move = bars[departure_end].close - bars[base_end].close;
-            if (impulse_move > 0) {
-                zone.type = ZoneType::DEMAND;
-                zone.base_low = bars[i].low;
-                zone.base_high = bars[base_end].high;
-                for (int j = i; j <= base_end; ++j) {
-                    zone.base_low = std::min(zone.base_low, bars[j].low);
-                    zone.base_high = std::max(zone.base_high, bars[j].high);
-                }
-            } else {
-                zone.type = ZoneType::SUPPLY;
-                zone.base_low = bars[i].low;
-                zone.base_high = bars[base_end].high;
-                for (int j = i; j <= base_end; ++j) {
-                    zone.base_low = std::min(zone.base_low, bars[j].low);
-                    zone.base_high = std::max(zone.base_high, bars[j].high);
-                }
+            
+            // Compute base range (same for both types)
+            zone.base_low = bars[i].low;
+            zone.base_high = bars[i].high;
+            for (int j = i; j <= base_end; ++j) {
+                zone.base_low = std::min(zone.base_low, bars[j].low);
+                zone.base_high = std::max(zone.base_high, bars[j].high);
             }
             
-            zone.distal_line = (zone.type == ZoneType::DEMAND) ? zone.base_low : zone.base_high;
-            zone.proximal_line = (zone.type == ZoneType::DEMAND) ? zone.base_high : zone.base_low;
+            if (impulse_move > 0) {
+                // Price moved UP after base → DEMAND zone (base was a consolidation before a rally)
+                zone.type = ZoneType::DEMAND;
+                zone.distal_line = zone.base_low;    // Far boundary (bottom)
+                zone.proximal_line = zone.base_high; // Near boundary (top — price approaches from above on retest)
+            } else {
+                // Price moved DOWN after base → SUPPLY zone
+                zone.type = ZoneType::SUPPLY;
+                zone.distal_line = zone.base_high;   // Far boundary (top)
+                zone.proximal_line = zone.base_low;  // Near boundary (bottom — price approaches from below on retest)
+            }
             
-            // Calculate strength
+            // FIX: Strength = tightness score (tighter consolidation = stronger zone)
+            // Original formula was inverted: wider range got higher strength
             double height = zone.base_high - zone.base_low;
-            zone.strength = 50.0 + (height / atr) * 10.0;
-            zone.strength = std::min(zone.strength, 100.0);
+            double max_range = config.base_height_max_atr * atr;
+            // Normalize: 0 = width at max_range (weakest), 100 = zero width (strongest)
+            zone.strength = 100.0 * (1.0 - std::min(height / max_range, 1.0));
+            zone.strength = std::max(50.0, zone.strength);  // Floor at 50 so valid zones start at 50
             
             // Calculate elite metrics and swing analysis
             calculate_elite_metrics(zone, bars, static_cast<int>(bars.size()) - 1, config);

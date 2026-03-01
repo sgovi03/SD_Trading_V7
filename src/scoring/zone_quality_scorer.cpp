@@ -14,7 +14,41 @@ ZoneQualityScorer::ZoneQualityScorer(const Config& cfg) : config_(cfg) {}
 ZoneQualityScore ZoneQualityScorer::calculate(const Zone& zone, const std::vector<Bar>& bars, int current_index) const {
     ZoneQualityScore score;
 
+	std::cout << "\n[DEBUG] Zone #" << zone.zone_id 
+          << " touches=" << zone.touch_count
+          << " max=" << config_.zone_max_touch_count
+          << " max_age=" << config_.zone_max_age_days
+          << std::flush;
+		  
     if (current_index < 0 || current_index >= static_cast<int>(bars.size())) {
+        return score;
+    }
+
+std::cout << "\nAfter  if (current_index < 0 || current_index >= static_cast<int>(bars.size())) statement" 
+          << " touches=" << zone.touch_count
+          << " max=" << config_.zone_max_touch_count
+          << " max_age=" << config_.zone_max_age_days
+          << std::flush;
+    // =================================================================
+    // ⭐ CRITICAL FIX #1: AUTO-RETIRE EXHAUSTED ZONES
+    // =================================================================
+    if (zone.touch_count > config_.zone_max_touch_count) {
+        score.total = 0.0;
+        LOG_WARN("\nZone #" + std::to_string(zone.zone_id) + " RETIRED: " + 
+                std::to_string(zone.touch_count) + " touches (max=" + 
+                std::to_string(config_.zone_max_touch_count) + ")");
+        return score;
+    }
+    
+    // =================================================================
+    // ⭐ CRITICAL FIX #2: AUTO-RETIRE OLD ZONES
+    // =================================================================
+    int age_days = calculate_days_difference(zone.formation_datetime, bars[current_index].datetime);
+    if (age_days > config_.zone_max_age_days) {
+        score.total = 0.0;
+        LOG_WARN("Zone #" + std::to_string(zone.zone_id) + " RETIRED: " + 
+                std::to_string(age_days) + " days old (max=" + 
+                std::to_string(config_.zone_max_age_days) + ")");
         return score;
     }
 
@@ -24,7 +58,7 @@ ZoneQualityScore ZoneQualityScorer::calculate(const Zone& zone, const std::vecto
     double base_strength = calculate_base_strength_score(zone);      // 0-30
     double age_score = calculate_age_score(zone, bars[current_index]); // 0-25
     double rejection_score = calculate_rejection_score(zone, bars, current_index); // 0-25
-    double touch_penalty = calculate_touch_penalty(zone);            // -15 to 0
+    double touch_penalty = calculate_touch_penalty(zone);            // -50 to +5
     double breakthrough_penalty = calculate_breakthrough_penalty(zone, bars, current_index);
     double elite_bonus = calculate_elite_bonus(zone, bars[current_index]);
     
@@ -37,7 +71,7 @@ ZoneQualityScore ZoneQualityScorer::calculate(const Zone& zone, const std::vecto
     LOG_INFO("   Base Strength:       " + std::to_string(base_strength) + " (0-30)");
     LOG_INFO("   Age Score:           " + std::to_string(age_score) + " (0-25)");
     LOG_INFO("   Rejection Score:     " + std::to_string(rejection_score) + " (0-25)");
-    LOG_INFO("   Touch Penalty:       " + std::to_string(touch_penalty) + " (-15 to 0)");
+    LOG_INFO("   Touch Penalty:       " + std::to_string(touch_penalty) + " (-50 to +5)");
     LOG_INFO("   Breakthrough Penalty:" + std::to_string(breakthrough_penalty));
     LOG_INFO("   Elite Bonus:         " + std::to_string(elite_bonus));
     LOG_INFO("   TRADITIONAL TOTAL:   " + std::to_string(traditional_score));
@@ -93,10 +127,12 @@ ZoneQualityScore ZoneQualityScorer::calculate(const Zone& zone, const std::vecto
     // Clamp to valid range [0, 100]
     score.total = std::max(0.0, std::min(100.0, score.total));
     
-    LOG_INFO("Zone Score Breakdown: Traditional=" + std::to_string(traditional_score) +
+    LOG_INFO("Zone #" + std::to_string(zone.zone_id) + 
+             " Score: Traditional=" + std::to_string(traditional_score) +
              " Volume=" + std::to_string(volume_score) +
              " OI=" + std::to_string(oi_score) +
-             " InstIndex=" + std::to_string(zone.institutional_index) +
+             " Touches=" + std::to_string(zone.touch_count) +
+             " Age=" + std::to_string(age_days) + "d" +
              " TOTAL=" + std::to_string(score.total));
     
     return score;
@@ -112,26 +148,41 @@ double ZoneQualityScorer::calculate_base_strength_score(const Zone& zone) const 
     return (zone.strength / 100.0) * 30.0;
 }
 
-// Component 2: AGE DECAY (0-25 range) - CRITICAL COMPONENT
+// Component 2: AGE DECAY (0-25 range) - ⭐ FIXED: Much more aggressive decay
 double ZoneQualityScorer::calculate_age_score(const Zone& zone, const Bar& current_bar) const {
     int age_days = calculate_days_difference(zone.formation_datetime, current_bar.datetime);
     double age_factor;
 
-    if (age_days <= 30) {
-        // Full score for zones < 1 month
+    // ⭐ FIX: Aggressive age decay - zones expire much faster
+    if (age_days <= 7) {
+        // Full score for zones < 1 week
         age_factor = 1.0;
-    } else if (age_days <= 90) {
-        // Linear decay 1.0 -> 0.67 (30 to 90 days)
-        age_factor = 1.0 - (age_days - 30) / 180.0;
-    } else if (age_days <= 180) {
-        // Linear decay 0.67 -> 0.33 (90 to 180 days)
-        age_factor = 0.67 - (age_days - 90) / 270.0;
+    } else if (age_days <= 14) {
+        // Linear decay 1.0 -> 0.8 (week 2)
+        age_factor = 1.0 - (age_days - 7) / 35.0;  // -0.2 over 7 days
+    } else if (age_days <= 30) {
+        // Linear decay 0.8 -> 0.5 (weeks 3-4)
+        age_factor = 0.8 - (age_days - 14) / 53.33;  // -0.3 over 16 days
+    } else if (age_days <= 60) {
+        // Linear decay 0.5 -> 0.2 (months 2)
+        age_factor = 0.5 - (age_days - 30) / 100.0;  // -0.3 over 30 days
+    } else if (age_days <= config_.zone_max_age_days) {
+        // Final decay 0.2 -> 0.0 until retirement
+        int remaining_days = config_.zone_max_age_days - 60;
+        age_factor = 0.2 * (1.0 - static_cast<double>(age_days - 60) / remaining_days);
+        age_factor = std::max(0.0, age_factor);
     } else {
-        // Exponential decay after 180 days
-        age_factor = std::max(0.1, std::exp(-(age_days - 180) / 120.0));
+        // Zone should be retired (this shouldn't happen due to early return)
+        age_factor = 0.0;
     }
 
-    return 25.0 * age_factor;
+    double age_score = 25.0 * age_factor;
+    
+    LOG_DEBUG("Age scoring: " + std::to_string(age_days) + " days, " +
+              "factor=" + std::to_string(age_factor) + ", " +
+              "score=" + std::to_string(age_score));
+    
+    return age_score;
 }
 
 // Component 3: REJECTION QUALITY (0-25 range) - Based on 30-day rejection rate OR zone touch count as proxy
@@ -154,39 +205,51 @@ double ZoneQualityScorer::calculate_rejection_score(const Zone& zone, const std:
         }
     } else {
         // FALLBACK: Use zone.touch_count as proxy for zone quality
-        // Touch count > 0 means zone is being respected
-        // If zone has touches but no rejection history (bootstrap), give it partial credit
-        if (zone.touch_count >= 10) {
-            // Well-tested zone with many touches = likely being respected
-            rejection_score = 15.0;  // Partial credit
-        } else if (zone.touch_count >= 5) {
-            // Some validation
-            rejection_score = 10.0;
-        } else if (zone.touch_count > 0) {
-            // At least one touch (fresh zone)
-            rejection_score = 5.0;
+        // ⭐ FIX: Favor FRESH zones (0-3 touches)
+        if (zone.touch_count == 0) {
+            // Untested fresh zone - give benefit of doubt
+            rejection_score = 15.0;
+        } else if (zone.touch_count <= 3) {
+            // Fresh zone with 1-3 tests - excellent!
+            rejection_score = 20.0;
+        } else if (zone.touch_count <= 10) {
+            // Some validation but still fresh
+            rejection_score = 12.0;
         } else {
-            // No touches yet - truly untested
-            rejection_score = 0.0;
+            // Many touches but no rejection data - partial credit
+            rejection_score = 8.0;
         }
     }
 
     return rejection_score;
 }
 
-// Component 4: TOUCH COUNT PENALTY (-15 to 0)
+// Component 4: TOUCH COUNT PENALTY - ⭐ COMPLETELY REWRITTEN
 double ZoneQualityScorer::calculate_touch_penalty(const Zone& zone) const {
     double penalty = 0.0;
 
-    if (zone.touch_count > 100) {
-        penalty = -15.0;  // Heavy penalty for exhausted zones
-    } else if (zone.touch_count > 70) {
-        penalty = -10.0;
-    } else if (zone.touch_count > 50) {
-        penalty = -5.0;
-    } else if (zone.touch_count < 5) {
-        penalty = -5.0;  // Penalty for untested zones
+    // ⭐ FIX: Favor FRESH zones, heavily penalize overtraded zones
+    if (zone.touch_count == 0) {
+        penalty = +5.0;  // BONUS for untested zones (institutional fresh)
+    } else if (zone.touch_count <= 2) {
+        penalty = +3.0;  // BONUS for barely-tested zones
+    } else if (zone.touch_count <= 5) {
+        penalty = 0.0;   // Neutral for lightly-tested zones
+    } else if (zone.touch_count <= 10) {
+        penalty = -3.0;  // Light penalty
+    } else if (zone.touch_count <= 20) {
+        penalty = -8.0;  // Medium penalty
+    } else if (zone.touch_count <= 30) {
+        penalty = -15.0; // Heavy penalty
+    } else if (zone.touch_count <= 50) {
+        penalty = -30.0; // Very heavy penalty
+    } else {
+        // Should be retired, but if not, massive penalty
+        penalty = -100.0;  // Effectively disables zone
     }
+
+    LOG_DEBUG("Touch penalty: count=" + std::to_string(zone.touch_count) +
+              ", penalty=" + std::to_string(penalty));
 
     return penalty;
 }
@@ -217,12 +280,13 @@ double ZoneQualityScorer::calculate_elite_bonus(const Zone& zone, const Bar& cur
     int age_days = calculate_days_difference(zone.formation_datetime, current_bar.datetime);
     double elite_bonus;
 
-    if (age_days <= 90) {
-        elite_bonus = 10.0;  // Full bonus for elite zones < 3 months
-    } else if (age_days <= 180) {
-        elite_bonus = 5.0;   // Half bonus for 3-6 months
+    // ⭐ FIX: Elite status expires much faster
+    if (age_days <= 30) {
+        elite_bonus = 10.0;  // Full bonus for elite zones < 1 month
+    } else if (age_days <= 60) {
+        elite_bonus = 5.0;   // Half bonus for 1-2 months
     } else {
-        elite_bonus = 0.0;   // Elite status expires after 6 months
+        elite_bonus = 0.0;   // Elite status expires after 2 months (was 6!)
     }
 
     return elite_bonus;
@@ -236,9 +300,8 @@ double ZoneQualityScorer::calculate_recent_rejection_rate(const Zone& zone, cons
     }
 
     // Calculate lookback start index
-    // For 1-min bars: ~390 bars per trading day (6.5 hours * 60 min - gaps)
-    // Conservative: use 350 to account for data gaps
-    int lookback_bars = lookback_days * 350;  // 350 bars ≈ 1 trading day
+    // For 5-min bars: ~78 bars per trading day (6.5 hours × 12 bars/hour)
+    int lookback_bars = lookback_days * 78;  // 78 bars ≈ 1 trading day for 5-min
     int start_index = std::max(0, current_index - lookback_bars);
 
     int touches = 0;
@@ -265,8 +328,8 @@ double ZoneQualityScorer::calculate_breakthrough_rate(const Zone& zone, const st
     }
 
     // Calculate lookback start index
-    // For 1-min bars: ~350 bars per trading day (accounting for gaps)
-    int lookback_bars = lookback_days * 350;  // 350 bars ≈ 1 trading day
+    // For 5-min bars: ~78 bars per trading day
+    int lookback_bars = lookback_days * 78;
     int start_index = std::max(0, current_index - lookback_bars);
 
     int touches = 0;

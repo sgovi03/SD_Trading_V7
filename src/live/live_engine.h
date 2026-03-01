@@ -27,6 +27,7 @@
 #include "utils/volume_baseline.h"  // V6.0: Volume baseline
 #include "scoring/volume_scorer.h"  // V6.0: Volume scorer
 #include "scoring/oi_scorer.h"  // V6.0: OI scorer
+#include "core/zone_state_manager.h"
 
 namespace SDTrading {
 namespace Live {
@@ -73,6 +74,9 @@ protected:
     Config config;  // Store by value to avoid dangling reference
     std::unique_ptr<BrokerInterface> broker;
     
+	// ⭐ FIX #2: Zone State Lifecycle Manager
+    std::unique_ptr<Core::ZoneStateManager> zone_state_manager_;
+	
     // Core components (same as backtest - The Brain)
     ZoneDetector detector;
     ZoneScorer scorer;

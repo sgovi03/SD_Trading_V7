@@ -45,7 +45,7 @@ private:
     std::string state_file_;
     
     // Private helper methods - implementation in .cpp
-    void update_zone_states(const Bar& current_bar, double atr);
+    void update_zone_states(const Bar& current_bar, double atr, const BacktestConfig& config);
     void mark_zone_as_tested(Zone& zone, double touch_price, const Bar* touch_bar = nullptr);
     void mark_zone_as_violated(Zone& zone, const std::string& reason);
     bool should_deactivate_zone(const Zone& zone, const ZoneMetadata& metadata,

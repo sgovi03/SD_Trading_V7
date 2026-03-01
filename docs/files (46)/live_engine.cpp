@@ -1,0 +1,3295 @@
+// ============================================================
+// LIVE ENGINE - MODIFIED IMPLEMENTATION
+// ============================================================
+
+#include "live_engine.h"
+#include "../csv_simulator_broker.h"  // ⭐ ADD THIS LINE
+#include "fyers_adapter.h"  // ⭐ NEW: For FyersAdapter dynamic_cast
+#include "../utils/logger.h"
+#include "../analysis/market_analyzer.h"
+#include "../backtest/csv_reporter.h"  // ⭐ NEW: CSV export functionality
+#include "../backtest/performance_tracker.h"  // ⭐ NEW: Performance tracking
+#include "../sd_engine_core.h"  // ⭐ For calculate_trailing_stop
+#include <iostream>
+#include <iomanip>
+#include <thread>
+#include <chrono>
+#include <ctime>
+#include <cmath>
+#include <optional>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <numeric>
+#include <algorithm>  // ⭐ FIX: Added for std::sort, std::stable_sort
+#include <json/json.h>
+// In BacktestEngine files
+#include "../ITradingEngine.h"
+#include "../ZonePersistenceAdapter.h"
+#include "../ZoneInitializer.h"
+
+namespace fs = std::filesystem;
+
+namespace SDTrading {
+namespace Live {
+
+using namespace Utils;
+
+// Fix Windows.h macro conflicts with std::max and std::min
+#undef max
+#undef min
+
+using namespace Core;
+
+namespace {
+
+int calculate_days_difference(const std::string& from_dt, const std::string& to_dt) {
+    auto parse_date = [](const std::string& dt, std::tm& tm_out) -> bool {
+        std::istringstream ss(dt);
+        ss >> std::get_time(&tm_out, "%Y-%m-%d %H:%M:%S");
+        if (!ss.fail()) {
+            return true;
+        }
+        ss.clear();
+        ss.str(dt);
+        ss >> std::get_time(&tm_out, "%Y-%m-%d");
+        return !ss.fail();
+    };
+
+    std::tm from_tm{};
+    std::tm to_tm{};
+    if (!parse_date(from_dt, from_tm) || !parse_date(to_dt, to_tm)) {
+        return 0;
+    }
+
+    from_tm.tm_isdst = -1;
+    to_tm.tm_isdst = -1;
+
+    std::time_t from_time = std::mktime(&from_tm);
+    std::time_t to_time = std::mktime(&to_tm);
+    if (from_time == static_cast<std::time_t>(-1) || to_time == static_cast<std::time_t>(-1)) {
+        return 0;
+    }
+
+    double diff_sec = std::difftime(to_time, from_time);
+    int days = static_cast<int>(diff_sec / (60.0 * 60.0 * 24.0));
+    return std::max(0, days);
+}
+
+bool is_zone_age_blocked(const Zone& zone, const Bar& current_bar, const Config& config, int& age_days_out) {
+    age_days_out = calculate_days_difference(zone.formation_datetime, current_bar.datetime);
+
+    if (config.min_zone_age_days > 0 && age_days_out < config.min_zone_age_days) {
+        return true;
+    }
+    if (config.max_zone_age_days > 0 && age_days_out > config.max_zone_age_days) {
+        return true;
+    }
+    if (config.exclude_zone_age_range &&
+        age_days_out >= config.exclude_zone_age_start &&
+        age_days_out <= config.exclude_zone_age_end) {
+        return true;
+    }
+
+    return false;
+}
+
+}  // namespace
+
+LiveEngine::LiveEngine(
+    const Config& cfg,
+    std::unique_ptr<BrokerInterface> broker_interface,
+    const std::string& symbol,
+    const std::string& interval,
+    const std::string& output_dir,
+    const std::string& historical_csv_path
+)
+    : config(cfg),  // Copy config to member
+      broker(std::move(broker_interface)),
+      detector(config),  // Pass member, not parameter
+      scorer(config),
+      entry_engine(config),
+      trade_mgr(broker ? Backtest::TradeManager(config, config.starting_capital, broker.get())
+                       : Backtest::TradeManager(config, config.starting_capital)),  // Use backtest mode when no broker (dryrun)
+      performance(config.starting_capital),  // ⭐ NEW: Performance tracker
+      last_csv_export_bar_(-1),  // ⭐ NEW: CSV export tracking
+      v6_enabled_(false),  // ✅ V6.0: Initialize flag
+      zone_persistence_("live", output_dir, config.enable_live_zone_filtering),  // ⭐ FIXED: Pass filtering flag
+            next_zone_id_(1),  // NEW: Zone ID tracking
+            output_dir_(output_dir),
+            historical_csv_path_(historical_csv_path),  // ⭐ NEW: Store CSV path
+    bar_index(0),
+    last_zone_scan_bar_(-1),  // NEW: Track last zone scan position
+    last_saved_bar_time_(""),
+    dryrun_bootstrap_end_bar_(0),  // ⭐ NEW: Initialize to 0 (no bootstrap)
+    skip_trading_until_bar_(false),  // ⭐ NEW: Initialize to false (trading enabled)
+    trading_symbol(symbol),
+    bar_interval(interval) {    
+		LOG_INFO("=========================================");
+		LOG_INFO("SD TRADING LIVE ENGINE V6.0");
+		LOG_INFO("=========================================");
+		LOG_INFO("LiveEngine created for " << symbol << " @ " << interval << " min");
+		
+		// ⭐ FIX: Moved OrderSubmitter initialization INSIDE constructor body
+		// Create OrderSubmitter
+		OrderSubmitConfig order_config;
+		order_config.base_url = "http://localhost:8080";
+		order_config.long_strategy_number = 13;
+		order_config.short_strategy_number = 14;
+		order_config.enable_submission = true;  // false for dry-run
+		order_submitter_ = std::make_unique<OrderSubmitter>(order_config);
+		
+		// ✅ V6.0: Initialize V6.0 components
+		if (config.v6_fully_enabled) {
+			v6_enabled_ = initialize_v6_components();
+			
+			if (v6_enabled_) {
+				wire_v6_dependencies();
+				LOG_INFO("✅ V6.0 components initialized and wired");
+			} else {
+				LOG_WARN("⚠️ V6.0 initialization failed - running in V4.0 mode");
+			}
+		} else {
+			LOG_WARN("⚠️ V6.0 disabled in config - running V4.0 mode");
+		}
+	}
+
+LiveEngine::~LiveEngine() {
+    // V6.0 resources cleanup automatic with unique_ptr
+}
+
+// =========================================
+// V6.0: Implementation Functions
+// =========================================
+
+bool LiveEngine::initialize_v6_components() {
+    LOG_INFO("🔄 Initializing V6.0 components...");
+    
+    // 1. Load Volume Baseline
+    if (!volume_baseline_.load_from_file(config.volume_baseline_file)) {
+        LOG_ERROR("❌ Failed to load volume baseline from: " + config.volume_baseline_file);
+        
+        if (config.v6_validate_baseline_on_startup) {
+            LOG_ERROR("Baseline validation REQUIRED but failed");
+            return false;
+        } else {
+            LOG_WARN("⚠️ Continuing without volume baseline (degraded mode)");
+            return false;
+        }
+    }
+    
+    LOG_INFO("✅ Volume Baseline loaded: " << volume_baseline_.size() << " time slots");
+    
+    // 2. Create Volume Scorer
+    volume_scorer_ = std::make_unique<Core::VolumeScorer>(volume_baseline_);
+    LOG_INFO("✅ VolumeScorer created");
+    
+    // 3. Create OI Scorer
+    oi_scorer_ = std::make_unique<Core::OIScorer>();
+    LOG_INFO("✅ OIScorer created");
+    
+    return true;
+}
+
+void LiveEngine::wire_v6_dependencies() {
+    LOG_INFO("🔌 Wiring V6.0 dependencies to shared components...");
+    
+    // 1. Wire to ZoneDetector
+    if (volume_baseline_.is_loaded()) {
+        detector.set_volume_baseline(&volume_baseline_);
+        LOG_INFO("✅ ZoneDetector ← VolumeBaseline");
+    }
+    
+    // 2. Wire to EntryDecisionEngine
+    if (volume_baseline_.is_loaded()) {
+        entry_engine.set_volume_baseline(&volume_baseline_);
+        LOG_INFO("✅ EntryDecisionEngine ← VolumeBaseline");
+    }
+    
+    if (oi_scorer_) {
+        entry_engine.set_oi_scorer(oi_scorer_.get());
+        LOG_INFO("✅ EntryDecisionEngine ← OIScorer");
+    }
+    
+    // 3. Wire to TradeManager
+    if (volume_baseline_.is_loaded()) {
+        trade_mgr.set_volume_baseline(&volume_baseline_);
+        LOG_INFO("✅ TradeManager ← VolumeBaseline");
+    }
+    
+    if (oi_scorer_) {
+        trade_mgr.set_oi_scorer(oi_scorer_.get());
+        LOG_INFO("✅ TradeManager ← OIScorer");
+    }
+    
+    LOG_INFO("🔌 V6.0 wiring complete");
+}
+
+void LiveEngine::validate_v6_startup() {
+    LOG_INFO("=========================================");
+    LOG_INFO("V6.0 LIVE ENGINE STARTUP VALIDATION");
+    LOG_INFO("=========================================");
+    
+    LOG_INFO("V6.0 Enabled:        " << (v6_enabled_ ? "✅ YES" : "❌ NO"));
+    LOG_INFO("Volume Baseline:     " << (volume_baseline_.is_loaded() ? "✅ LOADED" : "❌ NOT LOADED"));
+    LOG_INFO("Volume Scorer:       " << (volume_scorer_ ? "✅ ACTIVE" : "❌ INACTIVE"));
+    LOG_INFO("OI Scorer:           " << (oi_scorer_ ? "✅ ACTIVE" : "❌ INACTIVE"));
+    LOG_INFO("Volume Entry Filter: " << (config.enable_volume_entry_filters ? "✅ ENABLED" : "⚠️ DISABLED"));
+    LOG_INFO("OI Entry Filter:     " << (config.enable_oi_entry_filters ? "✅ ENABLED" : "⚠️ DISABLED"));
+    LOG_INFO("Volume Exit Signals: " << (config.enable_volume_exit_signals ? "✅ ENABLED" : "⚠️ DISABLED"));
+    LOG_INFO("OI Exit Signals:     " << (config.enable_oi_exit_signals ? "✅ ENABLED" : "⚠️ DISABLED"));
+    
+    // Validate configuration consistency
+    if (v6_enabled_) {
+        bool all_good = true;
+        
+        if (!volume_baseline_.is_loaded()) {
+            LOG_ERROR("⚠️ V6.0 enabled but baseline not loaded!");
+            all_good = false;
+        }
+        
+        if (!volume_scorer_ || !oi_scorer_) {
+            LOG_ERROR("⚠️ V6.0 enabled but scorers not created!");
+            all_good = false;
+        }
+        
+        if (all_good) {
+            LOG_INFO("✅ V6.0 VALIDATION PASSED - All systems operational");
+        } else {
+            LOG_ERROR("❌ V6.0 VALIDATION FAILED - Check errors above");
+        }
+    } else {
+        LOG_WARN("⚠️ V6.0 NOT ENABLED - Running in V4.0 degraded mode");
+    }
+    
+    LOG_INFO("=========================================");
+}
+
+bool LiveEngine::is_expiry_day(const std::string& current_datetime) const {
+    // Parse datetime to extract date
+    // Format: "2026-02-27 09:15:00"
+    if (current_datetime.length() < 10) {
+        return false;
+    }
+    
+    std::string date_str = current_datetime.substr(0, 10); // "2026-02-27"
+    
+    // Parse year, month, day
+    int year, month, day;
+    char dash1, dash2;
+    std::istringstream ss(date_str);
+    ss >> year >> dash1 >> month >> dash2 >> day;
+    
+    if (ss.fail() || dash1 != '-' || dash2 != '-') {
+        return false;
+    }
+    
+    // Check if it's last Thursday of the month
+    // Create date for this day
+    std::tm tm = {};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_isdst = -1;
+    
+    std::mktime(&tm); // Normalize (sets tm_wday)
+    
+    int weekday = tm.tm_wday; // 0 = Sunday, 4 = Thursday
+    
+    // Check if Thursday
+    if (weekday != 4) {
+        return false;
+    }
+    
+    // Check if last Thursday of month
+    // Add 7 days and see if we're in next month
+    tm.tm_mday += 7;
+    std::mktime(&tm);
+    
+    // If month changed, this was the last Thursday
+    return (tm.tm_mon != month - 1);
+}
+
+
+std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
+    std::vector<Bar> bars;
+    std::ifstream file(csv_path);
+    
+    if (!file.is_open()) {
+        LOG_ERROR("Could not open CSV file: " << csv_path);
+        return bars;
+    }
+    
+    std::string line;
+    std::getline(file, line);  // Read header
+    
+    // ✅ V6.0: Validate CSV format (expecting 11 columns for V6.0)
+    std::istringstream header_stream(line);
+    std::string col;
+    int col_count = 0;
+    while (std::getline(header_stream, col, ',')) {
+        col_count++;
+    }
+    
+    if (col_count != 11 && col_count != 9) {
+        LOG_ERROR("❌ INVALID CSV FORMAT: Expected 11 columns (V6.0) or 9 columns (legacy), found " << col_count);
+        LOG_ERROR("   V6.0 CSV format: Timestamp,DateTime,Symbol,O,H,L,C,Volume,OI,OI_Fresh,OI_Age_Seconds");
+        LOG_ERROR("   Legacy format: Timestamp,DateTime,Symbol,O,H,L,C,Volume,OI");
+        return bars;
+    }
+    
+    if (col_count == 11) {
+        LOG_INFO("✅ CSV format validated: 11 columns (V6.0 compatible with OI metadata)");
+    } else {
+        LOG_WARN("⚠️ CSV format: 9 columns (legacy format - V6.0 OI features degraded)");
+    }
+    
+    bool has_oi_metadata = (col_count == 11);
+    
+    int line_num = 1;
+    while (std::getline(file, line)) {
+        line_num++;
+        if (line.empty()) continue;
+        
+        std::istringstream ss(line);
+        std::string field;
+        Bar bar;
+        int col = 0;
+        
+        // CSV format: Timestamp,DateTime,Symbol,Open,High,Low,Close,Volume,OpenInterest
+        while (std::getline(ss, field, ',')) {
+            try {
+                switch (col) {
+                    case 0: /* timestamp */ break;
+                    case 1: bar.datetime = field; break;
+                    case 2: /* symbol */ break;
+                    case 3: bar.open = std::stod(field); break;
+                    case 4: bar.high = std::stod(field); break;
+                    case 5: bar.low = std::stod(field); break;
+                    case 6: bar.close = std::stod(field); break;
+                    case 7: bar.volume = static_cast<double>(std::stoll(field)); break;
+                    case 8: bar.oi = static_cast<double>(std::stoll(field)); break;
+                    case 9: // OI_Fresh (V6.0 only)
+                        if (has_oi_metadata) {
+                            bar.oi_fresh = (std::stoi(field) == 1);
+                        }
+                        break;
+                    case 10: // OI_Age_Seconds (V6.0 only)
+                        if (has_oi_metadata) {
+                            bar.oi_age_seconds = std::stoi(field);
+                        }
+                        break;
+                }
+            } catch (const std::exception& e) {
+                LOG_WARN("Failed to parse field at line " << line_num << ", col " << col << ": " << e.what());
+            }
+            col++;
+        }
+        
+        if (col >= 8) {  // Valid bar with all required fields
+            bars.push_back(bar);
+        } else if (col > 0) {
+            LOG_WARN("Skipping incomplete line " << line_num << " (only " << col << " fields)");
+        }
+    }
+    
+    file.close();
+    
+    // Load full dataset for zone bootstrap to match backtest behavior
+    // NOTE: Previously trimmed to last 10,000 bars; now using all bars
+    // to ensure comprehensive zone detection and more trade opportunities.
+    
+    LOG_INFO("CSV file closed: " << csv_path);
+    LOG_INFO("Loaded " << bars.size() << " bars (from " << bars.front().datetime << " to " << bars.back().datetime << ")");
+    return bars;
+}
+
+bool LiveEngine::initialize() {
+    LOG_INFO("==================================================");
+    LOG_INFO("  Initializing Live Trading Engine");
+    LOG_INFO("==================================================");
+    LOG_INFO("Config summary (startup):");
+    LOG_INFO("  Symbol:       " << trading_symbol);
+    LOG_INFO("  Interval:     " << bar_interval << " min");
+    LOG_INFO("  Lot size:     " << config.lot_size << " (propagated from system_config)");
+    
+    // ⭐ NEW ARCHITECTURE: Load historical bars from CSV instead of broker
+    auto bar_load_start = std::chrono::high_resolution_clock::now();
+    LOG_INFO("Loading historical bars from CSV: " << historical_csv_path_);
+    bar_history = load_csv_data(historical_csv_path_);
+    auto bar_load_end = std::chrono::high_resolution_clock::now();
+    auto bar_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bar_load_end - bar_load_start).count();
+    
+    if (bar_history.empty()) {
+        LOG_ERROR("Failed to load historical data from CSV");
+        return false;
+    }
+    
+    LOG_INFO("✅ Loaded " << bar_history.size() << " historical bars from CSV");
+    LOG_INFO("   CSV loading took: " << bar_load_ms << "ms (" << (bar_load_ms/1000.0) << "s)");
+    
+	if (order_submitter_) {
+		if (!order_submitter_->initialize()) {
+			LOG_WARN("OrderSubmitter initialization failed");
+			order_submitter_.reset();
+		}
+	}
+    // Connect to broker AFTER CSV loading (broker only for live ticks)
+    if (!broker->connect()) {
+        LOG_ERROR("Failed to connect to broker");
+        return false;
+    }
+    
+    LOG_INFO("✅ Broker connected (for live tick monitoring)");
+    
+    // ⭐ CRITICAL: Position broker to return bars AFTER what we already loaded
+    // We loaded the LAST N bars for historical analysis and zone detection
+    // Position broker to return the NEXT bars after that (simulating new bars arriving)
+    // ⭐ CRITICAL: Position broker to return bars AFTER what we already loaded
+    Live::FyersAdapter* fyers = dynamic_cast<Live::FyersAdapter*>(broker.get());
+    Live::CsvSimulatorBroker* csv_sim = dynamic_cast<Live::CsvSimulatorBroker*>(broker.get());
+    
+    if (fyers && bar_history.size() > 0) {
+        size_t total_bars_in_csv = fyers->get_csv_bar_count();
+        size_t loaded_bar_count = bar_history.size();
+        
+        // Position broker at the end of loaded data (ready to return next bar)
+        // Since we loaded the LAST N bars, broker should be at total_bars_in_csv
+        size_t broker_position = total_bars_in_csv;
+        
+        LOG_INFO("⭐ CSV Live Simulation Setup:");
+        LOG_INFO("   Total bars in CSV: " << total_bars_in_csv);
+        LOG_INFO("   Loaded for analysis: " << loaded_bar_count << " bars");
+        LOG_INFO("   Last loaded bar: " << bar_history.back().datetime);
+        LOG_INFO("   Broker position: " << broker_position << " (no more bars in CSV)");
+        LOG_INFO("   Status: At end of historical data - will repeat last bar");
+        
+        fyers->skip_to_bar_index(broker_position);
+        
+       LOG_INFO("✅ Broker ready (at end of CSV data)");
+        
+    } else if (csv_sim && bar_history.size() > 0) {
+        // ⭐ NEW: CsvSimulatorBroker positioning
+        size_t total_bars = csv_sim->get_total_bars();
+        size_t loaded_bar_count = bar_history.size();
+        size_t broker_position = total_bars;  // Position at end
+        
+        LOG_INFO("⭐ CSV Simulator Setup:");
+        LOG_INFO("   Total bars in CSV: " << total_bars);
+        LOG_INFO("   Loaded for analysis: " << loaded_bar_count << " bars");
+        LOG_INFO("   Last loaded bar: " << bar_history.back().datetime);
+        LOG_INFO("   Positioning simulator at: " << broker_position);
+        
+        csv_sim->skip_to_bar_index(broker_position);
+        
+        LOG_INFO("✅ Simulator positioned at end of CSV");
+        
+    } else {
+        LOG_WARN("⚠️  Could not sync broker position");
+    }
+    
+    // ⭐ TIMING: Measure detector setup
+    auto detector_start = std::chrono::high_resolution_clock::now();
+    LOG_INFO("Initializing zone detector with bars...");
+    for (const auto& bar : bar_history) {
+        detector.add_bar(bar);
+    }
+    auto detector_end = std::chrono::high_resolution_clock::now();
+    auto detector_ms = std::chrono::duration_cast<std::chrono::milliseconds>(detector_end - detector_start).count();
+    
+    LOG_INFO("✅ Zone detector initialized");
+        LOG_INFO("   Detector setup took: " << detector_ms << "ms (" << (detector_ms/1000.0) << "s)");
+    
+    // ✅ V6.0: VALIDATE STARTUP (V6 components already initialized in constructor)
+    if (config.v6_fully_enabled) {
+        validate_v6_startup();
+    }
+    
+    LOG_INFO("==================================================");
+    LOG_INFO("  Live Engine Ready!");
+    LOG_INFO("==================================================");
+    
+    return true;
+}
+
+void LiveEngine::update_bar_history() {
+    // Get latest bar from broker
+    Bar latest_bar = broker->get_latest_bar(trading_symbol, bar_interval);
+    
+    // Check if it's a new bar (different from last one)
+    if (!bar_history.empty()) {
+        const Bar& last_bar = bar_history.back();
+        if (latest_bar.datetime == last_bar.datetime) {
+            // Same bar, just update OHLC
+            bar_history.back() = latest_bar;
+            detector.update_last_bar(latest_bar);
+            LOG_DEBUG("Updated current bar");
+
+            // Ensure at least one visible print when data starts flowing
+            if (!has_printed_first_tick_) {
+                std::cout << "[CANDLE] "
+                          << latest_bar.datetime
+                          << " | O:" << std::fixed << std::setprecision(2) << latest_bar.open
+                          << " H:" << latest_bar.high
+                          << " L:" << latest_bar.low
+                          << " C:" << latest_bar.close
+                          << " V:" << latest_bar.volume
+                          << " Idx:" << (bar_history.size() - 1)
+                          << std::endl;
+                std::cout.flush();
+                has_printed_first_tick_ = true;
+                last_printed_bar_time_ = latest_bar.datetime;
+            }
+            return;  // ⭐ Return WITHOUT incrementing bar_index
+        }
+    }
+    
+    // New bar formed
+    bar_history.push_back(latest_bar);
+    detector.add_bar(latest_bar);
+    bar_index++;  // ⭐ MOVED HERE: Only increment when new bar is actually added
+    
+    LOG_INFO("📊 New bar formed: " << latest_bar.datetime 
+             << " C=" << latest_bar.close);
+
+    // ⭐ RUNTIME DEBUG: Log when appended CSV data arrives
+   // std::cout << "\n[BAR_ARRIVED] NEW BAR from CSV (possibly appended during runtime)\n";
+    std::cout << "  DateTime: " << latest_bar.datetime << "\n";
+    std::cout << "  OHLC: " << std::fixed << std::setprecision(2) 
+              << latest_bar.open << " / " << latest_bar.high << " / " 
+              << latest_bar.low << " / " << latest_bar.close << "\n";
+    std::cout << "  Bar Index: " << (bar_history.size() - 1) << "\n";
+    std::cout << "  Total bars in history: " << bar_history.size() << "\n";
+    std::cout << std::endl;
+    std::cout.flush();
+    
+    // Quick ASCII one-liner (friendly to all consoles)
+    std::cout << "[CANDLE] "
+              << latest_bar.datetime
+              << " | O:" << std::fixed << std::setprecision(2) << latest_bar.open
+              << " H:" << latest_bar.high
+              << " L:" << latest_bar.low
+              << " C:" << latest_bar.close
+              << " V:" << latest_bar.volume
+              << " Idx:" << (bar_history.size() - 1)
+              << std::endl;
+    std::cout.flush();
+    has_printed_first_tick_ = true;
+    last_printed_bar_time_ = latest_bar.datetime;
+    
+    // PRINT CANDLE DETAILS TO CONSOLE
+    // std::cout << "\n+====================================================+\n";
+    // std::cout << "| [NEW CANDLE] Live Candle Received from CSV        |\n";
+    // std::cout << "+====================================================+\n";
+    // std::cout << "  DateTime:  " << latest_bar.datetime << "\n";
+    // std::cout << "  Open:      " << std::fixed << std::setprecision(2) << latest_bar.open << "\n";
+    // std::cout << "  High:      " << latest_bar.high << "\n";
+    // std::cout << "  Low:       " << latest_bar.low << "\n";
+    // std::cout << "  Close:     " << latest_bar.close << "\n";
+    // std::cout << "  Volume:    " << latest_bar.volume << "\n";
+    // std::cout << "  Bar Index: " << bar_history.size() - 1 << "\n";
+    // std::cout << std::endl;
+    // std::cout.flush();  // Force flush to ensure output appears immediately
+    
+    // NEW: Update zone states on bar close
+    update_zone_states(latest_bar);
+}
+
+void LiveEngine::update_zone_states(const Bar& current_bar) {
+    bool zones_changed = false;
+
+    auto record_event = [&](Zone& target_zone, const ZoneStateEvent& evt, bool enabled) {
+        if (!config.enable_state_history || !enabled) {
+            return;
+        }
+        target_zone.state_history.push_back(evt);
+        if (config.max_state_history_events > 0 &&
+            target_zone.state_history.size() > static_cast<size_t>(config.max_state_history_events)) {
+            auto erase_count = target_zone.state_history.size() - static_cast<size_t>(config.max_state_history_events);
+            target_zone.state_history.erase(
+                target_zone.state_history.begin(),
+                target_zone.state_history.begin() + static_cast<long long>(erase_count));
+        }
+    };
+    
+    // Update states of active zones based on price action
+    for (auto& zone : active_zones) {
+        // NEW: Skip inactive zones during live filtering
+        // if (!zone.is_active) {
+        //     LOG_DEBUG("⛔ Zone " << zone.zone_id << " is inactive - skipping state update");
+        //     continue;
+        // }
+        
+        ZoneState old_state = zone.state;
+        std::string old_state_str = (old_state == ZoneState::FRESH ? "FRESH" :
+                                      old_state == ZoneState::TESTED ? "TESTED" : 
+                                      old_state == ZoneState::RECLAIMED ? "RECLAIMED" : "VIOLATED");
+        
+        bool price_in_zone = (current_bar.low <= zone.proximal_line && 
+                             current_bar.high >= zone.distal_line);
+        
+        if (price_in_zone) {
+            if (zone.state == ZoneState::FRESH) {
+                zone.state = ZoneState::TESTED;
+                zone.touch_count++;
+                zones_changed = true;
+                LOG_INFO("Zone " << zone.zone_id << " tested (first touch)");
+                
+                // Record FIRST_TOUCH event
+                ZoneStateEvent event(
+                    current_bar.datetime,
+                    static_cast<int>(bar_history.size()),
+                    "FIRST_TOUCH",
+                    old_state_str,
+                    "TESTED",
+                    (current_bar.high + current_bar.low) / 2.0,
+                    current_bar.high,
+                    current_bar.low,
+                    zone.touch_count
+                );
+                record_event(zone, event, config.record_first_touch);
+                
+            } else if (zone.state == ZoneState::TESTED) {
+                zone.touch_count++;
+                zones_changed = true;
+                
+                // Record RETEST event
+                ZoneStateEvent event(
+                    current_bar.datetime,
+                    static_cast<int>(bar_history.size()),
+                    "RETEST",
+                    old_state_str,
+                    "TESTED",
+                    (current_bar.high + current_bar.low) / 2.0,
+                    current_bar.high,
+                    current_bar.low,
+                    zone.touch_count
+                );
+                record_event(zone, event, config.record_retests);
+            }
+        }
+        
+        // Check for violation
+        bool violated = false;
+        std::string violation_event = "VIOLATED";
+        double violation_price = current_bar.close;
+
+        // Gap-over invalidation: entire bar clears the distal line without touching the zone
+        if (config.gap_over_invalidation && zone.state != ZoneState::VIOLATED) {
+            if (zone.type == ZoneType::DEMAND) {
+                violated = (current_bar.high < zone.distal_line);
+            } else {
+                violated = (current_bar.low > zone.distal_line);
+            }
+            if (violated) {
+                violation_event = "GAP_VIOLATED";
+                violation_price = (zone.type == ZoneType::DEMAND) ? current_bar.high : current_bar.low;
+                // ⭐ FIX: Set was_swept immediately (consistent with replay)
+                zone.was_swept = true;
+                zone.sweep_bar = static_cast<int>(bar_history.size());
+            }
+        }
+
+        // Body-close invalidation
+        if (!violated && config.invalidate_on_body_close) {
+            if (zone.type == ZoneType::DEMAND) {
+                violated = (current_bar.close < zone.distal_line);
+            } else {
+                violated = (current_bar.close > zone.distal_line);
+            }
+            if (violated) {
+                violation_event = "VIOLATED";
+                violation_price = current_bar.close;
+            }
+        }
+
+        if (violated && zone.state != ZoneState::VIOLATED) {
+            std::string pre_violation_state = (zone.state == ZoneState::FRESH ? "FRESH" : 
+                                               zone.state == ZoneState::TESTED ? "TESTED" : "RECLAIMED");
+            zone.state = ZoneState::VIOLATED;
+            zones_changed = true;
+            LOG_INFO("Zone " << zone.zone_id << " violated");
+
+            ZoneStateEvent event(
+                current_bar.datetime,
+                static_cast<int>(bar_history.size()),
+                violation_event,
+                pre_violation_state,
+                "VIOLATED",
+                violation_price,
+                current_bar.high,
+                current_bar.low,
+                zone.touch_count
+            );
+            record_event(zone, event, config.record_violations);
+
+            // NEW: Attempt zone flip detection after violation
+            if (config.enable_zone_flip) {
+                auto flipped = detect_zone_flip(zone, static_cast<int>(bar_history.size()) - 1);
+                if (flipped) {
+                    Zone new_zone = flipped.value();
+                    new_zone.zone_id = next_zone_id_++;
+                    
+                    // Score the flipped zone
+                    MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+                    new_zone.zone_score = scorer.evaluate_zone(new_zone, regime, current_bar);
+                    
+                    LOG_DEBUG("Flipped zone scored: ID=" << new_zone.zone_id 
+                             << " Total=" << new_zone.zone_score.total_score);
+                    
+                    active_zones.push_back(new_zone);
+                    LOG_INFO("NEW FLIPPED ZONE created: ID=" << new_zone.zone_id 
+                            << " Type=" << (new_zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Parent=" << zone.zone_id);
+                    zones_changed = true;
+                }
+            }
+        }
+        
+        // NEW: Sweep-Reclaim Detection (after violation is confirmed)
+        if (config.enable_sweep_reclaim && zone.state == ZoneState::VIOLATED && zone.was_swept) {
+            bool price_inside = (current_bar.low <= zone.proximal_line && 
+                                current_bar.high >= zone.distal_line);
+            
+            if (price_inside) {
+                // Calculate body percentage inside zone
+                double body_low = current_bar.open;
+                double body_high = current_bar.close;
+                if (body_high < body_low) std::swap(body_low, body_high);
+                
+                double body_in_zone = 0.0;
+                if (zone.type == ZoneType::DEMAND) {
+                    // For demand zone: body above distal line is considered "inside"
+                    body_in_zone = std::max<double>(0.0, body_high - zone.distal_line);
+                } else {
+                    // For supply zone: body below distal line is considered "inside"
+                    body_in_zone = std::max<double>(0.0, zone.distal_line - body_low);
+                }
+                
+                double zone_range = zone.proximal_line - zone.distal_line;
+                if (zone_range < 0) zone_range = -zone_range;
+                double body_pct = (zone_range > 0.0001) ? (body_in_zone / zone_range) : 0.0;
+                
+                if (body_pct >= config.reclaim_acceptance_pct) {
+                    zone.bars_inside_after_sweep++;
+                    
+                    if (zone.bars_inside_after_sweep >= config.reclaim_acceptance_bars) {
+                        zone.state = ZoneState::RECLAIMED;
+                        zone.reclaim_eligible = true;
+                        LOG_INFO("Zone " << zone.zone_id << " SWEEP_RECLAIMED after " 
+                                << zone.bars_inside_after_sweep << " bars");
+                        zones_changed = true;
+                        
+                        ZoneStateEvent reclaim_event(
+                            current_bar.datetime,
+                            static_cast<int>(bar_history.size()),
+                            "SWEEP_RECLAIMED",
+                            "VIOLATED",
+                            "RECLAIMED",
+                            (current_bar.high + current_bar.low) / 2.0,
+                            current_bar.high,
+                            current_bar.low,
+                            zone.touch_count
+                        );
+                        record_event(zone, reclaim_event, true);
+                    }
+                }
+            } else {
+                // Price exited zone - reset counter if body insufficient
+                zone.bars_inside_after_sweep = 0;
+                zone.reclaim_eligible = false;
+            }
+        }
+    }
+    
+    // NEW: Save zones once per bar if any state changed (prevents log spam)
+    if (zones_changed && current_bar.datetime != last_saved_bar_time_) {
+        // Clear state history if disabled
+        if (!config.enable_state_history) {
+            for (auto& zone : active_zones) {
+                zone.state_history.clear();
+            }
+        }
+        zone_persistence_.save_zones(active_zones, next_zone_id_);
+        // --- Update master zones file in sync ---
+        // Build metadata (similar to bootstrap)
+        std::map<std::string, std::string> metadata;
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm;
+    #ifdef _WIN32
+        localtime_s(&tm, &time_t);
+    #else
+        tm = *std::localtime(&time_t);
+    #endif
+        std::ostringstream timestamp_ss;
+        timestamp_ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        metadata["generated_at"] = timestamp_ss.str();
+        metadata["csv_path"] = historical_csv_path_;
+        metadata["symbol"] = trading_symbol;
+        metadata["interval"] = bar_interval;
+        metadata["bar_count"] = std::to_string(bar_history.size());
+        metadata["zone_count"] = std::to_string(active_zones.size());
+        metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
+        metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
+        fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+        zone_persistence_.save_zones_with_metadata(active_zones, next_zone_id_, master_file_path.string(), metadata);
+        last_saved_bar_time_ = current_bar.datetime;
+    }
+}
+
+// ============================================================
+// ⭐ FIX: OPTIMIZED ZONE-CENTRIC REPLAY WITH PRICE RANGE FILTERING
+// ============================================================
+// This replaces the original O(n×m) replay with an optimized version that:
+// 1. Only processes zones within price range of current LTP
+// 2. Processes each zone independently (better cache locality)
+// 3. Starts from formation_bar (skips irrelevant early bars)
+// 4. Early exits when zone reaches terminal state
+// 5. Consistent logic with update_zone_states()
+// ============================================================
+void LiveEngine::replay_historical_zone_states() {
+    if (bar_history.empty() || active_zones.empty()) {
+        LOG_INFO("Nothing to replay (empty bar_history or no zones)");
+        return;
+    }
+    
+    auto replay_start = std::chrono::high_resolution_clock::now();
+    
+    // Get current LTP for price range filtering
+    double current_ltp = bar_history.back().close;
+    double range_pct = config.live_zone_range_pct > 0 ? config.live_zone_range_pct : 5.0;  // Default 5%
+    
+    auto [lower, upper] = calculate_price_range(current_ltp, range_pct);
+    
+    LOG_INFO("=== Optimized Zone State Replay (Zone-Centric) ===");
+    LOG_INFO("Current LTP: " << current_ltp);
+    LOG_INFO("Price range: [" << lower << ", " << upper << "] (±" << range_pct << "%)");
+    LOG_INFO("Total zones: " << active_zones.size());
+    LOG_INFO("Total bars: " << bar_history.size());
+    
+    // Helper lambda for state string
+    auto get_state_str = [](ZoneState s) -> const char* {
+        switch(s) {
+            case ZoneState::FRESH: return "FRESH";
+            case ZoneState::TESTED: return "TESTED";
+            case ZoneState::RECLAIMED: return "RECLAIMED";
+            case ZoneState::VIOLATED: return "VIOLATED";
+            default: return "UNKNOWN";
+        }
+    };
+    
+    // Event recording lambda
+    auto record_event = [&](Zone& target_zone, const ZoneStateEvent& evt, bool enabled) {
+        if (!config.enable_state_history || !enabled) {
+            return;
+        }
+        target_zone.state_history.push_back(evt);
+        if (config.max_state_history_events > 0 &&
+            target_zone.state_history.size() > static_cast<size_t>(config.max_state_history_events)) {
+            auto erase_count = target_zone.state_history.size() - static_cast<size_t>(config.max_state_history_events);
+            target_zone.state_history.erase(
+                target_zone.state_history.begin(),
+                target_zone.state_history.begin() + static_cast<long long>(erase_count));
+        }
+    };
+    
+    bool zones_changed = false;
+    int zones_processed = 0;
+    int zones_skipped_range = 0;
+    size_t total_bar_iterations = 0;
+    
+    // ⭐ ZONE-CENTRIC PROCESSING: Process each zone independently
+    for (auto& zone : active_zones) {
+        // Skip zones outside price range (they won't be traded anyway)
+        if (!is_zone_in_range(zone, lower, upper)) {
+            zones_skipped_range++;
+            continue;  // Zone stays FRESH - will be updated if price moves there
+        }
+        
+        zones_processed++;
+        
+        // Start from the bar AFTER formation
+        size_t start_bar = static_cast<size_t>(zone.formation_bar) + 1;
+        if (start_bar >= bar_history.size()) {
+            continue;  // Zone just formed, nothing to replay
+        }
+        
+        // Process bars for this zone
+        for (size_t i = start_bar; i < bar_history.size(); ++i) {
+            total_bar_iterations++;
+            
+            // ⭐ EARLY EXIT: Skip if zone is in terminal state
+            if (zone.state == ZoneState::VIOLATED && 
+                (!config.enable_sweep_reclaim || !zone.was_swept)) {
+                break;
+            }
+            
+            const auto& bar = bar_history[i];
+            ZoneState old_state = zone.state;
+            
+            // --- Touch Detection ---
+            bool price_in_zone = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line);
+            
+            if (price_in_zone) {
+                if (zone.state == ZoneState::FRESH) {
+                    zone.state = ZoneState::TESTED;
+                    zone.touch_count++;
+                    zones_changed = true;
+                    
+                    ZoneStateEvent event(
+                        bar.datetime, static_cast<int>(i), "FIRST_TOUCH",
+                        get_state_str(old_state), "TESTED",
+                        (bar.high + bar.low) / 2.0, bar.high, bar.low, zone.touch_count
+                    );
+                    record_event(zone, event, config.record_first_touch);
+                    
+                } else if (zone.state == ZoneState::TESTED) {
+                    zone.touch_count++;
+                    zones_changed = true;
+                    
+                    ZoneStateEvent event(
+                        bar.datetime, static_cast<int>(i), "RETEST",
+                        get_state_str(old_state), "TESTED",
+                        (bar.high + bar.low) / 2.0, bar.high, bar.low, zone.touch_count
+                    );
+                    record_event(zone, event, config.record_retests);
+                }
+            }
+            
+            // --- Violation Detection ---
+            bool violated = false;
+            std::string violation_event = "VIOLATED";
+            double violation_price = bar.close;
+            
+            // Gap-over invalidation
+            if (config.gap_over_invalidation && zone.state != ZoneState::VIOLATED) {
+                if (zone.type == ZoneType::DEMAND) {
+                    violated = (bar.high < zone.distal_line);
+                } else {
+                    violated = (bar.low > zone.distal_line);
+                }
+                if (violated) {
+                    violation_event = "GAP_VIOLATED";
+                    violation_price = (zone.type == ZoneType::DEMAND) ? bar.high : bar.low;
+                    zone.was_swept = true;
+                    zone.sweep_bar = static_cast<int>(i);
+                }
+            }
+            
+            // Body-close invalidation
+            if (!violated && config.invalidate_on_body_close && zone.state != ZoneState::VIOLATED) {
+                if (zone.type == ZoneType::DEMAND) {
+                    violated = (bar.close < zone.distal_line);
+                } else {
+                    violated = (bar.close > zone.distal_line);
+                }
+                if (violated) {
+                    violation_event = "VIOLATED";
+                    violation_price = bar.close;
+                }
+            }
+            
+            // ⭐ FIX: Set violation state BEFORE sweep-reclaim check
+            if (violated && zone.state != ZoneState::VIOLATED) {
+                std::string pre_violation_state = get_state_str(zone.state);
+                zone.state = ZoneState::VIOLATED;
+                zones_changed = true;
+                
+                ZoneStateEvent event(
+                    bar.datetime, static_cast<int>(i), violation_event,
+                    pre_violation_state, "VIOLATED",
+                    violation_price, bar.high, bar.low, zone.touch_count
+                );
+                record_event(zone, event, config.record_violations);
+            }
+            
+            // --- Sweep-Reclaim Detection (AFTER violation state is set) ---
+            if (config.enable_sweep_reclaim && zone.was_swept && zone.state == ZoneState::VIOLATED) {
+                bool price_inside_zone = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line);
+                
+                if (price_inside_zone) {
+                    // ⭐ FIX: Consistent body calculation with update_zone_states
+                    double body_low = bar.open;
+                    double body_high = bar.close;
+                    if (body_high < body_low) std::swap(body_low, body_high);
+                    
+                    double zone_range = std::abs(zone.proximal_line - zone.distal_line);
+                    double body_in_zone = 0.0;
+                    
+                    if (zone.type == ZoneType::DEMAND) {
+                        body_in_zone = std::max<double>(0.0, body_high - zone.distal_line);
+                    } else {
+                        body_in_zone = std::max<double>(0.0, zone.distal_line - body_low);
+                    }
+                    
+                    double body_pct = (zone_range > 0.0001) ? (body_in_zone / zone_range) : 0.0;
+                    
+                    if (body_pct >= config.reclaim_acceptance_pct) {
+                        zone.bars_inside_after_sweep++;
+                        
+                        if (zone.bars_inside_after_sweep >= config.reclaim_acceptance_bars) {
+                            zone.state = ZoneState::RECLAIMED;
+                            zone.reclaim_eligible = true;
+                            zones_changed = true;
+                            
+                            ZoneStateEvent event(
+                                bar.datetime, static_cast<int>(i), "SWEEP_RECLAIMED",
+                                "VIOLATED", "RECLAIMED",
+                                (bar.high + bar.low) / 2.0, bar.high, bar.low, zone.touch_count
+                            );
+                            record_event(zone, event, config.record_violations);
+                        }
+                    } else {
+                        zone.bars_inside_after_sweep = 0;
+                    }
+                } else {
+                    zone.bars_inside_after_sweep = 0;
+                }
+            }
+        }  // End bar loop for this zone
+    }  // End zone loop
+    
+    // Save if changed
+    if (zones_changed) {
+        if (!config.enable_state_history) {
+            for (auto& zone : active_zones) {
+                zone.state_history.clear();
+            }
+        }
+        zone_persistence_.save_zones(active_zones, next_zone_id_);
+    }
+    last_saved_bar_time_.clear();
+    
+    auto replay_end = std::chrono::high_resolution_clock::now();
+    auto replay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(replay_end - replay_start).count();
+    
+    // Count final states
+    int fresh_count = 0, tested_count = 0, violated_count = 0, reclaimed_count = 0;
+    for (const auto& zone : active_zones) {
+        switch (zone.state) {
+            case ZoneState::FRESH: fresh_count++; break;
+            case ZoneState::TESTED: tested_count++; break;
+            case ZoneState::VIOLATED: violated_count++; break;
+            case ZoneState::RECLAIMED: reclaimed_count++; break;
+        }
+    }
+    
+    LOG_INFO("=== Replay Complete ===");
+    LOG_INFO("Time: " << replay_ms << "ms (" << (replay_ms/1000.0) << "s)");
+    LOG_INFO("Zones processed: " << zones_processed << " (in price range)");
+    LOG_INFO("Zones skipped: " << zones_skipped_range << " (outside price range, stay FRESH)");
+    LOG_INFO("Total bar iterations: " << total_bar_iterations);
+    LOG_INFO("Final states - FRESH: " << fresh_count << ", TESTED: " << tested_count 
+             << ", VIOLATED: " << violated_count << ", RECLAIMED: " << reclaimed_count);
+}
+
+bool LiveEngine::try_load_backtest_zones() {
+    // Try to load from live engine's own persistent file
+    fs::path live_zone_file = fs::path(output_dir_) / "zones_live.json";
+    
+    if (!fs::exists(live_zone_file)) {
+        LOG_INFO("No live persistent zones file found. Will detect zones from historical data.");
+        return false;
+    }
+    
+    LOG_INFO("Found live engine persistent zones file: " << live_zone_file.string());
+    LOG_INFO("Loading zones from: " << live_zone_file.string());
+    
+    std::ifstream file(live_zone_file);
+    if (!file.is_open()) {
+        LOG_WARN("Could not open live zone file. Will detect zones from historical data.");
+        return false;
+    }
+
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    
+    // Safe JSON parsing with error handling
+    if (!Json::parseFromStream(builder, file, &root, &errors)) {
+        LOG_ERROR("Failed to parse zones JSON file: " << errors);
+        LOG_WARN("Will detect zones from historical data instead.");
+        file.close();
+        return false;
+    }
+    file.close();
+    
+    const Json::Value zones_json = root["zones"];
+    if (!zones_json.isArray() || zones_json.empty()) {
+        LOG_WARN("Live zone file exists but contains no valid zones. Will detect zones from historical data.");
+        return false;
+    }
+    
+    LOG_INFO("Parsing zones from live persistent file...");
+
+    active_zones.clear();
+    
+    // Wrap zone parsing in try-catch to handle any errors
+    try {
+        for (const auto& zone_json : zones_json) {
+        Zone zone{};
+        zone.zone_id = zone_json.get("zone_id", 0).asInt();
+        std::string type_str = zone_json.get("type", "DEMAND").asString();
+        zone.type = (type_str == "SUPPLY") ? ZoneType::SUPPLY : ZoneType::DEMAND;
+        zone.base_low = zone_json.get("base_low", 0.0).asDouble();
+        zone.base_high = zone_json.get("base_high", 0.0).asDouble();
+        zone.distal_line = zone_json.get("distal_line", 0.0).asDouble();
+        zone.proximal_line = zone_json.get("proximal_line", 0.0).asDouble();
+        zone.formation_bar = zone_json.get("formation_bar", 0).asInt();
+        zone.formation_datetime = zone_json.get("formation_datetime", "").asString();
+        zone.strength = zone_json.get("strength", 0.0).asDouble();
+
+        std::string state_str = zone_json.get("state", "FRESH").asString();
+        if (state_str == "VIOLATED") {
+            zone.state = ZoneState::VIOLATED;
+        } else if (state_str == "TESTED") {
+            zone.state = ZoneState::TESTED;
+        } else {
+            zone.state = ZoneState::FRESH;
+        }
+
+        zone.touch_count = zone_json.get("touch_count", 0).asInt();
+        zone.is_elite = zone_json.get("is_elite", false).asBool();
+        zone.departure_imbalance = zone_json.get("departure_imbalance", 0.0).asDouble();
+        zone.retest_speed = zone_json.get("retest_speed", 0.0).asDouble();
+        zone.bars_to_retest = zone_json.get("bars_to_retest", 0).asInt();
+
+        // Load state history
+        if (zone_json.isMember("state_history")) {
+            const Json::Value& history_json = zone_json["state_history"];
+            for (const Json::Value& event_json : history_json) {
+                ZoneStateEvent event;
+                event.timestamp = event_json.get("timestamp", "").asString();
+                event.bar_index = event_json.get("bar_index", -1).asInt();
+                event.event = event_json.get("event", "").asString();
+                event.old_state = event_json.get("old_state", "").asString();
+                event.new_state = event_json.get("new_state", "").asString();
+                event.price = event_json.get("price", 0.0).asDouble();
+                event.bar_high = event_json.get("bar_high", 0.0).asDouble();
+                event.bar_low = event_json.get("bar_low", 0.0).asDouble();
+                event.touch_number = event_json.get("touch_number", 0).asInt();
+                
+                zone.state_history.push_back(event);
+            }
+        }
+
+        active_zones.push_back(zone);
+    }
+    
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception while parsing zones: " << e.what());
+        LOG_WARN("Zone file may be corrupted. Will detect zones from historical data.");
+        active_zones.clear();
+        return false;
+    }
+
+    next_zone_id_ = root.get("next_zone_id", next_zone_id_).asInt();
+
+    // Clear state history from loaded zones if disabled
+    if (!config.enable_state_history) {
+        LOG_INFO("Clearing state history from loaded zones (state history disabled)");
+        for (auto& zone : active_zones) {
+            zone.state_history.clear();
+        }
+    }
+
+    LOG_INFO("✅ Successfully loaded " << active_zones.size() << " zones from live persistent file (next_zone_id: " << next_zone_id_ << ")");
+    return true;
+}
+
+void LiveEngine::process_zones() {
+    auto record_event = [&](Zone& target_zone, const ZoneStateEvent& evt, bool enabled) {
+        if (!config.enable_state_history || !enabled) {
+            return;
+        }
+        target_zone.state_history.push_back(evt);
+        if (config.max_state_history_events > 0 &&
+            target_zone.state_history.size() > static_cast<size_t>(config.max_state_history_events)) {
+            auto erase_count = target_zone.state_history.size() - static_cast<size_t>(config.max_state_history_events);
+            target_zone.state_history.erase(
+                target_zone.state_history.begin(),
+                target_zone.state_history.begin() + static_cast<long long>(erase_count));
+        }
+    };
+
+    // CRITICAL FIX: Only advance the scan pointer when we have enough lookahead
+    // Zone detection needs a 5-bar lookahead (bars.size() - 5). If we move the
+    // scan pointer to the latest bar, we starve the detector and it returns 0 zones.
+    const int current_bar_count = static_cast<int>(bar_history.size());
+    const int last_scannable_bar = current_bar_count - 6;  // last index with 5-bar lookahead
+    if (last_scannable_bar <= last_zone_scan_bar_) {
+        // Not enough new bars to run detection safely
+        return;
+    }
+    
+    LOG_DEBUG("Scanning for new zones from bar " << last_zone_scan_bar_ + 1 
+              << " to " << last_scannable_bar);
+    
+    // ⭐ DEBUG: Log bar details for debugging runtime zone detection
+    std::cout << "\n[ZONE_DETECT_DEBUG] process_zones() called\n";
+    std::cout << "  last_zone_scan_bar_: " << last_zone_scan_bar_ << "\n";
+    std::cout << "  current_bar_count: " << current_bar_count << "\n";
+    std::cout << "  last_scannable_bar: " << last_scannable_bar << "\n";
+    std::cout << "  Bars to check: " << (last_scannable_bar - last_zone_scan_bar_) << "\n";
+    if (current_bar_count > 0) {
+        std::cout << "  Last bar datetime: " << bar_history.back().datetime << "\n";
+    }
+    std::cout << std::endl;
+    
+    // Detect new zones with duplicate prevention against active zones
+    std::vector<Zone> new_zones = detector.detect_zones_no_duplicates(
+        active_zones,
+        last_zone_scan_bar_ + 1
+    );
+    
+    std::cout << "[ZONE_DETECT_DEBUG] detector.detect_zones() returned: " << new_zones.size() << " zones\n";
+    std::cout.flush();
+    
+    bool zones_added = false;
+    
+    // Add non-duplicate zones to active zones
+    for (auto zone : new_zones) {
+        // ⭐ FIXED: For runtime-appended data, only filter out VERY old zones
+        // Accept zones formed recently (within last N bars) even if they're before last_zone_scan_bar_
+        // This allows detection of zones formed in the newly appended data
+        int bars_before_last_scan = last_zone_scan_bar_ - zone.formation_bar;
+        
+        // If zone was formed AFTER last scan, definitely include it
+        if (zone.formation_bar > last_zone_scan_bar_) {
+            // Zone is new, will be added below
+        } 
+        // If zone was formed recently (e.g., within last 10 bars), still include it
+        // This handles the case where CSV data is appended with slightly overlapping bars
+        else if (bars_before_last_scan <= 10) {
+            LOG_DEBUG("Zone " << zone.zone_id << " formed " << bars_before_last_scan 
+                     << " bars before last scan - includes it (overlapping data)");
+            // Continue processing - don't skip
+        }
+        else {
+            // Skip zones from stale data
+            std::cout << "[ZONE_DETECT_DEBUG] Skipping zone formed at bar " << zone.formation_bar 
+                     << " (last_zone_scan_bar_=" << last_zone_scan_bar_ << ")\n";
+            std::cout.flush();
+            continue;  // Skip zones from already-scanned bars
+        }
+        
+        bool already_active = false;
+        for (const auto& active : active_zones) {
+            // FIXED: Check both price levels AND formation_bar to prevent duplicates
+            if (zone.formation_bar == active.formation_bar &&
+                std::abs(zone.proximal_line - active.proximal_line) < 1.0 &&
+                std::abs(zone.distal_line - active.distal_line) < 1.0) {
+                already_active = true;
+                std::cout << "[ZONE_DETECT_DEBUG] Zone at bar " << zone.formation_bar 
+                         << " already exists (duplicate)\n";
+                std::cout.flush();
+                break;
+            }
+        }
+        
+        if (!already_active) {
+            // NEW: Assign zone ID
+            zone.zone_id = next_zone_id_++;
+            
+            // Score the newly detected zone
+            MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+            
+            LOG_DEBUG("Zone scored: ID=" << zone.zone_id 
+                     << " Total=" << zone.zone_score.total_score
+                     << " (" << zone.zone_score.entry_rationale << ")");
+            
+            // Record ZONE_CREATED event
+            ZoneStateEvent creation_event(
+                bar_history.back().datetime,
+                zone.formation_bar,
+                "ZONE_CREATED",
+                "",  // No previous state
+                "FRESH",
+                (zone.proximal_line + zone.distal_line) / 2.0,
+                bar_history.back().high,
+                bar_history.back().low,
+                0  // No touches yet
+            );
+            record_event(zone, creation_event, config.record_zone_creation);
+            
+            active_zones.push_back(zone);
+            zones_added = true;
+            
+            std::cout << "\n[ZONE_DETECT_DEBUG] ✅ NEW ZONE ADDED\n";
+            std::cout << "  Zone ID: " << zone.zone_id << "\n";
+            std::cout << "  Type: " << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY") << "\n";
+            std::cout << "  Formation Bar: " << zone.formation_bar << "\n";
+            std::cout << "  Formation DateTime: " << bar_history.back().datetime << "\n";
+            std::cout << "  Price Range: " << zone.distal_line << " - " << zone.proximal_line << "\n";
+            std::cout << "  Score: " << zone.zone_score.total_score << "/120\n";
+            std::cout << std::endl;
+            std::cout.flush();
+            
+            LOG_ERROR("🔷 New zone detected: " 
+                    << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                    << " @ " << zone.distal_line << "-" << zone.proximal_line
+                    << " (ID: " << zone.zone_id << ", formed at bar " << zone.formation_bar << ")");
+        }
+    }
+    
+    // Update last scan position
+    last_zone_scan_bar_ = last_scannable_bar;
+    
+    // NEW: Save zones if any were added
+    if (zones_added) {
+        // Clear state history if disabled
+        if (!config.enable_state_history) {
+            for (auto& zone : active_zones) {
+                zone.state_history.clear();
+            }
+        }
+        zone_persistence_.save_zones(active_zones, next_zone_id_);
+        // --- Update master zones file in sync ---
+        std::map<std::string, std::string> metadata;
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm;
+#ifdef _WIN32
+        localtime_s(&tm, &time_t);
+#else
+        tm = *std::localtime(&time_t);
+#endif
+        std::ostringstream timestamp_ss;
+        timestamp_ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        metadata["generated_at"] = timestamp_ss.str();
+        metadata["csv_path"] = historical_csv_path_;
+        metadata["symbol"] = trading_symbol;
+        metadata["interval"] = bar_interval;
+        metadata["bar_count"] = std::to_string(bar_history.size());
+        metadata["zone_count"] = std::to_string(active_zones.size());
+        metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
+        metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
+        fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+        zone_persistence_.save_zones_with_metadata(active_zones, next_zone_id_, master_file_path.string(), metadata);
+    }
+    
+    LOG_DEBUG("Active zones: " << active_zones.size());
+}
+
+void LiveEngine::check_for_entries() {
+    if (skip_trading_until_bar_ && dryrun_bootstrap_end_bar_ > 0) {
+        int current_bar = static_cast<int>(bar_history.size()) - 1;
+        if (current_bar < dryrun_bootstrap_end_bar_) {
+            LOG_DEBUG("[BOOTSTRAP PHASE] Skipping trade check at bar " << current_bar 
+                     << " (bootstrap ends at bar " << dryrun_bootstrap_end_bar_ << ")");
+            return;
+        }
+        skip_trading_until_bar_ = false;
+        LOG_INFO("✅ Bootstrap phase complete at bar " << current_bar 
+                << " - Trading now ENABLED");
+    }
+    
+    // ⭐ FIX: ENTRY TIME GATE - Block entries after circuit breaker cutoff
+    // Prevents late entries (e.g., 15:29) that bypass position closing logic
+    if (config.close_before_session_end_minutes > 0) {
+        const Bar& current_bar = bar_history.back();
+        std::string current_time_str = current_bar.datetime;
+        
+        // Parse current time (HH:MM:SS)
+        int curr_hour = 0, curr_min = 0, curr_sec = 0;
+        try {
+            size_t space_pos = current_time_str.rfind(' ');
+            if (space_pos != std::string::npos) {
+                std::string time_part = current_time_str.substr(space_pos + 1);
+                sscanf(time_part.c_str(), "%d:%d:%d", &curr_hour, &curr_min, &curr_sec);
+            }
+        } catch (...) {
+            LOG_WARN("Failed to parse current time for entry gate: " << current_time_str);
+        }
+        
+        // Parse session end time
+        int session_hour = 0, session_min = 0, session_sec = 0;
+        try {
+            sscanf(config.session_end_time.c_str(), "%d:%d:%d", &session_hour, &session_min, &session_sec);
+        } catch (...) {
+            LOG_WARN("Failed to parse session_end_time for entry gate: " << config.session_end_time);
+        }
+        
+        // Calculate cutoff time (session_end - close_before_session_end_minutes)
+        int cutoff_min = session_min - config.close_before_session_end_minutes;
+        int cutoff_hour = session_hour;
+        if (cutoff_min < 0) {
+            cutoff_hour--;
+            cutoff_min += 60;
+        }
+        
+        // Convert to minutes since midnight
+        int curr_total_min = curr_hour * 60 + curr_min;
+        int cutoff_total_min = cutoff_hour * 60 + cutoff_min;
+        
+        if (curr_total_min >= cutoff_total_min) {
+            std::cout << "\n⏳ ENTRY BLOCKED - Too close to session end\n";
+            std::cout << "Current time: " << current_time_str << "\n";
+            std::cout << "Entry cutoff: " << (cutoff_hour < 10 ? "0" : "") << cutoff_hour << ":" 
+                      << (cutoff_min < 10 ? "0" : "") << cutoff_min << "\n";
+            std::cout << "No new entries allowed to avoid overnight gap risk\n\n";
+            
+            LOG_INFO("⏳ ENTRY BLOCKED: Current time (" << current_time_str 
+                    << ") >= Entry cutoff (" << cutoff_hour << ":" << cutoff_min << ")");
+            return;
+        }
+    }
+    
+    // In-position skip (configurable)
+    if (config.live_skip_when_in_position && trade_mgr.is_in_position()) {
+        std::cout << "\n[SKIP] TRADE CHECK SKIPPED - Already in position" << std::endl;
+        return;  // Already in a trade
+    }
+    
+    double current_price = broker->get_ltp(trading_symbol);
+    const Bar& current_bar = bar_history.back();
+
+    // Bar-change gating (configurable): only evaluate on a new bar
+    if (config.live_entry_require_new_bar) {
+        if (!last_entry_check_bar_time_.empty() && last_entry_check_bar_time_ == current_bar.datetime) {
+            std::cout << "[SKIP] Entry check skipped (same bar: " << current_bar.datetime << ")" << std::endl;
+            return;
+        }
+        last_entry_check_bar_time_ = current_bar.datetime;
+    }
+    
+    // ✅ V6.0: Check for expiry day and adjust config if needed
+    Config active_config = config;  // Copy config
+    bool is_expiry = is_expiry_day(current_bar.datetime);
+    
+    if (is_expiry) {
+        LOG_INFO("📅 EXPIRY DAY DETECTED - Applying special rules");
+        
+        if (config.expiry_day_disable_oi_filters) {
+            active_config.enable_oi_entry_filters = false;
+            active_config.enable_oi_exit_signals = false;
+            LOG_INFO("   OI filters DISABLED (rollover distortion)");
+        }
+        
+        active_config.lot_size = static_cast<int>(
+            config.lot_size * config.expiry_day_position_multiplier
+        );
+        LOG_INFO("   Position size adjusted to: " << active_config.lot_size << " lots");
+    }
+    
+    // ⭐ PRINT TRADE CHECK START
+    std::cout << "\n+====================================================+\n";
+    std::cout << "| [ENTRY CHECK] Checking for Entry Opportunities    |\n";
+    std::cout << "+====================================================+\n";
+    std::cout << "  Current Price: " << std::fixed << std::setprecision(2) << current_price << "\n";
+    std::cout << "  Bar Time:      " << current_bar.datetime << "\n";
+    std::cout << "  Active Zones:  " << active_zones.size() << "\n";
+    std::cout << std::endl;
+    std::cout.flush();
+    
+    // Get market regime
+    MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+    std::string regime_str = (regime == MarketRegime::BULL ? "UPTREND" : 
+                             regime == MarketRegime::BEAR ? "DOWNTREND" : "SIDEWAYS");
+    std::cout << "  Market Regime: " << regime_str << "\n\n";
+    
+    // ⭐ SAFETY CHECK: Validate zones are not from stale data
+    // Calculate ATR to determine reasonable zone distance from current price
+    double atr = MarketAnalyzer::calculate_atr(bar_history, config.atr_period);
+    double max_zone_distance = atr * config.max_zone_distance_atr;  // Configurable multiplier
+    
+    bool trade_generated = false;
+    int zones_checked = 0;
+    int zones_rejected = 0;
+    int zones_price_not_in = 0;
+    
+    // ⭐ DETERMINISTIC FIX: Use stable_sort for guaranteed deterministic ordering
+    // When multiple zones are valid at the same price, the first one in sorted order wins
+    // stable_sort preserves relative order of equal elements (unlike std::sort)
+    // ⭐ ENHANCED SORTING: Prioritize by state quality, then recency
+std::stable_sort(active_zones.begin(), active_zones.end(), 
+    [](const Zone& a, const Zone& b) {
+        // Helper: Get state priority (lower = better)
+        auto get_state_priority = [](const Zone& z) -> int {
+            switch (z.state) {
+                case ZoneState::FRESH:     return 0;  // Highest priority
+                case ZoneState::RECLAIMED: return 1;  // Second (reclaimed zones show renewed strength)
+                case ZoneState::TESTED:    return 2;  // Third (still valid but less pristine)
+                case ZoneState::VIOLATED:  return 3;  // Lowest (broken zones)
+                default:                   return 4;
+            }
+        };
+        
+        int priority_a = get_state_priority(a);
+        int priority_b = get_state_priority(b);
+        
+        // Primary sort: State priority
+        if (priority_a != priority_b)
+            return priority_a < priority_b;
+        
+        // Secondary sort: Within same state, prefer newer zones (more relevant)
+        if (a.formation_bar != b.formation_bar)
+            return a.formation_bar > b.formation_bar;
+        
+        // Tertiary sort: Zone ID (newer zones have higher IDs)
+        return a.zone_id > b.zone_id;
+    });
+    
+    // === LOSS PROTECTION: Pause after consecutive losses ===
+    if (pause_counter > 0) {
+        std::cout << "[LOSS PROTECTION] Skipping entry: " << pause_counter << " bars left in pause after "
+                  << config.max_consecutive_losses << " consecutive losses.\n";
+        LOG_DEBUG("[LOSS PROTECTION] Skipping entry: " << pause_counter << " bars left in pause after "
+                 << config.max_consecutive_losses << " consecutive losses.");
+        pause_counter--;
+        return;
+    }
+
+    // Check each active zone for entry opportunity
+    for (auto& zone : active_zones) {
+        zones_checked++;
+        
+        // Skip violated zones
+        // Only skip violated zones if configured to do so
+if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
+    zones_rejected++;
+    LOG_WARN("⚠️  Zone " << zone.zone_id << " VIOLATED - skipped (skip_retest=YES)");
+    continue;
+}
+// If skip_retest = NO, allow VIOLATED zones to be evaluated
+        
+        // Skip if only trading fresh zones
+        if (config.only_fresh_zones && ( (zone.state != ZoneState::FRESH) || (zone.state != ZoneState::RECLAIMED) || (zone.state != ZoneState::TESTED)) ) {
+            zones_rejected++;
+            std::cout << "********* ZONE REJECTED: only_fresh_zones is enabled and zone " << zone.zone_id 
+                << " is in state " << (zone.state == ZoneState::TESTED ? "TESTED" : "VIOLATED") << std::endl;
+            continue;
+        }
+
+        // Zone age filter (min/max/exclude range)
+        int zone_age_days = 0;
+        if (is_zone_age_blocked(zone, current_bar, config, zone_age_days)) {
+            zones_rejected++;
+            LOG_INFO("Zone " << zone.zone_id << " rejected by age filter: " << zone_age_days
+                     << " days (min=" << config.min_zone_age_days
+                     << ", max=" << config.max_zone_age_days
+                     << ", exclude=" << (config.exclude_zone_age_range ? "YES" : "NO") << ")");
+            continue;
+        }
+        
+        // ⭐ NEW: Reject zones from stale data (too far from current price)
+        double zone_mid = (zone.proximal_line + zone.distal_line) / 2.0;
+        double distance_from_price = std::abs(zone_mid - current_price);
+        
+        if (distance_from_price > max_zone_distance) {
+            zones_rejected++;
+            LOG_WARN("⚠️  Rejecting zone " << zone.zone_id << " - too far from current price");
+            LOG_WARN("    Zone mid: " << zone_mid << ", Current: " << current_price 
+                    << ", Distance: " << distance_from_price << " points (max: " << max_zone_distance << ")");
+            continue;
+        }
+        
+        // Per-zone cooldown (configurable)
+        if (config.live_zone_entry_cooldown_seconds > 0) {
+            auto it = last_entry_attempt_by_zone_.find(zone.zone_id);
+            if (it != last_entry_attempt_by_zone_.end()) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+                if (elapsed < config.live_zone_entry_cooldown_seconds) {
+                    zones_rejected++;
+                    LOG_DEBUG("Cooldown active for zone " << zone.zone_id << " (" << elapsed << "s elapsed)");
+                    continue;
+                }
+            }
+        }
+
+        // Check if price is in zone
+        bool price_in_zone;
+        if (zone.type == ZoneType::DEMAND) {
+        // Demand: distal < proximal
+            price_in_zone = (current_price >= zone.distal_line && 
+                    current_price <= zone.proximal_line);
+        } else {
+        // Supply: distal > proximal (inverted!)
+            price_in_zone = (current_price <= zone.distal_line && 
+            current_price >= zone.proximal_line);
+        }
+        if (!price_in_zone) {
+            zones_price_not_in++;
+            continue;
+        }
+        
+        LOG_INFO("💡 Price in zone: " << current_price);
+
+        if (config.enable_candle_confirmation) {
+            if (bar_history.size() < 2) {
+                zones_rejected++;
+                LOG_INFO("Candle confirmation rejected: not enough bars");
+                continue;
+            }
+
+            const Bar& confirm_bar = bar_history[bar_history.size() - 2];
+            double zone_low = std::min(zone.distal_line, zone.proximal_line);
+            double zone_high = std::max(zone.distal_line, zone.proximal_line);
+            bool close_in_zone = (confirm_bar.close >= zone_low && confirm_bar.close <= zone_high);
+            bool wick_in_zone = (confirm_bar.low <= zone_high && confirm_bar.high >= zone_low);
+
+            double candle_range = confirm_bar.high - confirm_bar.low;
+            double candle_body = std::abs(confirm_bar.close - confirm_bar.open);
+            double body_pct = (candle_range > 0.0) ? (candle_body / candle_range * 100.0) : 0.0;
+
+            std::string direction = (zone.type == ZoneType::DEMAND) ? "LONG" : "SHORT";
+            bool direction_ok = (direction == "LONG") ? (confirm_bar.close > confirm_bar.open)
+                                                       : (confirm_bar.close < confirm_bar.open);
+
+            bool candle_ok = close_in_zone && wick_in_zone && direction_ok &&
+                             (body_pct >= config.candle_confirmation_body_pct);
+
+            if (!candle_ok) {
+                zones_rejected++;
+                LOG_INFO("Candle confirmation rejected: zone=" << zone.zone_id
+                        << " close_in_zone=" << close_in_zone
+                        << " wick_in_zone=" << wick_in_zone
+                        << " direction_ok=" << direction_ok
+                        << " body_pct=" << std::fixed << std::setprecision(2) << body_pct
+                        << " min_body_pct=" << config.candle_confirmation_body_pct);
+                continue;
+            }
+        }
+
+        if (config.enable_structure_confirmation) {
+            if (bar_history.size() < 3) {
+                zones_rejected++;
+                LOG_INFO("Structure confirmation rejected: not enough bars");
+                continue;
+            }
+
+            const Bar& confirm_bar = bar_history[bar_history.size() - 2];
+            const Bar& prev_bar = bar_history[bar_history.size() - 3];
+            std::string direction = (zone.type == ZoneType::DEMAND) ? "LONG" : "SHORT";
+
+            bool structure_ok = (direction == "LONG")
+                ? (confirm_bar.close > prev_bar.high)
+                : (confirm_bar.close < prev_bar.low);
+
+            if (!structure_ok) {
+                zones_rejected++;
+                LOG_INFO("Structure confirmation rejected: zone=" << zone.zone_id
+                        << " confirm_close=" << confirm_bar.close
+                        << " prev_high=" << prev_bar.high
+                        << " prev_low=" << prev_bar.low);
+                continue;
+            }
+        }
+        
+        // ⭐ EMA ALIGNMENT FILTER (moved from entry_decision_engine.cpp due to linker issues)
+        // Check EMA trend alignment before scoring to save computation
+        int current_index = static_cast<int>(bar_history.size()) - 1;
+        double ema_20 = MarketAnalyzer::calculate_ema(bar_history, 20, current_index);
+        double ema_50 = MarketAnalyzer::calculate_ema(bar_history, 50, current_index);
+        std::string direction = (zone.type == ZoneType::DEMAND) ? "LONG" : "SHORT";
+        
+        if (direction == "LONG" && config.require_ema_alignment_for_longs) {
+            double ema_sep_pct = 100.0 * (ema_20 - ema_50) / ema_50;
+            if (ema_20 <= ema_50 || ema_sep_pct < config.ema_min_separation_pct_long) {
+                zones_rejected++;
+                std::cout << "  [NO] Zone " << zone.zone_id << ": EMA filter - LONG rejected (EMA20 "
+                          << std::fixed << std::setprecision(2) << ema_20 << " <= EMA50 " << ema_50
+                          << ", sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_long << "%)\n";
+                LOG_INFO("EMA filter rejected LONG: EMA20=" << ema_20 << " <= EMA50=" << ema_50 << ", sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_long << "%");
+                continue;  // Skip this zone - downtrend or weak uptrend
+            }
+        }
+        
+        if (direction == "SHORT" && config.require_ema_alignment_for_shorts) {
+            double ema_sep_pct = 100.0 * (ema_50 - ema_20) / ema_20;
+            if (ema_20 >= ema_50 || ema_sep_pct < config.ema_min_separation_pct_short) {
+                zones_rejected++;
+                std::cout << "  [NO] Zone " << zone.zone_id << ": EMA filter - SHORT rejected (EMA20 " 
+                          << std::fixed << std::setprecision(2) << ema_20 << " >= EMA50 " << ema_50
+                          << ", sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_short << "%)\n";
+                LOG_INFO("EMA filter rejected SHORT: EMA20=" << ema_20 << " >= EMA50=" << ema_50 << ", sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_short << "%");
+                continue;  // Skip this zone - uptrend or weak downtrend
+            }
+        }
+        
+        // Score the zone
+        ZoneScore zone_score = scorer.evaluate_zone(zone, regime, current_bar);
+        
+        // Calculate entry decision
+        EntryDecision decision;
+
+        if (config.enable_two_stage_scoring) {
+            // Reuse current_index from EMA filter above
+            Core::ZoneQualityScore zone_quality_score;
+            Core::EntryValidationScore entry_validation_score;
+            bool approved = entry_engine.should_enter_trade_two_stage(
+                zone,
+                bar_history,
+                current_index,
+                zone.proximal_line,  // Preliminary entry for validation
+                0.0,                 // Preliminary stop for validation
+                &zone_quality_score,
+                &entry_validation_score
+            );
+            if (!approved) {
+                // Build detailed rejection reason
+                std::ostringstream reason;
+                reason << "Two-stage scoring failed: ";
+                if (zone_quality_score.total < config.zone_quality_minimum_score) {
+                    reason << "Zone quality " << std::fixed << std::setprecision(2) 
+                           << zone_quality_score.total << " < " << config.zone_quality_minimum_score;
+                } else if (entry_validation_score.total < config.entry_validation_minimum_score) {
+                    reason << "Entry validation " << std::fixed << std::setprecision(2)
+                           << entry_validation_score.total << " < " << config.entry_validation_minimum_score;
+                }
+                std::cout << "  [NO] Zone " << zone.zone_id << ": Entry rejected - " << reason.str() << "\n";
+                LOG_ERROR("[NO] Entry rejected: " << reason.str());
+                continue;
+            }
+            
+            // Pass zone quality score to calculate_entry for aggressiveness calculation
+            // Pass current_bar pointer for V6 logic
+            const Bar* current_bar_ptr = bar_history.empty() ? nullptr : &bar_history.back();
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
+                                                     config.enable_revamped_scoring ? &zone_quality_score : nullptr, current_bar_ptr);
+            // decision.should_enter = true;  // Already validated
+        } else {
+            // Pass current_bar pointer for V6 logic
+            const Bar* current_bar_ptr = bar_history.empty() ? nullptr : &bar_history.back();
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, current_bar_ptr);
+        }
+        
+        if (!decision.should_enter) {
+            std::cout << "  [NO] Zone " << zone.zone_id << ": Entry rejected - " << decision.rejection_reason << "\n";
+            LOG_ERROR("[NO] Entry rejected: " << decision.rejection_reason);
+            continue;
+        }
+        
+        std::cout << "  +========================================+\n";
+        std::cout << "  | [YES] ENTRY SIGNAL GENERATED!          |\n";
+        std::cout << "  +========================================+\n";
+        std::cout << "  Zone ID:        " << zone.zone_id << "\n";
+        std::cout << "  Zone Type:      " << (zone.type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY") << "\n";
+        std::cout << "  Proximal:       " << zone.proximal_line << "\n";
+        std::cout << "  Distal:         " << zone.distal_line << "\n";
+        std::cout << "  Formation:      " << zone.formation_datetime << "\n";
+        std::cout << "  Zone Score:     " << zone_score.total_score << "/120\n";
+        std::cout << "  Entry Price:    " << decision.entry_price << "\n";
+        std::cout << "  Stop Loss:      " << decision.stop_loss << "\n";
+        std::cout << "  Take Profit:    " << decision.take_profit << "\n";
+        std::cout << "  +========================================+\n";
+        std::cout.flush();
+        
+        LOG_INFO("[YES] Entry signal generated! Zone " << zone.zone_id << " Score: " 
+                << zone_score.total_score << "/120");
+        
+        // Record last attempt time for cooldown
+        if (config.live_zone_entry_cooldown_seconds > 0) {
+            last_entry_attempt_by_zone_[zone.zone_id] = std::chrono::steady_clock::now();
+        }
+
+        // ⭐ USE SHARED TRADEMANAGER ⭐
+        // For indicator calculation, use the actual bar_history size, not the global bar_index
+        int indicator_bar_index = bar_history.empty() ? -1 : static_cast<int>(bar_history.size() - 1);
+        
+        LOG_INFO("📊 Indicator Calc Debug: bar_history.size()=" + std::to_string(bar_history.size()) + 
+                " indicator_bar_index=" + std::to_string(indicator_bar_index) +
+                " global bar_index=" + std::to_string(bar_index));
+        
+        bool entered = trade_mgr.enter_trade(
+            decision, 
+            zone, 
+            current_bar, 
+            indicator_bar_index,  // Use bar_history.size() - 1 for indicators
+            regime,
+            trading_symbol,  // Live mode needs symbol
+            &bar_history     // Pass bars for indicator calculation
+        );
+		if (entered && order_submitter_ && order_submitter_->is_enabled()) {
+			const Trade& trade = trade_mgr.get_current_trade();
+			auto result = order_submitter_->submit_order(
+				trade.direction,       // "LONG" or "SHORT"
+				trade.position_size,   // Quantity
+				zone.zone_id,
+				trade.zone_score,
+				trade.entry_price,
+				trade.stop_loss,
+				trade.take_profit
+			);
+		}
+
+        if (entered) {
+            const Trade& trade = trade_mgr.get_current_trade();
+            
+            std::cout << "\n+====================================================+\n";
+            std::cout << "| [TRADE ENTRY] Trade Successfully Generated!       |\n";
+            std::cout << "+====================================================+\n";
+            std::cout << "  Direction:   " << trade.direction << "\n";
+            std::cout << "  Entry Price: " << std::fixed << std::setprecision(2) 
+                      << trade.entry_price << "\n";
+            std::cout << "  Stop Loss:   " << trade.stop_loss << "\n";
+            std::cout << "  Take Profit: " << trade.take_profit << "\n";
+            std::cout << "  Quantity:    " << trade.position_size << "\n";
+            std::cout << "  Zone Score:  " << trade.zone_score << "/120\n";
+            std::cout << "  Entry Date:  " << trade.entry_date << "\n";
+            std::cout << std::endl;
+            std::cout.flush();
+
+            // 📝 LOG ORDER TO CSV FOR SIMULATION
+            log_order_to_csv(
+                trade.entry_date,
+                std::to_string(zone.zone_id),
+                trade.zone_score,
+                (trade.direction == "LONG" ? "BUY" : "SELL"),
+                trade.entry_price,
+                trade.stop_loss,
+                trade.take_profit,
+                trade.position_size
+            );
+
+            trade_generated = true;
+            break;  // Only one trade at a time
+        }
+    }
+    
+    // ⭐ PRINT TRADE GENERATION SUMMARY
+    std::cout << "+====================================================+\n";
+    std::cout << "| [SUMMARY] Trade Check Summary                     |\n";
+    std::cout << "+====================================================+\n";
+    std::cout << "  Zones Checked:        " << zones_checked << "\n";
+    std::cout << "  Zones Rejected:       " << zones_rejected << "\n";
+    std::cout << "  Price Not In Zone:    " << zones_price_not_in << "\n";
+    std::cout << "  Trade Generated:      " << (trade_generated ? "[YES]" : "[NO]") << "\n";
+    std::cout << std::endl;
+    std::cout.flush();
+}
+
+void LiveEngine::manage_position() {
+    if (!trade_mgr.is_in_position()) return;
+    
+    // === LOSS PROTECTION: Update consecutive_losses and pause_counter on trade close ===
+    // This logic should be called after a trade is closed (stop loss or take profit)
+    // Find if a trade was just closed in the last bar
+    const auto& trades = performance.get_trades();
+    if (!trades.empty()) {
+        const auto& last_trade = trades.back();
+        static std::string last_exit_date = "";
+        if (last_trade.exit_date != last_exit_date) {
+            // Only process once per trade
+            last_exit_date = last_trade.exit_date;
+            if (last_trade.pnl < 0) {
+                consecutive_losses++;
+                LOG_INFO("[LOSS PROTECTION] Consecutive losses: " << consecutive_losses);
+                if (consecutive_losses >= config.max_consecutive_losses) {
+                    pause_counter = config.pause_bars_after_losses;
+                    LOG_INFO("[LOSS PROTECTION] Triggered pause for " << pause_counter << " bars after "
+                             << consecutive_losses << " consecutive losses.");
+                    consecutive_losses = 0;
+                }
+            } else if (last_trade.pnl > 0) {
+                consecutive_losses = 0;
+            }
+        }
+    }
+
+    // ⭐ FIX #5: CIRCUIT BREAKER - Close positions approaching session end
+    if (config.close_before_session_end_minutes > 0) {
+        const Bar& current_bar = bar_history.back();
+        std::string current_time_str = current_bar.datetime;  // Format: "2026-01-06 14:55:00"
+        
+        // Parse current time (HH:MM:SS from end of datetime string)
+        int curr_hour = 0, curr_min = 0, curr_sec = 0;
+        try {
+            size_t space_pos = current_time_str.rfind(' ');
+            if (space_pos != std::string::npos) {
+                std::string time_part = current_time_str.substr(space_pos + 1);
+                sscanf(time_part.c_str(), "%d:%d:%d", &curr_hour, &curr_min, &curr_sec);
+            }
+        } catch (...) {
+            LOG_WARN("Failed to parse current time: " << current_time_str);
+        }
+        
+        // Parse session end time (HH:MM:SS format)
+        int session_hour = 0, session_min = 0, session_sec = 0;
+        try {
+            sscanf(config.session_end_time.c_str(), "%d:%d:%d", &session_hour, &session_min, &session_sec);
+        } catch (...) {
+            LOG_WARN("Failed to parse session_end_time: " << config.session_end_time);
+        }
+        
+        // Calculate cutoff time (session_end - close_before_session_end_minutes)
+        int cutoff_min = session_min - config.close_before_session_end_minutes;
+        int cutoff_hour = session_hour;
+        if (cutoff_min < 0) {
+            cutoff_hour--;
+            cutoff_min += 60;
+        }
+        
+        // Convert times to minutes since midnight for easy comparison
+        int curr_total_min = curr_hour * 60 + curr_min;
+        int cutoff_total_min = cutoff_hour * 60 + cutoff_min;
+        
+        if (curr_total_min >= cutoff_total_min) {
+            // Time to close positions!
+            Trade& trade = const_cast<Trade&>(trade_mgr.get_current_trade());
+            double current_price = broker->get_ltp(trading_symbol);
+            
+            std::cout << "\n⏳ CIRCUIT BREAKER ACTIVATED ⏳\n";
+            std::cout << "Current time (" << current_time_str << ") >= Cutoff time (" 
+                      << (cutoff_hour < 10 ? "0" : "") << cutoff_hour << ":" 
+                      << (cutoff_min < 10 ? "0" : "") << cutoff_min << ")\n";
+            std::cout << "Forcefully closing position to avoid overnight gap risk\n\n";
+            
+            LOG_WARN("⏳ CIRCUIT BREAKER: Closing position at market price (" << current_price 
+                    << ") to avoid overnight gap risk");
+            
+            std::string current_time = current_bar.datetime;
+            Trade closed_trade = trade_mgr.close_trade(current_time, "SESSION_END", current_price);
+            
+            std::cout << "+====================================================+\n";
+            std::cout << "| [SESSION END] Trade Closed - Circuit Breaker      |\n";
+            std::cout << "+====================================================+\n";
+            std::cout << "  Exit Price:  " << std::fixed << std::setprecision(2) 
+                      << closed_trade.exit_price << "\n";
+            std::cout << "  Exit Date:   " << closed_trade.exit_date << "\n";
+            std::cout << "  Final P&L:   " << (closed_trade.pnl >= 0 ? "+" : "") << closed_trade.pnl << "\n";
+            std::cout << "  Return:      " << (closed_trade.return_pct >= 0 ? "+" : "") 
+                      << std::setprecision(2) << closed_trade.return_pct << "%\n";
+            std::cout << std::endl;
+            std::cout.flush();
+
+            LOG_INFO("Position closed: SESSION_END (circuit breaker), P&L: " << closed_trade.pnl);
+
+            performance.add_trade(closed_trade);
+            performance.update_capital(trade_mgr.get_capital());
+            export_trade_journal();
+            return;
+        }
+    }
+    
+    double current_price = broker->get_ltp(trading_symbol);
+    const Bar& current_bar = bar_history.back();
+    // Get mutable reference for trailing stop updates
+    Trade& trade = const_cast<Trade&>(trade_mgr.get_current_trade());
+    
+    // ⭐ FIX 1: Increment bars_in_trade FIRST, before any exit checks
+    trade.bars_in_trade++;
+    
+    // ⭐ FIX 2: Require MINIMUM 2 bars before allowing exits (prevents same-bar exit)
+    // bars_in_trade = 1 on first call, = 2 on second bar, etc.
+    if (trade.bars_in_trade < 2) {
+        LOG_DEBUG("Position too new (bars_in_trade=" << trade.bars_in_trade << "), skipping exit check");
+        
+        // Still update highest/lowest for trailing stop tracking
+        if (trade.direction == "LONG") {
+            if (current_bar.high > trade.highest_price || trade.highest_price == 0.0) {
+                trade.highest_price = current_bar.high;
+            }
+        } else {
+            if (current_bar.low < trade.lowest_price || trade.lowest_price == 0.0) {
+                trade.lowest_price = current_bar.low;
+            }
+        }
+        
+        // Still print position status
+        std::cout << "\n+====================================================+\n";
+        std::cout << "| [POSITION] Position Monitoring (Entry Bar)        |\n";
+        std::cout << "+====================================================+\n";
+        std::cout << "  Direction:   " << trade.direction << "\n";
+        std::cout << "  Entry Price: " << std::fixed << std::setprecision(2) << trade.entry_price << "\n";
+        std::cout << "  Bars in Trade: " << trade.bars_in_trade << " (min 2 for exit)\n";
+        std::cout << std::endl;
+        std::cout.flush();
+        return;  // Don't check exits yet
+    }
+    
+    // Calculate current P&L for display
+    double pnl;
+    if (trade.direction == "LONG") {
+        pnl = (current_price - trade.entry_price) * trade.position_size * config.lot_size;
+    } else {
+        pnl = (trade.entry_price - current_price) * trade.position_size * config.lot_size;
+    }
+    
+    LOG_DEBUG("Position P&L: $" << pnl << " (Price: " << current_price << ")");
+    
+    // ⭐ FIXED: Multi-Stage Trailing Stop (live_engine.cpp)
+    //
+    // Mirrors the identical fix applied to backtest_engine.cpp.
+    // Bug fixes:
+    // 1. Stage 1 (breakeven) was DEAD CODE -- same threshold (1.0R) as Stage 2.
+    //    Config fix: trail_activation_rr = 0.5 makes Stage 1 reachable.
+    // 2. ATR stages (3 & 4) floored at Stage 2 level -- prevents ATR wideness
+    //    from degrading a previously locked profit floor.
+    // 3. Stage logging includes stage number and current_r on every ratchet
+    //    move for full live audit trail.
+    if (config.use_trailing_stop) {
+        double risk = std::abs(trade.entry_price - trade.original_stop_loss);
+        if (risk <= 0) risk = std::abs(trade.entry_price - trade.stop_loss);
+        if (risk < 0.01) risk = 1.0;
+
+        // Track best (most favourable) price reached using bar extremes
+        if (trade.direction == "LONG") {
+            if (current_bar.high > trade.highest_price || trade.highest_price <= 0.0)
+                trade.highest_price = current_bar.high;
+        } else {
+            if (current_bar.low < trade.lowest_price || trade.lowest_price <= 0.0)
+                trade.lowest_price = current_bar.low;
+        }
+
+        // Current R = best excursion / initial risk
+        double best_excursion = (trade.direction == "LONG")
+            ? (trade.highest_price - trade.entry_price)
+            : (trade.entry_price - trade.lowest_price);
+        double current_r = (risk > 0) ? (best_excursion / risk) : 0.0;
+
+        // ATR for buffer in Stages 3 & 4
+        double atr_trail = risk;  // fallback: use risk as ATR proxy
+        int current_idx = static_cast<int>(bar_history.size()) - 1;
+        if (current_idx >= config.atr_period) {
+            double atr_sum = 0.0;
+            for (int i = current_idx - config.atr_period + 1; i <= current_idx; i++) {
+                double tr = std::max<double>({
+                    bar_history[i].high - bar_history[i].low,
+                    std::abs(bar_history[i].high - bar_history[i-1].close),
+                    std::abs(bar_history[i].low - bar_history[i-1].close)
+                });
+                atr_sum += tr;
+            }
+            atr_trail = atr_sum / config.atr_period;
+        }
+
+        // Pre-compute fixed stage levels used as floors in ATR stages
+        double stage1_level = trade.entry_price;  // breakeven
+        double stage2_level = (trade.direction == "LONG")
+            ? trade.entry_price + (risk * 0.5)
+            : trade.entry_price - (risk * 0.5);
+
+        double new_trail_stop = 0.0;
+        int    activated_stage = 0;
+
+        if (current_r >= 3.0) {
+            // Stage 4: Tight ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
+                ? trade.highest_price - (atr_trail * 0.5)
+                : trade.lowest_price  + (atr_trail * 0.5);
+            new_trail_stop = (trade.direction == "LONG")
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 4;
+        } else if (current_r >= 2.0) {
+            // Stage 3: Moderate ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
+                ? trade.highest_price - (atr_trail * 1.0)
+                : trade.lowest_price  + (atr_trail * 1.0);
+            new_trail_stop = (trade.direction == "LONG")
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 3;
+        } else if (current_r >= 1.0) {
+            // Stage 2: Lock 0.5R profit
+            // LONG : entry + 0.5R  (SL moves above entry)
+            // SHORT: entry - 0.5R  (SL moves below entry)
+            new_trail_stop = stage2_level;
+            activated_stage = 2;
+        } else if (current_r >= config.trail_activation_rr) {
+            // Stage 1: Breakeven lock
+            // Requires trail_activation_rr = 0.5 in config (< 1.0) to be reachable.
+            new_trail_stop = stage1_level;
+            activated_stage = 1;
+        }
+
+        // Log first activation
+        if (activated_stage > 0 && !trade.trailing_activated) {
+            trade.trailing_activated = true;
+            LOG_INFO("📈 Trail STAGE " << activated_stage << " first activated at "
+                     << std::fixed << std::setprecision(2) << current_r << "R"
+                     << "  new_trail=" << new_trail_stop);
+        }
+
+        // Ratchet: only advance stop in the profitable direction, never retreat
+        if (new_trail_stop > 0.0) {
+            if (trade.direction == "LONG" && new_trail_stop > trade.stop_loss) {
+                LOG_INFO("Trail SL ▲ " << trade.stop_loss << " → " << new_trail_stop
+                         << "  [Stage " << activated_stage << ", R=" << current_r << "]");
+                trade.stop_loss = new_trail_stop;
+                trade.current_trail_stop = new_trail_stop;
+            } else if (trade.direction == "SHORT" && new_trail_stop < trade.stop_loss) {
+                LOG_INFO("Trail SL ▼ " << trade.stop_loss << " → " << new_trail_stop
+                         << "  [Stage " << activated_stage << ", R=" << current_r << "]");
+                trade.stop_loss = new_trail_stop;
+                trade.current_trail_stop = new_trail_stop;
+            }
+        }
+    }
+    
+    // ⭐ bars_in_trade already incremented at the start of this function
+    
+    // ⭐ PRINT LIVE POSITION STATUS
+    std::cout << "\n+====================================================+\n";
+    std::cout << "| [POSITION] Position Monitoring                    |\n";
+    std::cout << "+====================================================+\n";
+    std::cout << "  Direction:   " << trade.direction << "\n";
+    std::cout << "  Entry Price: " << std::fixed << std::setprecision(2) << trade.entry_price << "\n";
+    std::cout << "  Entry Date:  " << trade.entry_date << "\n";
+    std::cout << "  Bars in Trade: " << trade.bars_in_trade << "\n";  // ⭐ NEW: Show bars
+    std::cout << "  Current Price: " << current_price << "\n";
+    std::cout << "  Stop Loss:   " << trade.stop_loss;
+    if (trade.trailing_activated) {
+        std::cout << " (TRAILING)";
+    }
+    std::cout << "\n";
+    std::cout << "  Take Profit: " << trade.take_profit << "\n";
+    std::cout << "  Current P&L: " << (pnl >= 0 ? "+" : "") << pnl << " (" 
+              << (pnl >= 0 ? "+" : "") << (pnl / trade.entry_price * 100) << "%)\n";
+    if (trade.trailing_activated) {
+        double risk = std::abs(trade.entry_price - trade.original_stop_loss);
+        double current_r = (risk > 0) ? (pnl / (risk * trade.position_size * config.lot_size)) : 0.0;
+        std::cout << "  Current R:   " << std::setprecision(2) << current_r << "R\n";
+    }
+    std::cout << std::endl;
+    std::cout.flush();
+    
+    // ⭐ DETERMINISTIC FIX: Check SL/TP using BAR extremes, not just current price
+    // This ensures consistent exits regardless of tick timing
+    // For LONG: check if bar.low hit SL, bar.high hit TP
+    // For SHORT: check if bar.high hit SL, bar.low hit TP
+    bool sl_hit = false;
+    bool tp_hit = false;
+    double exit_price = 0.0;
+    
+    if (trade.direction == "LONG") {
+        sl_hit = (current_bar.low <= trade.stop_loss);
+        tp_hit = (current_bar.high >= trade.take_profit);
+        if (sl_hit && tp_hit) {
+            sl_hit = true;
+            tp_hit = false;
+        }
+        // Intraday SL slippage: fill at worse of SL or close
+        exit_price = sl_hit ? std::min(trade.stop_loss, current_bar.close) : trade.take_profit;
+    } else {
+        // SHORT position
+        sl_hit = (current_bar.high >= trade.stop_loss);
+        tp_hit = (current_bar.low <= trade.take_profit);
+        if (sl_hit && tp_hit) {
+            sl_hit = true;
+            tp_hit = false;
+        }
+        // Intraday SL slippage: fill at worse of SL or close
+        exit_price = sl_hit ? std::max(trade.stop_loss, current_bar.close) : trade.take_profit;
+    }
+
+    // EMA crossover exit (only if SL/TP not hit in this bar)
+    if (config.enable_ema_exit && !sl_hit && !tp_hit) {
+        int current_idx = static_cast<int>(bar_history.size()) - 1;
+        int min_ema_period = std::max(config.exit_ema_fast_period, config.exit_ema_slow_period);
+        if (current_idx >= min_ema_period) {
+            double ema9 = MarketAnalyzer::calculate_ema(bar_history, config.exit_ema_fast_period, current_idx);
+            double ema20 = MarketAnalyzer::calculate_ema(bar_history, config.exit_ema_slow_period, current_idx);
+            bool ema_exit = (trade.direction == "LONG" && ema9 < ema20) ||
+                            (trade.direction == "SHORT" && ema9 > ema20);
+
+            if (ema_exit) {
+                std::string current_time = current_bar.datetime;
+                Trade closed_trade = trade_mgr.close_trade(current_time, "EMA_CROSS", current_price);
+
+                std::cout << "+====================================================+\n";
+                std::cout << "| [EMA EXIT] Trade Closed - EMA 9/20 Cross          |\n";
+                std::cout << "+====================================================+\n";
+                std::cout << "  Exit Price:  " << std::fixed << std::setprecision(2)
+                          << closed_trade.exit_price << "\n";
+                std::cout << "  Exit Date:   " << closed_trade.exit_date << "\n";
+                std::cout << "  Final P&L:   " << (closed_trade.pnl >= 0 ? "+" : "") << closed_trade.pnl << "\n";
+                std::cout << "  Return:      " << (closed_trade.return_pct >= 0 ? "+" : "")
+                          << std::setprecision(2) << closed_trade.return_pct << "%\n";
+                std::cout << "  EMA9/EMA20:  " << std::setprecision(2) << ema9 << " / " << ema20 << "\n";
+                std::cout << std::endl;
+                std::cout.flush();
+
+                LOG_INFO("Position closed: EMA_CROSS, P&L: $" << closed_trade.pnl
+                         << " (EMA9=" << ema9 << ", EMA20=" << ema20 << ")");
+
+                if (order_submitter_ && order_submitter_->is_enabled()) {
+                    auto result = order_submitter_->square_off_all_positions();
+                    LOG_INFO("Called square_off_all_positions after EMA_CROSS. Success: " << result.success);
+                }
+
+                performance.add_trade(closed_trade);
+                performance.update_capital(trade_mgr.get_capital());
+                export_trade_journal();
+                return;
+            }
+        }
+    }
+    
+    if (sl_hit) {
+        std::string exit_reason = trade.trailing_activated ? "TRAIL_SL" : "STOP_LOSS";
+        std::string current_time = current_bar.datetime;
+        Trade closed_trade = trade_mgr.close_trade(current_time, exit_reason, exit_price);
+        
+        // ⭐ FIX #2: Log trail performance when trail exits
+        if (exit_reason == "TRAIL_SL" && closed_trade.risk_amount > 0) {
+            double r_achieved = closed_trade.pnl / closed_trade.risk_amount;
+            LOG_INFO("🎯 Trail exit at " << std::fixed << std::setprecision(2) 
+                    << r_achieved << "R (P&L: " << closed_trade.pnl << ")");
+            std::cout << "\n  📊 Trail Performance: " << std::setprecision(2) 
+                      << r_achieved << "R achieved\n";
+        }
+        
+        // ⭐ FIX: STRICT ZONE ID MATCHING for retry counter
+        // OLD BUG: Distance-based detection (within 50 points) allowed zones 320, 337, 245 to re-trade
+        // NEW: Exact zone_id match prevents repeat trading of same zone
+        if (config.enable_per_zone_retry_limit && closed_trade.zone_id >= 0) {
+            for (auto& zone : active_zones) {
+                if (zone.zone_id == closed_trade.zone_id) {
+                    zone.entry_retry_count++;
+                    LOG_INFO("🚫 Zone " << zone.zone_id << " retry count incremented to " 
+                             << zone.entry_retry_count << " (BLOCKS re-entry if >= " 
+                             << config.max_retries_per_zone << ")");
+                    break;
+                }
+            }
+        }
+        
+        std::cout << "+====================================================+\n";
+        std::cout << "| [STOP LOSS] Trade Closed - Stop Loss Hit          |\n";
+        std::cout << "+====================================================+\n";
+        std::cout << "  Exit Price:  " << std::fixed << std::setprecision(2) 
+                  << closed_trade.exit_price << "\n";
+        std::cout << "  Exit Date:   " << closed_trade.exit_date << "\n";
+        std::cout << "  Final P&L:   " << (closed_trade.pnl >= 0 ? "+" : "") << closed_trade.pnl << "\n";
+        std::cout << "  Return:      " << (closed_trade.return_pct >= 0 ? "+" : "") 
+                  << std::setprecision(2) << closed_trade.return_pct << "%\n";
+        std::cout << std::endl;
+        std::cout.flush();
+
+        LOG_INFO("Position closed: STOP_LOSS, P&L: $" << closed_trade.pnl);
+
+        // Call square_off_all_positions if available and enabled
+        if (order_submitter_ && order_submitter_->is_enabled()) {
+            auto result = order_submitter_->square_off_all_positions();
+            LOG_INFO("Called square_off_all_positions after STOP_LOSS. Success: " << result.success);
+        }
+
+        // ⭐ NEW: Update performance and export CSV
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_mgr.get_capital());
+        export_trade_journal();
+
+        return;
+    }
+    
+    // ⭐ DETERMINISTIC: Check take profit using the already-computed flag
+    if (tp_hit) {
+        std::string current_time = current_bar.datetime;
+        Trade closed_trade = trade_mgr.close_trade(current_time, "TAKE_PROFIT", exit_price);
+        
+        std::cout << "+====================================================+\n";
+        std::cout << "| [PROFIT] Trade Closed - Take Profit Hit           |\n";
+        std::cout << "+====================================================+\n";
+        std::cout << "  Exit Price:  " << std::fixed << std::setprecision(2) 
+                  << closed_trade.exit_price << "\n";
+        std::cout << "  Exit Date:   " << closed_trade.exit_date << "\n";
+        std::cout << "  Final P&L:   " << (closed_trade.pnl >= 0 ? "+" : "") << closed_trade.pnl << "\n";
+        std::cout << "  Return:      " << (closed_trade.return_pct >= 0 ? "+" : "") 
+                  << std::setprecision(2) << closed_trade.return_pct << "%\n";
+        std::cout << std::endl;
+        std::cout.flush();
+
+        LOG_INFO("Position closed: TAKE_PROFIT, P&L: $" << closed_trade.pnl);
+
+        // Call square_off_all_positions if available and enabled
+        if (order_submitter_ && order_submitter_->is_enabled()) {
+            auto result = order_submitter_->square_off_all_positions();
+            LOG_INFO("Called square_off_all_positions after TAKE_PROFIT. Success: " << result.success);
+        }
+
+        // ⭐ NEW: Update performance and export CSV
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_mgr.get_capital());
+        export_trade_journal();
+
+        return;
+    }
+}
+
+void LiveEngine::process_tick() {
+    LOG_DEBUG("Processing tick...");
+    
+    // DEBUG: Print every tick to verify loop is running
+    std::cout << "\n[TICK] TICK PROCESSED - Current bar count: " << bar_history.size() << std::endl;
+    std::cout.flush();
+    
+    // Update bar history (bar_index is now incremented inside update_bar_history only when new bar is added)
+    update_bar_history();
+    
+    // ⭐ NEW: Periodic zone refresh (LTP ±5%, every 30 min)
+    if (config.enable_live_zone_filtering && bar_history.size() > 0) {
+        double current_ltp = bar_history.back().close;
+        refresh_active_zones(current_ltp);
+    }
+    
+    // ⭐ NEW: Periodic CSV export backup (every N bars)
+    if (config.live_export_every_n_bars > 0) {
+        if (bar_index - last_csv_export_bar_ >= config.live_export_every_n_bars) {
+            LOG_INFO("Periodic CSV export (bar " << bar_index << ")");
+            export_trade_journal();
+            last_csv_export_bar_ = bar_index;
+        }
+    }
+    
+    // Manage existing position
+    if (trade_mgr.is_in_position()) {  // ⭐ Use TradeManager
+        manage_position();
+        // Don't return early - continue to process zones and check for signals
+        // (but won't enter new trades while already in position)
+    }
+    
+    // Process zones (even if in position, for monitoring)
+    // if (bar_history.size() >= 100) {  // Need sufficient history
+    //     process_zones();
+    // }
+    
+    // Check for entries (will be rejected by TradeManager if already in position)
+    if (bar_history.size() >= 100) {
+        check_for_entries();
+    }
+}
+
+bool LiveEngine::bootstrap_zones_on_startup() {
+    LOG_INFO("==============================================");
+    LOG_INFO("  ZONE BOOTSTRAP: Checking cache validity");
+    LOG_INFO("==============================================");
+    
+    // Check if bootstrap is enabled in config
+    if (!config.zone_bootstrap_enabled) {
+        LOG_INFO("❌ Bootstrap disabled in config - using standard zone detection");
+        return false;
+    }
+    
+    // Try to load existing master zone file with metadata
+    fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+    
+    if (!fs::exists(master_file_path)) {
+        LOG_INFO("❌ No cached zones found: " << master_file_path.string());
+        LOG_INFO("   Will generate fresh zone snapshot");
+        // Fall through to regeneration
+    } else {
+        // Load metadata and check validity
+        auto metadata = zone_persistence_.load_metadata(master_file_path.string());
+        
+        if (metadata.empty()) {
+            LOG_WARN("⚠️  Cached zones have no metadata - regenerating");
+        } else {
+            LOG_INFO("✅ Found cached zones with metadata:");
+            for (const auto& [key, value] : metadata) {
+                LOG_INFO("   " << key << ": " << value);
+            }
+            
+            // Check validity (TTL, daily refresh, config changes)
+            if (check_bootstrap_validity(metadata)) {
+                // Reuse cached zones
+                LOG_INFO("✅ REUSING cached zones (valid)");
+                
+                // Load zones from master file
+                int loaded_id = 1;
+                if (zone_persistence_.load_zones(active_zones, loaded_id)) {
+                    next_zone_id_ = loaded_id;
+                    LOG_INFO("✅ Loaded " << active_zones.size() << " zones from cache");
+                    return true;
+                } else {
+                    LOG_WARN("⚠️  Failed to load cached zones - regenerating");
+                }
+            } else {
+                LOG_INFO("❌ Cached zones invalid (TTL/schedule/config) - regenerating");
+            }
+        }
+    }
+    
+    // Regeneration path: Detect zones from scratch using full historical data
+    LOG_INFO("==============================================");
+    LOG_INFO("  ZONE BOOTSTRAP: Generating fresh snapshot");
+    LOG_INFO("==============================================");
+    
+    auto bootstrap_start = std::chrono::high_resolution_clock::now();
+    
+    // Detect zones using shared ZoneInitializer (same as backtest)
+    LOG_INFO("Detecting zones from " << bar_history.size() << " historical bars...");
+    active_zones = Core::ZoneInitializer::detect_initial_zones(bar_history, detector, next_zone_id_);
+    LOG_INFO("✅ Detected " << active_zones.size() << " initial zones");
+    
+    // Score all zones
+    LOG_INFO("Scoring zones...");
+    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+    for (auto& zone : active_zones) {
+        zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+    }
+    LOG_INFO("✅ Scored " << active_zones.size() << " zones");
+
+    LOG_INFO("Replaying historical bars to sync zone states...");
+    bool original_flip_setting = config.enable_zone_flip;
+    config.enable_zone_flip = false;
+    replay_historical_zone_states();
+    config.enable_zone_flip = original_flip_setting;
+    LOG_INFO("✅ Zone states synchronized with historical data");
+
+    
+    // Build metadata
+    std::map<std::string, std::string> metadata;
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm;
+#ifdef _WIN32
+    localtime_s(&tm, &time_t);
+#else
+    tm = *std::localtime(&time_t);
+#endif
+    std::ostringstream timestamp_ss;
+    timestamp_ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    
+    metadata["generated_at"] = timestamp_ss.str();
+    metadata["csv_path"] = historical_csv_path_;
+    metadata["symbol"] = trading_symbol;
+    metadata["interval"] = bar_interval;
+    metadata["bar_count"] = std::to_string(bar_history.size());
+    metadata["zone_count"] = std::to_string(active_zones.size());
+    metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
+    metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
+    
+    // Save master zones with metadata
+    LOG_INFO("Saving master zones with metadata...");
+    bool save_success = zone_persistence_.save_zones_with_metadata(
+        active_zones, next_zone_id_, master_file_path.string(), metadata
+    );
+    
+    if (!save_success) {
+        LOG_ERROR("❌ Failed to save master zones");
+        return false;
+    }
+    
+    // Save active zones (filtered) separately
+    if (config.enable_live_zone_filtering && bar_history.size() > 0) {
+        double ltp = bar_history.back().close;
+        filter_zones_by_range(ltp);
+        
+        fs::path active_file_path = fs::path(output_dir_) / "zones_live_active.json";
+        
+        // Count active zones
+        std::vector<Zone> filtered_active;
+        for (const auto& zone : active_zones) {
+            if (zone.is_active) {
+                filtered_active.push_back(zone);
+            }
+        }
+        
+        LOG_INFO("Saving active zones (filtered)...");
+        zone_persistence_.save_zones_as(filtered_active, next_zone_id_, active_file_path.string());
+        LOG_INFO("✅ Saved " << filtered_active.size() << " active zones");
+    }
+    
+    auto bootstrap_end = std::chrono::high_resolution_clock::now();
+    auto bootstrap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bootstrap_end - bootstrap_start).count();
+    
+    LOG_INFO("==============================================");
+    LOG_INFO("  ZONE BOOTSTRAP COMPLETE");
+    LOG_INFO("  Time: " << bootstrap_ms << "ms (" << (bootstrap_ms/1000.0) << "s)");
+    LOG_INFO("  Zones: " << active_zones.size());
+    LOG_INFO("==============================================");
+    
+    return true;
+}
+
+bool LiveEngine::check_bootstrap_validity(const std::map<std::string, std::string>& metadata) {
+    // Check if force regenerate flag is set
+    if (config.zone_bootstrap_force_regenerate) {
+        LOG_INFO("❌ Validity: force_regenerate=true");
+        return false;
+    }
+    
+    // Check generated_at timestamp (TTL check)
+    if (metadata.find("generated_at") != metadata.end()) {
+        std::string generated_at_str = metadata.at("generated_at");
+        
+        // Parse timestamp: format is "YYYY-MM-DD HH:MM:SS"
+        std::tm generated_tm = {};
+        std::istringstream ss(generated_at_str);
+        ss >> std::get_time(&generated_tm, "%Y-%m-%d %H:%M:%S");
+        
+        if (ss.fail()) {
+            LOG_WARN("⚠️  Could not parse generated_at timestamp");
+        } else {
+            auto generated_time = std::chrono::system_clock::from_time_t(std::mktime(&generated_tm));
+            auto now = std::chrono::system_clock::now();
+            auto age_hours = std::chrono::duration_cast<std::chrono::hours>(now - generated_time).count();
+            
+            LOG_INFO("   Age: " << age_hours << " hours (TTL: " << config.zone_bootstrap_ttl_hours << " hours)");
+            
+            if (age_hours >= config.zone_bootstrap_ttl_hours) {
+                LOG_INFO("❌ Validity: TTL exceeded");
+                return false;
+            }
+        }
+    }
+    
+    // Check daily refresh time (e.g., "08:50")
+    if (!config.zone_bootstrap_refresh_time.empty()) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm;
+#ifdef _WIN32
+        localtime_s(&now_tm, &time_t);
+#else
+        now_tm = *std::localtime(&time_t);
+#endif
+        
+        // Parse refresh_time "HH:MM"
+        std::istringstream ss(config.zone_bootstrap_refresh_time);
+        int refresh_hour, refresh_min;
+        char colon;
+        ss >> refresh_hour >> colon >> refresh_min;
+        
+        if (!ss.fail()) {
+            int current_minutes = now_tm.tm_hour * 60 + now_tm.tm_min;
+            int refresh_minutes = refresh_hour * 60 + refresh_min;
+            
+            // If current time is past refresh time today, check if zones were generated before refresh time
+            if (current_minutes >= refresh_minutes) {
+                if (metadata.find("generated_at") != metadata.end()) {
+                    std::string generated_at_str = metadata.at("generated_at");
+                    std::tm generated_tm = {};
+                    std::istringstream gen_ss(generated_at_str);
+                    gen_ss >> std::get_time(&generated_tm, "%Y-%m-%d %H:%M:%S");
+                    
+                    if (!gen_ss.fail()) {
+                        int generated_minutes = generated_tm.tm_hour * 60 + generated_tm.tm_min;
+                        
+                        // If zones were generated today but before refresh time, regenerate
+                        if (generated_tm.tm_mday == now_tm.tm_mday &&
+                            generated_tm.tm_mon == now_tm.tm_mon &&
+                            generated_tm.tm_year == now_tm.tm_year &&
+                            generated_minutes < refresh_minutes) {
+                            LOG_INFO("❌ Validity: Daily refresh time passed (" << config.zone_bootstrap_refresh_time << ")");
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Check if CSV path changed
+    if (metadata.find("csv_path") != metadata.end()) {
+        if (metadata.at("csv_path") != historical_csv_path_) {
+            LOG_INFO("❌ Validity: CSV path changed");
+            return false;
+        }
+    }
+    
+    // Check if symbol/interval changed
+    if (metadata.find("symbol") != metadata.end()) {
+        if (metadata.at("symbol") != trading_symbol) {
+            LOG_INFO("❌ Validity: Symbol changed");
+            return false;
+        }
+    }
+    
+    if (metadata.find("interval") != metadata.end()) {
+        if (metadata.at("interval") != bar_interval) {
+            LOG_INFO("❌ Validity: Interval changed");
+            return false;
+        }
+    }
+    
+    LOG_INFO("✅ Validity: All checks passed");
+    return true;
+}
+
+void LiveEngine::run(int duration_minutes) {
+    LOG_INFO("==================================================");
+    LOG_INFO("  Starting Live Trading");
+    LOG_INFO("  Symbol: " << trading_symbol);
+    LOG_INFO("  Interval: " << bar_interval << " min");
+    if (duration_minutes > 0) {
+        LOG_INFO("  Duration: " << duration_minutes << " minutes");
+    } else {
+        LOG_INFO("  Duration: Continuous (Ctrl+C to stop)");
+    }
+    LOG_INFO("==================================================");
+    
+    // ⭐ NEW: Bootstrap zones on startup (with TTL/refresh logic)
+    bool bootstrapped = bootstrap_zones_on_startup();
+    
+    if (!bootstrapped) {
+        // Bootstrap disabled or failed - fall back to legacy zone detection
+        LOG_WARN("⚠️  Bootstrap failed or disabled - using legacy zone detection");
+        
+        // ⭐ TIMING: Measure zone detection
+        auto zone_detect_start = std::chrono::high_resolution_clock::now();
+        
+        // ⭐ CRITICAL FIX: Detect zones BEFORE main loop (same as backtest)
+        // This ensures both engines detect zones at the SAME point
+        LOG_INFO("Detecting initial zones from historical data...");
+        
+        bool loaded_backtest_zones = try_load_backtest_zones();
+
+        if (!loaded_backtest_zones) {
+            if (active_zones.empty()) {
+                // Only detect if no persisted zones loaded
+                active_zones = Core::ZoneInitializer::detect_initial_zones(bar_history, detector, next_zone_id_);
+                LOG_INFO("Found " << active_zones.size() << " zones");
+            }
+
+            // ⚠️ OPTIMIZATION: Skip historical replay for large datasets (>100k bars)
+            // Historical replay can be slow for large datasets and is mainly for perfect state sync
+            // For live trading, we can start fresh and let zones update in real-time
+            if (bar_history.size() > 100000) {
+                LOG_WARN("⚡ SKIPPING historical replay due to large dataset (" << bar_history.size() << " bars)");
+                LOG_WARN("   Zones will update in real-time from current point forward");
+                LOG_WARN("   This is normal for first-time initialization");
+            } else {
+                // Re-apply historical bars to align states with updated rules (e.g., body-close invalidation)
+                // Note: This is a one-time pass at startup; cost is acceptable outside Debug.
+                // CRITICAL: Disable zone flipping during replay to match backtest behavior
+                bool original_flip_setting = config.enable_zone_flip;
+                config.enable_zone_flip = false;  // Temporarily disable flipping
+                LOG_INFO("Replaying historical bars to sync zone states...");
+                replay_historical_zone_states();
+                config.enable_zone_flip = original_flip_setting;  // Restore original setting
+            }
+        }
+
+        // ⭐ CRITICAL FIX: Score all zones (whether newly detected or loaded from backtest)
+        // This ensures zone_score fields are populated correctly
+        LOG_INFO("Scoring " << active_zones.size() << " zones...");
+        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+        int zones_scored = 0;
+        for (auto& zone : active_zones) {
+            // Re-score the zone with current market context
+            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+            zones_scored++;
+            
+            LOG_DEBUG("Zone " << zone.zone_id << " scored: total=" << zone.zone_score.total_score
+                     << " (" << zone.zone_score.entry_rationale << ")");
+        }
+        LOG_INFO("✅ Scored " << zones_scored << " zones (avg: " 
+                 << (zones_scored > 0 ? (std::accumulate(active_zones.begin(), active_zones.end(), 0.0,
+                    [](double sum, const Core::Zone& z) { return sum + z.zone_score.total_score; }) / zones_scored) : 0.0)
+                 << ")");
+
+        // ⭐ NEW: Apply dynamic range-based filtering on initialization
+        if (config.enable_live_zone_filtering && bar_history.size() > 0) {
+            double initial_ltp = bar_history.back().close;
+            LOG_INFO("Applying initial zone filtering (LTP: " << initial_ltp << ")");
+            filter_zones_by_range(initial_ltp);
+            
+            // Initialize refresh tracking
+            bars_since_last_refresh_ = 0;
+            last_refresh_ltp_ = initial_ltp;
+        }
+
+        // ⭐ TIMING: Measure zone saving
+        auto zone_save_start = std::chrono::high_resolution_clock::now();
+        
+        // Clear state history if disabled (to keep file size small)
+        if (!config.enable_state_history) {
+            for (auto& zone : active_zones) {
+                zone.state_history.clear();
+            }
+        }
+        
+        // Save the aligned zones to the live snapshot
+        LOG_INFO("💾 Saving zones to persistent file...");
+        bool save_result = zone_persistence_.save_zones(active_zones, next_zone_id_);
+        
+        if (!save_result) {
+            LOG_WARN("⚠️ Failed to save zones - will regenerate on next startup");
+        } else {
+            LOG_INFO("✅ Zones saved successfully: " << zone_persistence_.get_zone_file_path());
+        }
+        
+        auto zone_save_end = std::chrono::high_resolution_clock::now();
+        auto zone_save_ms = std::chrono::duration_cast<std::chrono::milliseconds>(zone_save_end - zone_save_start).count();
+        
+        auto zone_detect_end = std::chrono::high_resolution_clock::now();
+        auto zone_detect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(zone_detect_end - zone_detect_start).count();
+        
+        LOG_INFO("Zone detection complete: " << zone_detect_ms << "ms (" << (zone_detect_ms/1000.0) << "s)");
+        LOG_INFO("  - Zone saving: " << zone_save_ms << "ms");
+    }
+    
+    // Mark all historical bars as scanned
+    last_zone_scan_bar_ = static_cast<int>(bar_history.size() - 1);
+    
+    LOG_INFO("Zone detection complete. Ready to monitor for new zones...");
+    
+    auto start_time = std::chrono::steady_clock::now();
+    
+    // Main trading loop
+    while (true) {
+        try {
+            process_tick();
+            
+            // NEW: Periodic zone detection to maintain fresh zone pipeline
+            if (config.live_zone_detection_interval_bars > 0) {
+                int current_bar_count = static_cast<int>(bar_history.size());
+                int last_scannable_bar = current_bar_count - 6;
+                int bars_since_detection = last_scannable_bar - last_zone_scan_bar_;
+                
+                if (last_scannable_bar > last_zone_scan_bar_ &&
+                    bars_since_detection >= config.live_zone_detection_interval_bars) {
+                    LOG_INFO("🔄 Running periodic zone detection (" << bars_since_detection << " bars since last scan)");
+                    
+                    // Detect new zones with duplicate prevention
+                    std::vector<Core::Zone> new_zones = detector.detect_zones_no_duplicates(
+                        active_zones,
+                        last_zone_scan_bar_ + 1
+                    );
+
+                    if (!new_zones.empty()) {
+                        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(
+                            bar_history, config.htf_lookback_bars, config.htf_trending_threshold);
+                        int added_count = 0;
+
+                        for (auto& zone : new_zones) {
+                            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+                            zone.zone_id = next_zone_id_++;
+                            active_zones.push_back(zone);
+                            added_count++;
+                            LOG_INFO("  ✅ Added Zone " << zone.zone_id << " (score: "
+                                    << zone.zone_score.total_score << ", state: "
+                                    << (zone.state == Core::ZoneState::FRESH ? "FRESH" :
+                                        zone.state == Core::ZoneState::TESTED ? "TESTED" : "VIOLATED") << ")");
+                        }
+
+                        // Re-score merged zones if any were updated
+                        if (!detector.get_last_merged_zone_ids().empty()) {
+                            for (auto& zone : active_zones) {
+                                if (std::find(detector.get_last_merged_zone_ids().begin(),
+                                              detector.get_last_merged_zone_ids().end(),
+                                              zone.zone_id) != detector.get_last_merged_zone_ids().end()) {
+                                    zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+                                }
+                            }
+                        }
+
+                        LOG_INFO("✅ Zone detection complete: " << new_zones.size()
+                                << " detected, " << added_count << " added");
+                    } else {
+                        LOG_DEBUG("No new zones detected");
+                    }
+                    
+                    last_zone_scan_bar_ = last_scannable_bar;
+                }
+            }
+            
+            // Check duration
+            if (duration_minutes > 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(
+                    now - start_time).count();
+                if (elapsed >= duration_minutes) {
+                    LOG_INFO("Duration reached, stopping...");
+                    break;
+                }
+            }
+            
+            // Sleep until next tick (e.g., every 10 seconds)
+            // ⭐ FIX: Skip sleep for CSV simulator
+CsvSimulatorBroker* csv_broker = dynamic_cast<CsvSimulatorBroker*>(broker.get());
+if (csv_broker == nullptr) {
+    std::this_thread::sleep_for(std::chrono::seconds(10)); // Real broker
+    LOG_DEBUG("⏱️  Live mode: waiting for tick");
+} else {
+    LOG_DEBUG("📊 CSV mode: processing immediately");
+    // Live mode: wait for new bars instead of stopping
+    if (csv_broker->get_current_position() >= csv_broker->get_total_bars()) {
+                if (dryrun_bootstrap_end_bar_ > 0) {
+                    // DryRun mode: Stop when complete
+                    LOG_INFO("✅ All bars processed - stopping");
+                    break;
+                } else {
+                    // Live mode: Wait for new data
+                    LOG_DEBUG("⏱️  Waiting for new bars (at end of CSV)");
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                }
+            }
+    size_t pos = csv_broker->get_current_position();
+    if (pos > 0 && pos % 100 == 0) {
+        LOG_INFO("📊 Progress: " << (pos * 100.0 / csv_broker->get_total_bars()) 
+                << "% (" << pos << "/" << csv_broker->get_total_bars() << ")");
+    }
+}
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR("Error in trading loop: " << e.what());
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }
+    
+    stop();
+}
+
+void LiveEngine::stop() {
+    LOG_INFO("==================================================");
+    LOG_INFO("  Stopping Live Trading");
+    LOG_INFO("==================================================");
+    
+    // NEW: Save zones before shutdown
+    LOG_INFO("Saving zones to file...");
+    // Clear state history if disabled
+    if (!config.enable_state_history) {
+        for (auto& zone : active_zones) {
+            zone.state_history.clear();
+        }
+    }
+    if (zone_persistence_.save_zones(active_zones, next_zone_id_)) {
+        LOG_INFO("✅ Zones saved: " << zone_persistence_.get_zone_file_path());
+    } else {
+        LOG_WARN("Failed to save zones");
+    }
+    
+    // Close any open positions using TradeManager
+    if (trade_mgr.is_in_position()) {  // ⭐ Use TradeManager
+        LOG_WARN("Closing open position before shutdown");
+        
+        double current_price = broker->get_ltp(trading_symbol);
+        std::string current_time = bar_history.back().datetime;
+        
+        Trade closed_trade = trade_mgr.close_trade(current_time, "ENGINE_STOP", current_price);
+        
+        // ⭐ NEW: Add final trade to performance
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_mgr.get_capital());
+    }
+    
+    // ⭐ NEW: Final CSV export and performance summary
+    LOG_INFO("Exporting final trade journal...");
+    export_trade_journal();
+    
+    // Display final performance summary
+    std::cout << "\n==================================================\n";
+    std::cout << "  LIVE TRADING PERFORMANCE SUMMARY\n";
+    std::cout << "==================================================\n";
+    performance.print_summary();
+    std::cout << "==================================================\n\n";
+    
+    // Disconnect from broker
+    if (broker) {
+        broker->disconnect();
+    }
+    
+    LOG_INFO("✅ Live Engine stopped");
+}
+
+std::optional<Core::Zone> LiveEngine::detect_zone_flip(const Core::Zone& violated_zone, int bar_index) {
+    // Look back for consolidation before the breakdown
+    int lookback_start = std::max<double>(0, bar_index - config.flip_lookback_bars);
+    
+    if (lookback_start >= bar_index - 1) {
+        return std::nullopt;  // Not enough bars
+    }
+    
+    // Find consolidation period before breakdown
+    double flip_base_low = bar_history[lookback_start].low;
+    double flip_base_high = bar_history[lookback_start].high;
+    
+    for (int i = lookback_start; i < bar_index; i++) {
+        flip_base_low = std::min(flip_base_low, bar_history[i].low);
+        flip_base_high = std::max<double>(flip_base_high, bar_history[i].high);
+    }
+    
+    // Check if breakdown is vigorous enough
+    if (bar_index + 5 >= static_cast<int>(bar_history.size())) {
+        return std::nullopt;  // Not enough bars ahead
+    }
+    
+    double price_at_breakdown = bar_history[bar_index].close;
+    double price_after_impulse = bar_history[bar_index + 5].close;
+    double impulse_move = std::abs(price_after_impulse - price_at_breakdown);
+    double atr = Core::MarketAnalyzer::calculate_atr(bar_history, config.atr_period, bar_index);
+    
+    if (impulse_move < config.flip_min_impulse_atr * atr) {
+        return std::nullopt;  // Impulse too weak
+    }
+    
+    // Create flipped zone (opposite type)
+    Core::Zone flipped;
+    flipped.type = (violated_zone.type == Core::ZoneType::DEMAND) ? 
+                   Core::ZoneType::SUPPLY : Core::ZoneType::DEMAND;
+    flipped.base_low = flip_base_low;
+    flipped.base_high = flip_base_high;
+    flipped.distal_line = (flipped.type == Core::ZoneType::DEMAND) ? flip_base_low : flip_base_high;
+    flipped.proximal_line = (flipped.type == Core::ZoneType::DEMAND) ? flip_base_high : flip_base_low;
+    flipped.formation_bar = lookback_start;
+    flipped.formation_datetime = bar_history[lookback_start].datetime;
+    flipped.state = Core::ZoneState::FRESH;
+    flipped.touch_count = 0;
+    flipped.is_flipped_zone = true;
+    flipped.parent_zone_id = violated_zone.zone_id;
+    
+    // Calculate strength
+    double range = flip_base_high - flip_base_low;
+    if (atr > 0.0001) {
+        double ratio = range / atr;
+        flipped.strength = 100.0 * (1.0 - std::min(ratio / config.max_consolidation_range, 1.0));
+    } else {
+        flipped.strength = 0.0;
+    }
+    
+    // Only return if strength is acceptable
+    if (flipped.strength < config.min_zone_strength) {
+        return std::nullopt;
+    }
+    
+    return flipped;
+}
+
+void LiveEngine::export_trade_journal() {
+    try {
+        const auto& trades = performance.get_trades();
+        
+        // ⭐ FIX: Only export if there are NEW trades since last export
+        if (trades.size() == last_exported_trade_count_) {
+            LOG_DEBUG("No new trades to export (count=" << trades.size() << ")");
+            return;
+        }
+        
+        LOG_INFO("📊 Exporting trade journal (" << trades.size() << " trades, was " << last_exported_trade_count_ << ")...");
+        
+        if (trades.empty()) {
+            LOG_INFO("No trades to export yet");
+            return;
+        }
+        
+        Backtest::CSVReporter reporter(output_dir_);
+        
+        // Calculate current metrics
+        Backtest::PerformanceMetrics metrics = performance.calculate_metrics();
+        metrics.total_bars = bar_history.size();
+        
+        // Export trade log
+        bool trades_ok = reporter.export_trades(trades, "trades.csv");
+        if (trades_ok) {
+            LOG_INFO("✅ Trade log exported: " << output_dir_ << "/trades.csv (" << trades.size() << " trades)");
+        }
+        
+        // Export performance metrics
+        bool metrics_ok = reporter.export_metrics(metrics, "metrics.csv");
+        if (metrics_ok) {
+            LOG_INFO("✅ Metrics exported: " << output_dir_ << "/metrics.csv");
+        }
+        
+        // Export equity curve
+        bool equity_ok = reporter.export_equity_curve(trades, config.starting_capital, "equity_curve.csv");
+        if (equity_ok) {
+            LOG_INFO("✅ Equity curve exported: " << output_dir_ << "/equity_curve.csv");
+        }
+        
+        // ⭐ Update last exported count AFTER successful export
+        last_exported_trade_count_ = trades.size();
+        
+        std::cout << "📊 Trade journal updated: " << trades.size() << " trades, "
+                  << "P&L: $" << std::fixed << std::setprecision(2) << metrics.total_pnl 
+                  << " (" << metrics.total_return_pct << "%)" << std::endl;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to export trade journal: " << e.what());
+    }
+}
+
+// bool LiveEngine::send_test_buy_signal() {
+//     LOG_INFO("🧪 TEST: Sending dummy BUY signal to Fyers broker...");
+    
+//     // Check if already in position
+//     if (trade_mgr.is_in_position()) {
+//         LOG_WARN("Already in a position. Cannot enter another trade.");
+//         std::cout << "\n⚠️  Already in position - close existing trade first" << std::endl;
+//         return false;
+//     }
+    
+//     // Get current market price
+//     double current_price = broker->get_ltp(trading_symbol);
+//     if (current_price <= 0) {
+//         LOG_ERROR("Failed to get current market price");
+//         std::cout << "\n❌ Failed to get market price from broker" << std::endl;
+//         return false;
+//     }
+    
+//     LOG_INFO("Current market price: " << current_price);
+//     std::cout << "\n📊 Current Market Price: ₹" << std::fixed << std::setprecision(2) << current_price << std::endl;
+    
+//     // Create a dummy zone for testing (centered around current price)
+//     Zone test_zone;
+//     test_zone.zone_id = 99999;  // Test zone ID
+//     test_zone.type = ZoneType::DEMAND;  // BUY signal
+//     test_zone.distal_line = current_price - 10.0;  // 10 points below
+//     test_zone.proximal_line = current_price + 10.0;  // 10 points above
+//     test_zone.base_low = test_zone.distal_line;
+//     test_zone.base_high = test_zone.proximal_line;
+//     test_zone.formation_bar = bar_index;
+//     test_zone.formation_datetime = bar_history.empty() ? "TEST" : bar_history.back().datetime;
+//     test_zone.state = ZoneState::FRESH;
+//     test_zone.touch_count = 0;
+//     test_zone.strength = 80.0;  // High strength for test
+    
+//     LOG_INFO("Created test DEMAND zone: " << test_zone.distal_line << " - " << test_zone.proximal_line);
+    
+//     // Create dummy entry decision
+//     EntryDecision test_decision;
+//     test_decision.should_enter = true;
+//     test_decision.entry_price = current_price;
+//     test_decision.stop_loss = current_price - 30.0;  // 30 points stop loss
+//     test_decision.take_profit = current_price + 60.0;  // 60 points take profit (1:2 R:R)
+//     test_decision.position_size = 1;  // 1 lot for testing
+//     test_decision.direction = "LONG";
+//     test_decision.risk_reward_ratio = 2.0;
+//     test_decision.rejection_reason = "";
+    
+//     LOG_INFO("Entry decision created: LONG @ " << test_decision.entry_price 
+//              << ", SL: " << test_decision.stop_loss 
+//              << ", TP: " << test_decision.take_profit);
+    
+//     // Create dummy bar
+//     Bar test_bar;
+//     test_bar.datetime = bar_history.empty() ? "TEST" : bar_history.back().datetime;
+//     test_bar.open = current_price;
+//     test_bar.high = current_price + 5.0;
+//     test_bar.low = current_price - 5.0;
+//     test_bar.close = current_price;
+//     test_bar.volume = 10000;
+    
+//     // Get market regime
+//     MarketRegime test_regime = MarketRegime::NEUTRAL;
+//     if (!bar_history.empty()) {
+//         test_regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+//     }
+    
+//     LOG_INFO("Market regime: " << static_cast<int>(test_regime));
+    
+//     std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+//     std::cout << "  🧪 TEST BUY SIGNAL" << std::endl;
+//     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+//     std::cout << "  Symbol:      " << trading_symbol << std::endl;
+//     std::cout << "  Direction:   LONG (BUY)" << std::endl;
+//     std::cout << "  Entry Price: ₹" << std::fixed << std::setprecision(2) << test_decision.entry_price << std::endl;
+//     std::cout << "  Stop Loss:   ₹" << test_decision.stop_loss << " (-30 pts)" << std::endl;
+//     std::cout << "  Take Profit: ₹" << test_decision.take_profit << " (+60 pts)" << std::endl;
+//     std::cout << "  Position:    " << test_decision.position_size << " lot" << std::endl;
+//     std::cout << "  Risk:Reward: 1:" << std::setprecision(1) << test_decision.risk_reward_ratio << std::endl;
+//     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+//     std::cout << "\n⚠️  This is a TEST trade - will be sent to broker!" << std::endl;
+    
+//     // Use TradeManager to enter the trade (this will call broker)
+//     LOG_INFO("Calling TradeManager to execute trade...");
+//     bool success = trade_mgr.enter_trade(
+//         test_decision,
+//         test_zone,
+//         test_bar,
+//         bar_index,
+//         test_regime,
+//         trading_symbol
+//     );
+    
+//     if (success) {
+//         const Trade& trade = trade_mgr.get_current_trade();
+        
+//         std::cout << "\n✅ TEST BUY ORDER SENT TO FYERS!" << std::endl;
+//         std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+//         std::cout << "  Trade ID:    " << trade.trade_id << std::endl;
+//         std::cout << "  Direction:   " << trade.direction << std::endl;
+//         std::cout << "  Entry:       ₹" << std::fixed << std::setprecision(2) << trade.entry_price << std::endl;
+//         std::cout << "  Stop Loss:   ₹" << trade.stop_loss << std::endl;
+//         std::cout << "  Take Profit: ₹" << trade.take_profit << std::endl;
+//         std::cout << "  Quantity:    " << trade.position_size << " lot(s)" << std::endl;
+//         std::cout << "  Capital:     ₹" << trade_mgr.get_capital() << std::endl;
+//         std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+//         std::cout << "\n📊 Position is now OPEN - monitor with process_tick()" << std::endl;
+//         std::cout << "💡 To close: Use TradeManager or let SL/TP trigger" << std::endl;
+        
+//         LOG_INFO("✅ Test trade executed successfully");
+//         LOG_INFO("Trade ID: " << trade.trade_id);
+std::pair<double, double> LiveEngine::calculate_price_range(double ltp, double range_pct) const {
+    double range_points = ltp * (range_pct / 100.0);
+    double lower = ltp - range_points;
+    double upper = ltp + range_points;
+    
+    LOG_DEBUG("Price range calculation: LTP=" << ltp << ", range_pct=" << range_pct 
+             << "% => [" << lower << ", " << upper << "]");
+    
+    return {lower, upper};
+}
+
+bool LiveEngine::is_zone_in_range(const Zone& zone, double lower, double upper) const {
+    // Zone overlaps range if:
+    // - Zone distal is below range upper, AND
+    // - Zone proximal is above range lower
+    bool overlaps = (zone.distal_line <= upper && zone.proximal_line >= lower);
+    
+    LOG_DEBUG("Zone overlap check: distal=" << zone.distal_line << ", proximal=" << zone.proximal_line 
+             << ", range=[" << lower << ", " << upper << "] => " << (overlaps ? "YES" : "NO"));
+    
+    return overlaps;
+}
+
+void LiveEngine::filter_zones_by_range(double ltp) {
+    if (!config.enable_live_zone_filtering) {
+        LOG_DEBUG("Live zone filtering disabled - keeping all zones active");
+        return;
+    }
+    
+    LOG_INFO("=== Zone Filtering by Price Range ===");
+    LOG_INFO("LTP: " << ltp << ", Range: ±" << config.live_zone_range_pct << "%");
+    
+    auto [lower, upper] = calculate_price_range(ltp, config.live_zone_range_pct);
+    LOG_INFO("Filtering zones to range: [" << lower << ", " << upper << "]");
+    
+    // Move zones that don't overlap into inactive list
+    std::vector<Zone> zones_to_keep;
+    std::vector<Zone> zones_to_deactivate;
+    
+    for (auto& zone : active_zones) {
+        if (is_zone_in_range(zone, lower, upper)) {
+            // Zone overlaps - keep active
+            if (!zone.is_active) {
+                zone.is_active = true;
+                LOG_INFO("✅ Zone " << zone.zone_id << " RE-ACTIVATED (now in range)");
+            }
+            zones_to_keep.push_back(zone);
+        } else {
+            // Zone doesn't overlap - deactivate
+            zone.is_active = false;
+            zones_to_deactivate.push_back(zone);
+            LOG_INFO("⛔ Zone " << zone.zone_id << " DEACTIVATED (outside range)");
+        }
+    }
+    
+    // Update vectors
+    inactive_zones.insert(inactive_zones.end(), zones_to_deactivate.begin(), zones_to_deactivate.end());
+    active_zones = zones_to_keep;
+    
+    LOG_INFO("After filtering: " << active_zones.size() << " active, " << inactive_zones.size() << " inactive");
+}
+
+void LiveEngine::refresh_active_zones(double ltp) {
+    if (!config.enable_live_zone_filtering) {
+        return;
+    }
+    
+    // Check if refresh interval has elapsed
+    bars_since_last_refresh_++;
+    int bar_interval_minutes = std::stoi(bar_interval);
+    int bars_for_interval = config.live_zone_refresh_interval_minutes > 0 ? 
+        (config.live_zone_refresh_interval_minutes * 60) / bar_interval_minutes : 
+        INT_MAX;  // Disable refresh if interval <= 0
+    
+    if (bars_since_last_refresh_ < bars_for_interval) {
+        LOG_DEBUG("Refresh interval not elapsed: " << bars_since_last_refresh_ 
+                 << " / " << bars_for_interval << " bars");
+        return;
+    }
+    
+    LOG_INFO("=== Periodic Zone Refresh (every " << config.live_zone_refresh_interval_minutes << " min) ===");
+    LOG_INFO("Checking inactive zones for re-activation...");
+    
+    auto [lower, upper] = calculate_price_range(ltp, config.live_zone_range_pct);
+    
+    // Check inactive zones for re-activation
+    std::vector<Zone> zones_to_reactivate;
+    std::vector<Zone> zones_still_inactive;
+    
+    for (auto& zone : inactive_zones) {
+        if (is_zone_in_range(zone, lower, upper)) {
+            // Zone now in range - re-activate and re-score
+            zone.is_active = true;
+            
+            // Re-score the zone with current market regime
+            MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+            
+            LOG_INFO("🔄 Zone " << zone.zone_id << " RE-ACTIVATED and RE-SCORED: " 
+                    << zone.zone_score.total_score << "/120");
+            
+            zones_to_reactivate.push_back(zone);
+        } else {
+            // Still outside range
+            zones_still_inactive.push_back(zone);
+        }
+    }
+    
+    // Update vectors
+    active_zones.insert(active_zones.end(), zones_to_reactivate.begin(), zones_to_reactivate.end());
+    inactive_zones = zones_still_inactive;
+    
+    // Reset refresh counter
+    bars_since_last_refresh_ = 0;
+    last_refresh_ltp_ = ltp;
+    
+    LOG_INFO("Refresh complete: " << zones_to_reactivate.size() << " zones re-activated");
+    LOG_INFO("Current state: " << active_zones.size() << " active, " << inactive_zones.size() << " inactive");
+}
+
+void LiveEngine::log_order_to_csv(const std::string& entry_time,
+                                  const std::string& zone_id,
+                                  double zone_score,
+                                  const std::string& direction,
+                                  double entry_price,
+                                  double stop_loss,
+                                  double take_profit,
+                                  int position_size) {
+    try {
+        // Create output directory if it doesn't exist
+        fs::path output_path = fs::path(output_dir_) / "live_trades";
+        fs::create_directories(output_path);
+        
+        // Path to simulated_orders.csv
+        fs::path csv_file = output_path / "simulated_orders.csv";
+        
+        // Create header if file doesn't exist
+        if (!fs::exists(csv_file)) {
+            std::ofstream f(csv_file);
+            f << "entry_time,zone_id,zone_score,direction,entry_price,stop_loss,take_profit,position_size,lot_size,quantity\n";
+            f.close();
+        }
+        
+        // Append order to CSV
+        std::ofstream f(csv_file, std::ios::app);
+        int total_quantity = position_size * config.lot_size;
+        
+        f << entry_time << ","
+          << zone_id << ","
+          << std::fixed << std::setprecision(4) << zone_score << ","
+          << direction << ","
+          << std::fixed << std::setprecision(2) << entry_price << ","
+          << std::fixed << std::setprecision(2) << stop_loss << ","
+          << std::fixed << std::setprecision(2) << take_profit << ","
+          << position_size << ","
+          << config.lot_size << ","
+          << total_quantity << "\n";
+        
+        f.close();
+        
+        std::cout << "\n📝 [ORDER LOG] Order logged to CSV\n";
+        std::cout << "   File:      " << csv_file << "\n";
+        std::cout << "   Direction: " << direction << "\n";
+        std::cout << "   Entry:     $" << std::fixed << std::setprecision(2) << entry_price << "\n";
+        std::cout << "   Quantity:  " << total_quantity << "\n";
+        std::cout.flush();
+        
+        LOG_INFO("Order logged to CSV: " << zone_id << " " << direction << " @ " << entry_price);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to log order to CSV: " << e.what());
+    }
+}
+//         LOG_INFO("Entry price: " << trade.entry_price);
+//         LOG_INFO("Position size: " << trade.position_size << " lots");
+        
+//         return true;
+//     } else {
+//         std::cout << "\n❌ FAILED TO SEND ORDER" << std::endl;
+//         std::cout << "   Check broker connection and logs" << std::endl;
+//         LOG_ERROR("Failed to execute test trade");
+//         return false;
+//     }
+// }
+
+
+} // namespace Live
+} // namespace SDTrading

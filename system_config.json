@@ -3,9 +3,9 @@
   "_version": "1.0",
 
   "system": {
-    "root_directory": "D:/SD_System/SD_Volume_OI/SD_Trading_V4",
+    "root_directory": "D:/SD_System/SD_Volume_OI/SD_Trading_V6",
     "environment": "PRODUCTION",
-    "log_level": "ERROR"
+    "log_level": "INFO"
   },
   
   "directories": {
@@ -18,10 +18,10 @@
   },
   
   "files": {
-    "strategy_config": "conf/phase_6_config_v0.1_Tested_in_1_Mins.txt",
+    "strategy_config": "conf/phase_6_config_v0_6_ABSORPTION_new_recommendation.txt",
     "fyers_token": "scripts/fyers_token.txt",
     "fyers_config": "scripts/fyers_config.json",
-    "live_data_csv": "data/LiveTest/live_data-DRYRUN.csv",
+    "live_data_csv": "data/LiveTest/Live_Data_5Mins_Sep05_Feb26.csv",
     "historical_data_cache": "data/cache/historical",
     "bridge_status": "data/bridge_status.json",
     "python_log": "logs/fyers_bridge.log",
@@ -49,7 +49,7 @@
   
   "trading": {
     "symbol": "NSE:NIFTY26FEBFUT",
-    "resolution": "1",
+    "resolution": "5",
     "mode": "paper",
     "starting_capital": 300000,
     "lot_size": 65
@@ -109,14 +109,14 @@
   "volume_oi": {
     "_comment": "SD Engine V6.0 - Volume & OI Integration",
     "volume_config": {
-      "enable_volume_entry_filters": true,
-      "enable_volume_exit_signals": true,
+      "enable_volume_entry_filters": false,
+      "enable_volume_exit_signals": false,
       "min_entry_volume_ratio": 0.8,
       "institutional_volume_threshold": 2.0,
       "extreme_volume_threshold": 3.0,
       "volume_lookback_period": 20,
       "volume_normalization_method": "time_of_day",
-      "volume_baseline_file": "data/baselines/volume_baseline_1min.json"
+      "volume_baseline_file": "data/baselines/volume_baseline_5min.json"
     },
     "oi_config": {
       "enable_oi_entry_filters": true,

@@ -92,6 +92,8 @@ set(LIBRARY_SOURCES
     src/core/system_config_loader.cpp
     src/utils/system_initializer.cpp
     src/utils/logger.h
+	src/core/zone_state_manager.h
+	src/core/zone_state_manager.cpp
 
     # Utils - V6.0: Volume baseline infrastructure
     src/utils/volume_baseline.cpp

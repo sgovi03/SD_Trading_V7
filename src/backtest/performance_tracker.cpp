@@ -1,6 +1,8 @@
 #include "performance_tracker.h"
 #include "../utils/logger.h"
 #include <cmath>
+#include <map>
+#include <vector>
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
@@ -316,6 +318,74 @@ void PerformanceTracker::print_summary() const {
     std::cout << "  Sharpe Ratio:    " << std::setprecision(3) << metrics.sharpe_ratio << std::endl;
     
     std::cout << "\n==================================================" << std::endl;
+
+    // ⭐ DIAGNOSTIC: Break down P&L by exit reason to identify loss source
+    std::cout << "\n==================================================\n";
+    std::cout << "  EXIT REASON BREAKDOWN (Diagnostic)\n";
+    std::cout << "==================================================\n";
+
+    // Aggregate by exit reason
+    std::map<std::string, std::tuple<int,int,double,double,double>> reason_stats;
+    // key → (total, losses, total_pnl, sum_loss_abs, max_loss_abs)
+    for (const auto& t : all_trades) {
+        auto& s = reason_stats[t.exit_reason];
+        std::get<0>(s)++;
+        if (t.pnl < 0) {
+            std::get<1>(s)++;
+            std::get<3>(s) += std::abs(t.pnl);
+            if (std::abs(t.pnl) > std::get<4>(s)) std::get<4>(s) = std::abs(t.pnl);
+        }
+        std::get<2>(s) += t.pnl;
+    }
+
+    std::cout << std::left << std::setw(14) << "Exit Reason"
+              << std::right << std::setw(7)  << "Count"
+              << std::setw(8)  << "Losses"
+              << std::setw(14) << "Total P&L"
+              << std::setw(14) << "Avg Loss"
+              << std::setw(14) << "Max Loss"
+              << "\n";
+    std::cout << std::string(71, '-') << "\n";
+    for (const auto& kv : reason_stats) {
+        int cnt   = std::get<0>(kv.second);
+        int lcnt  = std::get<1>(kv.second);
+        double tp = std::get<2>(kv.second);
+        double sl = std::get<3>(kv.second);
+        double ml = std::get<4>(kv.second);
+        double al = (lcnt > 0) ? sl / lcnt : 0.0;
+        std::cout << std::left << std::setw(14) << kv.first
+                  << std::right << std::setw(7)  << cnt
+                  << std::setw(8)  << lcnt
+                  << std::setw(14) << std::fixed << std::setprecision(0) << tp
+                  << std::setw(14) << al
+                  << std::setw(14) << ml
+                  << "\n";
+    }
+
+    // Also print top 10 worst trades
+    std::cout << "\n  TOP 10 WORST TRADES:\n";
+    std::vector<const Trade*> sorted;
+    for (const auto& t : all_trades) sorted.push_back(&t);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const Trade* a, const Trade* b){ return a->pnl < b->pnl; });
+    int shown = 0;
+    for (const auto* t : sorted) {
+        if (shown++ >= 10) break;
+        double pts = (t->direction == "LONG")
+            ? (t->exit_price - t->entry_price)
+            : (t->entry_price - t->exit_price);
+        std::cout << "  #" << std::setw(5) << t->trade_num
+                  << " " << std::setw(6) << t->direction
+                  << " Entry=" << std::fixed << std::setprecision(1) << t->entry_price
+                  << " Exit=" << t->exit_price
+                  << " Pts=" << std::setprecision(1) << pts
+                  << " Lots=" << t->position_size
+                  << " PnL=" << std::setprecision(0) << t->pnl
+                  << " Reason=" << t->exit_reason
+                  << " Bars=" << t->bars_in_trade
+                  << "\n";
+    }
+    std::cout << "==================================================\n";
 }
 
 } // namespace Backtest

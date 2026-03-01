@@ -1,0 +1,1367 @@
+// ============================================================
+// BACKTEST ENGINE - MODIFIED IMPLEMENTATION
+// ============================================================
+
+#include "backtest_engine.h"
+#include "csv_reporter.h"
+#include "../utils/logger.h"
+#include "../ZoneInitializer.h"
+#include "../analysis/market_analyzer.h"
+#include "../sd_engine_core.h"  // For calculate_trailing_stop
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <sstream>
+#include <ctime>
+#include <filesystem>
+#include <optional>
+#include <numeric>  // For std::accumulate
+#include <algorithm>
+// In BacktestEngine files
+#include "../ITradingEngine.h"
+#include "../ZonePersistenceAdapter.h"
+
+namespace fs = std::filesystem;
+
+namespace SDTrading {
+namespace Backtest {
+
+namespace {
+
+int calculate_days_difference(const std::string& from_dt, const std::string& to_dt) {
+    auto parse_date = [](const std::string& dt, std::tm& tm_out) -> bool {
+        std::istringstream ss(dt);
+        ss >> std::get_time(&tm_out, "%Y-%m-%d %H:%M:%S");
+        if (!ss.fail()) {
+            return true;
+        }
+        ss.clear();
+        ss.str(dt);
+        ss >> std::get_time(&tm_out, "%Y-%m-%d");
+        return !ss.fail();
+    };
+
+    std::tm from_tm{};
+    std::tm to_tm{};
+    if (!parse_date(from_dt, from_tm) || !parse_date(to_dt, to_tm)) {
+        return 0;
+    }
+
+    from_tm.tm_isdst = -1;
+    to_tm.tm_isdst = -1;
+
+    std::time_t from_time = std::mktime(&from_tm);
+    std::time_t to_time = std::mktime(&to_tm);
+    if (from_time == static_cast<std::time_t>(-1) || to_time == static_cast<std::time_t>(-1)) {
+        return 0;
+    }
+
+    double diff_sec = std::difftime(to_time, from_time);
+    int days = static_cast<int>(diff_sec / (60.0 * 60.0 * 24.0));
+    return std::max(0, days);
+}
+
+bool is_zone_age_blocked(const Core::Zone& zone, const Core::Bar& current_bar, const Core::Config& config, int& age_days_out) {
+    age_days_out = calculate_days_difference(zone.formation_datetime, current_bar.datetime);
+
+    if (config.min_zone_age_days > 0 && age_days_out < config.min_zone_age_days) {
+        return true;
+    }
+    if (config.max_zone_age_days > 0 && age_days_out > config.max_zone_age_days) {
+        return true;
+    }
+    if (config.exclude_zone_age_range &&
+        age_days_out >= config.exclude_zone_age_start &&
+        age_days_out <= config.exclude_zone_age_end) {
+        return true;
+    }
+
+    return false;
+}
+
+}  // namespace
+
+BacktestEngine::BacktestEngine(
+    const Core::Config& cfg,
+    const std::string& data_file,
+    const std::string& output_directory
+)
+    : config(cfg),
+      detector(config),  // FIX: Use member config, not parameter cfg
+      scorer(config),     // FIX: Use member config, not parameter cfg
+      entry_engine(config), // FIX: Use member config, not parameter cfg
+      trade_manager(config, config.starting_capital), // FIX: Use member config
+      performance(config.starting_capital),  // FIX: Use member config
+      volume_baseline_(),  // V6.0: Initialize volume baseline
+      volume_scorer_(nullptr),  // V6.0: Will be created after baseline loads
+      oi_scorer_(nullptr),      // V6.0: Will be created after baseline loads
+      zone_persistence_("backtest", output_directory, false),  // ⭐ FIXED: Pass false (no filtering in backtest)
+      next_zone_id_(1),  // NEW: Zone ID tracking
+      data_file_path_(data_file),
+      output_dir_(output_directory),
+      pause_counter(0),
+      consecutive_losses(0) {
+    
+    // Pre-allocate vectors for performance
+    bars.reserve(50000);  // Reserve for ~50K bars (1-min: ~1 month)
+    active_zones.reserve(1000);  // Reserve for up to 1000 zones
+    
+    // Create output directory
+    fs::create_directories(output_dir_);
+    
+    LOG_INFO("BacktestEngine created");
+    LOG_INFO("  Data file: " << data_file_path_);
+    LOG_INFO("  Output:    " << output_dir_);
+    
+    // ========================================
+    // V6.0: Initialize Volume/OI Components
+    // ========================================
+    if (config.v6_fully_enabled) {
+        LOG_INFO("🚀 V6.0 Volume & OI Integration ENABLED");
+        
+        // Load volume baseline
+        std::string baseline_path = config.volume_baseline_file;
+        if (volume_baseline_.load_from_file(baseline_path)) {
+            LOG_INFO("✅ Volume Baseline loaded: " << volume_baseline_.size() << " time slots");
+            
+            // Create scorers
+            volume_scorer_ = new Core::VolumeScorer(volume_baseline_);
+            oi_scorer_ = new Core::OIScorer();
+            LOG_INFO("✅ V6.0 Scorers initialized");
+            
+            // Inject into subsystems
+            detector.set_volume_baseline(&volume_baseline_);
+            entry_engine.set_volume_baseline(&volume_baseline_);
+            entry_engine.set_oi_scorer(oi_scorer_);
+            trade_manager.set_volume_baseline(&volume_baseline_);
+            trade_manager.set_oi_scorer(oi_scorer_);
+            
+            LOG_INFO("✅ V6.0 Components wired into engine");
+            
+            if (config.v6_validate_baseline_on_startup) {
+                LOG_INFO("📊 Volume Baseline Statistics:");
+                LOG_INFO("   - Time slots: " << volume_baseline_.size());
+                LOG_INFO("   - Market start: 09:15");
+                LOG_INFO("   - Market end:   15:30");
+            }
+        } else {
+            LOG_WARN("⚠️  Volume baseline not loaded - V6.0 running in degraded mode");
+            LOG_WARN("   Expected file: " << baseline_path);
+        }
+    } else {
+        LOG_INFO("ℹ️  V6.0 Integration DISABLED (v6_fully_enabled=false)");
+    }
+}
+
+BacktestEngine::~BacktestEngine() {
+    // Clean up V6.0 resources
+    if (volume_scorer_ != nullptr) {
+        delete volume_scorer_;
+        volume_scorer_ = nullptr;
+    }
+    if (oi_scorer_ != nullptr) {
+        delete oi_scorer_;
+        oi_scorer_ = nullptr;
+    }
+    LOG_INFO("BacktestEngine destroyed");
+}
+
+bool BacktestEngine::load_csv_data() {
+    LOG_INFO("Loading CSV data: " << data_file_path_);
+    
+    std::ifstream file(data_file_path_);
+    if (!file.is_open()) {
+        LOG_ERROR("Cannot open data file: " << data_file_path_);
+        return false;
+    }
+    
+    bars.clear();
+    std::string line;
+    std::getline(file, line); // Skip header
+    
+    int line_number = 1;
+    while (std::getline(file, line)) {
+        line_number++;
+        
+        if (line.empty()) continue;
+        
+        try {
+            std::stringstream ss(line);
+            std::string timestamp, datetime, symbol;
+            std::string open_str, high_str, low_str, close_str, volume_str, oi_str;
+            std::string oi_fresh_str, oi_age_seconds_str;  // NEW V6.0
+            
+            // Parse CSV columns (Fyers format: 11 columns in V6.0, backward compatible with 9)
+            std::getline(ss, timestamp, ',');      // Column 0: Unix timestamp
+            std::getline(ss, datetime, ',');       // Column 1: DateTime
+            std::getline(ss, symbol, ',');         // Column 2: Symbol
+            std::getline(ss, open_str, ',');       // Column 3: Open
+            std::getline(ss, high_str, ',');       // Column 4: High
+            std::getline(ss, low_str, ',');        // Column 5: Low
+            std::getline(ss, close_str, ',');      // Column 6: Close
+            std::getline(ss, volume_str, ',');     // Column 7: Volume
+            std::getline(ss, oi_str, ',');         // Column 8: OpenInterest
+            std::getline(ss, oi_fresh_str, ',');   // Column 9: OI_Fresh (NEW V6.0)
+            std::getline(ss, oi_age_seconds_str, ','); // Column 10: OI_Age_Seconds (NEW V6.0)
+            
+            // Create Bar
+            Core::Bar bar;
+            bar.datetime = datetime;
+            bar.open = std::stod(open_str);
+            bar.high = std::stod(high_str);
+            bar.low = std::stod(low_str);
+            bar.close = std::stod(close_str);
+            bar.volume = volume_str.empty() ? 0.0 : std::stod(volume_str);
+            bar.oi = oi_str.empty() ? 0.0 : std::stod(oi_str);
+            
+            // NEW V6.0: Parse OI metadata (backward compatible)
+            if (!oi_fresh_str.empty()) {
+                bar.oi_fresh = (oi_fresh_str == "1" || oi_fresh_str == "true" || oi_fresh_str == "True");
+            } else {
+                bar.oi_fresh = false;
+            }
+            
+            if (!oi_age_seconds_str.empty()) {
+                bar.oi_age_seconds = std::stoi(oi_age_seconds_str);
+            } else {
+                bar.oi_age_seconds = 0;
+            }
+            
+            bars.push_back(bar);
+            
+        } catch (const std::exception& e) {
+            LOG_WARN("Skipping line " << line_number << ": " << e.what());
+            continue;
+        }
+    }
+    
+    file.close();
+    
+    if (bars.empty()) {
+        LOG_ERROR("No data loaded from CSV");
+        return false;
+    }
+    
+    LOG_INFO("Loaded " << bars.size() << " bars");
+    LOG_INFO("  First: " << bars.front().datetime);
+    LOG_INFO("  Last:  " << bars.back().datetime);
+    
+    // Add bars to detector
+    for (const auto& bar : bars) {
+        detector.add_bar(bar);
+    }
+    
+    return true;
+}
+
+bool BacktestEngine::initialize() {
+    LOG_INFO("Initializing BacktestEngine...");
+    
+    // Load CSV data
+    if (!load_csv_data()) {
+        LOG_ERROR("Failed to load CSV data");
+        return false;
+    }
+    
+    // Backtest always starts with fresh zones (no loading)
+    active_zones.clear();
+    next_zone_id_ = 1;
+    LOG_INFO("Starting with fresh zones (backtest mode)");
+    
+    LOG_INFO("BacktestEngine initialized successfully");
+    return true;
+}
+
+void BacktestEngine::update_zone_states(const Core::Bar& bar) {
+    bool zones_changed = false;
+
+    auto record_event = [&](Core::Zone& target_zone, const Core::ZoneStateEvent& evt, bool enabled) {
+        if (!config.enable_state_history || !enabled) {
+            return;
+        }
+        target_zone.state_history.push_back(evt);
+        if (config.max_state_history_events > 0 &&
+            target_zone.state_history.size() > static_cast<size_t>(config.max_state_history_events)) {
+            auto erase_count = target_zone.state_history.size() - static_cast<size_t>(config.max_state_history_events);
+            target_zone.state_history.erase(
+                target_zone.state_history.begin(),
+                target_zone.state_history.begin() + static_cast<long long>(erase_count));
+        }
+    };
+    
+    // Update states of active zones based on price action
+    for (auto& zone : active_zones) {
+        Core::ZoneState old_state = zone.state;
+        std::string old_state_str = (old_state == Core::ZoneState::FRESH ? "FRESH" :
+                                      old_state == Core::ZoneState::TESTED ? "TESTED" : "VIOLATED");
+        
+        // price_in_zone: bar overlaps the zone body in any way.
+        // DEMAND: proximal=base_high (top), distal=base_low (bottom)
+        //   overlap = bar.high >= distal AND bar.low <= proximal  → current formula works
+        // SUPPLY: proximal=base_low (bottom), distal=base_high (top)
+        //   overlap = bar.low <= distal AND bar.high >= proximal
+        //   The old formula (bar.low<=proximal && bar.high>=distal) required the bar
+        //   to span the ENTIRE supply zone — normal touches were invisible.
+        bool price_in_zone;
+        if (zone.type == Core::ZoneType::DEMAND) {
+            price_in_zone = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+        } else {
+            // Fix #4: SUPPLY touch = bar overlaps zone from above (bar.high touches proximal or higher)
+            // Old code required bar to SPAN entire zone; now any overlap with proximal upward is a touch
+            price_in_zone = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+        }
+
+        if (price_in_zone) {
+            if (zone.state == Core::ZoneState::FRESH) {
+                zone.state = Core::ZoneState::TESTED;
+                zone.touch_count++;
+                // V6.0: Record normalised touch volume
+                if (volume_baseline_.is_loaded()) {
+                    std::string slot = volume_baseline_.extract_time_slot(bar.datetime);
+                    double ratio = volume_baseline_.get_normalized_ratio(slot, bar.volume);
+                    zone.volume_profile.touch_volumes.push_back(ratio);
+
+                    if (zone.volume_profile.touch_volumes.size() >= 3) {
+                        const auto& tv = zone.volume_profile.touch_volumes;
+                        int n = static_cast<int>(tv.size());
+                        int rc = 0;
+                        for (int i = n - 2; i >= std::max(0, n - 3); --i)
+                            if (tv[i + 1] > tv[i]) rc++;
+                        zone.volume_profile.volume_rising_on_retests = (rc >= 2);
+                        if (zone.volume_profile.volume_rising_on_retests) {
+                            LOG_WARN("Zone " + std::to_string(zone.zone_id) +
+                                     " rising volume on retests — Component 5 penalty active");
+                        }
+                    }
+                }
+                zones_changed = true;
+                
+                // Record FIRST_TOUCH event
+                Core::ZoneStateEvent event(
+                    bar.datetime,
+                    static_cast<int>(bars.size() - 1),
+                    "FIRST_TOUCH",
+                    old_state_str,
+                    "TESTED",
+                    (bar.high + bar.low) / 2.0,  // Mid-price
+                    bar.high,
+                    bar.low,
+                    zone.touch_count
+                );
+                record_event(zone, event, config.record_first_touch);
+                
+            } else if (zone.state == Core::ZoneState::TESTED) {
+                zone.touch_count++;
+                // V6.0: Record normalised touch volume
+                if (volume_baseline_.is_loaded()) {
+                    std::string slot = volume_baseline_.extract_time_slot(bar.datetime);
+                    double ratio = volume_baseline_.get_normalized_ratio(slot, bar.volume);
+                    zone.volume_profile.touch_volumes.push_back(ratio);
+
+                    if (zone.volume_profile.touch_volumes.size() >= 3) {
+                        const auto& tv = zone.volume_profile.touch_volumes;
+                        int n = static_cast<int>(tv.size());
+                        int rc = 0;
+                        for (int i = n - 2; i >= std::max(0, n - 3); --i)
+                            if (tv[i + 1] > tv[i]) rc++;
+                        zone.volume_profile.volume_rising_on_retests = (rc >= 2);
+                        if (zone.volume_profile.volume_rising_on_retests) {
+                            LOG_WARN("Zone " + std::to_string(zone.zone_id) +
+                                     " rising volume on retests — Component 5 penalty active");
+                        }
+                    }
+                }
+                zones_changed = true;
+                
+                // Record RETEST event
+                Core::ZoneStateEvent event(
+                    bar.datetime,
+                    static_cast<int>(bars.size() - 1),
+                    "RETEST",
+                    old_state_str,
+                    "TESTED",
+                    (bar.high + bar.low) / 2.0,
+                    bar.high,
+                    bar.low,
+                    zone.touch_count
+                );
+                record_event(zone, event, config.record_retests);
+            }
+        }
+        
+        // Check for violation
+        bool violated = false;
+        std::string violation_event = "VIOLATED";
+        double violation_price = bar.close;
+
+        // Gap-over invalidation: entire bar clears distal without touching the zone
+        if (config.gap_over_invalidation && zone.state != Core::ZoneState::VIOLATED) {
+            if (zone.type == Core::ZoneType::DEMAND) {
+                violated = (bar.high < zone.distal_line);
+            } else {
+                violated = (bar.low > zone.distal_line);
+            }
+            if (violated) {
+                violation_event = "GAP_VIOLATED";
+                violation_price = (zone.type == Core::ZoneType::DEMAND) ? bar.high : bar.low;
+                zone.was_swept = true;
+                zone.sweep_bar = static_cast<int>(bars.size() - 1);
+            }
+        }
+
+        // Body-close invalidation
+        if (!violated && config.invalidate_on_body_close) {
+            if (zone.type == Core::ZoneType::DEMAND) {
+                violated = (bar.close < zone.distal_line);
+            } else {
+                violated = (bar.close > zone.distal_line);
+            }
+            if (violated) {
+                violation_event = "VIOLATED";
+                violation_price = bar.close;
+            }
+        }
+
+        // SWEEP-RECLAIM DETECTION: Check if swept zone is reclaiming
+        if (config.enable_sweep_reclaim && zone.was_swept && zone.state == Core::ZoneState::VIOLATED) {
+            bool price_inside_zone = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line);
+            
+            if (price_inside_zone) {
+                // Check if bar closes inside zone (acceptance)
+                double zone_range = std::abs(zone.proximal_line - zone.distal_line);
+                double body_in_zone = 0.0;
+                
+                if (zone.type == Core::ZoneType::DEMAND) {
+                    // For demand, check how much body is above distal
+                    if (bar.close >= zone.distal_line) {
+                        body_in_zone = std::min(bar.close, zone.proximal_line) - zone.distal_line;
+                    }
+                } else {
+                    // For supply, check how much body is below distal
+                    if (bar.close <= zone.distal_line) {
+                        body_in_zone = zone.distal_line - std::max(bar.close, zone.proximal_line);
+                    }
+                }
+                
+                double body_pct = (zone_range > 0) ? (body_in_zone / zone_range) : 0.0;
+                
+                if (body_pct >= config.reclaim_acceptance_pct) {
+                    zone.bars_inside_after_sweep++;
+                    
+                    // Check if acceptance period met
+                    if (zone.bars_inside_after_sweep >= config.reclaim_acceptance_bars) {
+                        zone.state = Core::ZoneState::RECLAIMED;
+                        zone.reclaim_eligible = true;
+                        zones_changed = true;
+                        
+                        // Record reclaim event
+                        Core::ZoneStateEvent event(
+                            bar.datetime,
+                            static_cast<int>(bars.size() - 1),
+                            "SWEEP_RECLAIMED",
+                            "VIOLATED",
+                            "RECLAIMED",
+                            (bar.high + bar.low) / 2.0,
+                            bar.high,
+                            bar.low,
+                            zone.touch_count
+                        );
+                        record_event(zone, event, config.record_violations);
+                        LOG_DEBUG("Zone " << zone.zone_id << " RECLAIMED after sweep");
+                    }
+                } else {
+                    // Reset counter if body not sufficiently inside
+                    zone.bars_inside_after_sweep = 0;
+                }
+            } else {
+                // Reset counter if price exits zone
+                zone.bars_inside_after_sweep = 0;
+            }
+        }
+
+        if (violated && zone.state != Core::ZoneState::VIOLATED) {
+            std::string pre_violation_state = (zone.state == Core::ZoneState::FRESH ? "FRESH" : "TESTED");
+            zone.state = Core::ZoneState::VIOLATED;
+            zones_changed = true;
+            
+            // Record violation event
+            Core::ZoneStateEvent event(
+                bar.datetime,
+                static_cast<int>(bars.size() - 1),
+                violation_event,
+                pre_violation_state,
+                "VIOLATED",
+                violation_price,
+                bar.high,
+                bar.low,
+                zone.touch_count
+            );
+            record_event(zone, event, config.record_violations);
+            
+            // ZONE FLIP DETECTION: Check for opposite zone at breakdown point
+            if (config.enable_zone_flip) {
+                auto flipped_zone = detect_zone_flip(zone, static_cast<int>(bars.size() - 1));
+                if (flipped_zone.has_value()) {
+                    flipped_zone->zone_id = next_zone_id_++;
+                    
+                    // Score the flipped zone
+                    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+                    flipped_zone->zone_score = scorer.evaluate_zone(flipped_zone.value(), regime, bar);
+                    
+                    LOG_DEBUG("Flipped zone scored: ID=" << flipped_zone->zone_id 
+                             << " Total=" << flipped_zone->zone_score.total_score
+                             << " (" << flipped_zone->zone_score.entry_rationale << ")");
+                    
+                    active_zones.push_back(flipped_zone.value());
+                    zones_changed = true;
+                    LOG_DEBUG("Zone " << zone.zone_id << " flipped -> new " << 
+                            (flipped_zone->type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY") <<
+                            " zone " << flipped_zone->zone_id);
+                }
+            }
+        }
+    }
+    
+    // NOTE: Zone persistence disabled during backtest loop for performance
+    // Zones will be saved once at the end in export_results()
+}
+
+void BacktestEngine::detect_and_add_zones(const Core::Bar& bar, int bar_index) {
+    auto record_event = [&](Core::Zone& target_zone, const Core::ZoneStateEvent& evt, bool enabled) {
+        if (!config.enable_state_history || !enabled) {
+            return;
+        }
+        target_zone.state_history.push_back(evt);
+        if (config.max_state_history_events > 0 &&
+            target_zone.state_history.size() > static_cast<size_t>(config.max_state_history_events)) {
+            auto erase_count = target_zone.state_history.size() - static_cast<size_t>(config.max_state_history_events);
+            target_zone.state_history.erase(
+                target_zone.state_history.begin(),
+                target_zone.state_history.begin() + static_cast<long long>(erase_count));
+        }
+    };
+
+    // Detect new zones with duplicate prevention
+    std::vector<Core::Zone> new_zones = detector.detect_zones_no_duplicates(active_zones);
+
+    const auto& summary = detector.get_last_detection_summary();
+    total_zones_created_ += summary.created;
+    total_zones_merged_ += summary.merged;
+    total_zones_skipped_ += summary.skipped;
+    
+    // Optimize: Skip duplication check if no new zones detected
+    if (new_zones.empty()) {
+        return;
+    }
+    
+    // Add new zones (duplicates are already filtered)
+    for (auto& zone : new_zones) {
+        zone.zone_id = next_zone_id_++;
+
+        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        zone.zone_score = scorer.evaluate_zone(zone, regime, bar);
+
+        LOG_DEBUG("Zone scored: ID=" << zone.zone_id
+                 << " Total=" << zone.zone_score.total_score
+                 << " (" << zone.zone_score.entry_rationale << ")");
+
+        Core::ZoneStateEvent creation_event(
+            bar.datetime,
+            bar_index,
+            "ZONE_CREATED",
+            "",
+            "FRESH",
+            (zone.proximal_line + zone.distal_line) / 2.0,
+            bar.high,
+            bar.low,
+            0
+        );
+        record_event(zone, creation_event, config.record_zone_creation);
+
+        active_zones.push_back(zone);
+
+        LOG_DEBUG("New zone added: "
+                 << (zone.type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                 << " @ " << zone.distal_line << "-" << zone.proximal_line
+                 << " (ID: " << zone.zone_id << ")");
+    }
+
+    // Re-score merged zones if any were updated
+    if (!detector.get_last_merged_zone_ids().empty()) {
+        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        for (auto& zone : active_zones) {
+            if (std::find(detector.get_last_merged_zone_ids().begin(),
+                          detector.get_last_merged_zone_ids().end(),
+                          zone.zone_id) != detector.get_last_merged_zone_ids().end()) {
+                zone.zone_score = scorer.evaluate_zone(zone, regime, bar);
+            }
+        }
+    }
+}
+
+void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
+    // ⭐ FIX: ENTRY TIME GATE - Block entries after circuit breaker cutoff
+    // Prevents late entries (e.g., 15:29) that bypass position closing logic
+    if (config.close_before_session_end_minutes > 0) {
+        std::string current_time_str = bar.datetime;
+        
+        // Parse current time (HH:MM:SS)
+        int curr_hour = 0, curr_min = 0, curr_sec = 0;
+        try {
+            size_t space_pos = current_time_str.rfind(' ');
+            if (space_pos != std::string::npos) {
+                std::string time_part = current_time_str.substr(space_pos + 1);
+                sscanf(time_part.c_str(), "%d:%d:%d", &curr_hour, &curr_min, &curr_sec);
+            }
+        } catch (...) {
+            // Silently skip if parsing fails
+        }
+        
+        // Parse session end time
+        int session_hour = 0, session_min = 0, session_sec = 0;
+        try {
+            sscanf(config.session_end_time.c_str(), "%d:%d:%d", &session_hour, &session_min, &session_sec);
+        } catch (...) {
+            // Silently skip if parsing fails
+        }
+        
+        // Calculate cutoff time (session_end - close_before_session_end_minutes)
+        int cutoff_min = session_min - config.close_before_session_end_minutes;
+        int cutoff_hour = session_hour;
+        if (cutoff_min < 0) {
+            cutoff_hour--;
+            cutoff_min += 60;
+        }
+        
+        // Convert to minutes since midnight
+        int curr_total_min = curr_hour * 60 + curr_min;
+        int cutoff_total_min = cutoff_hour * 60 + cutoff_min;
+        
+        if (curr_total_min >= cutoff_total_min) {
+            // Entry blocked - too close to session end
+            LOG_DEBUG("⏳ ENTRY BLOCKED: Time (" << current_time_str 
+                    << ") >= Entry cutoff (" << cutoff_hour << ":" << cutoff_min << ")");
+            return;
+        }
+    }
+    
+    // Get current market regime using medium-term lookback for trade filtering
+    // Note: Using 100 bars (~1 week for 15min bars) instead of HTF's 700 bars
+    // to better capture actionable trends vs very long-term bias
+    const int REGIME_LOOKBACK = 100;  // ~1 week of 15-min bars
+    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, REGIME_LOOKBACK, config.htf_trending_threshold);
+    
+    // Debug: Log regime detection (reduced frequency for performance)
+    static int regime_log_counter = 0;
+    if (regime_log_counter++ % 500 == 0) {
+        std::string regime_str = (regime == Core::MarketRegime::BULL) ? "BULL" : 
+                                  (regime == Core::MarketRegime::BEAR) ? "BEAR" : "RANGING";
+        LOG_DEBUG("Market Regime: " << regime_str << " (lookback=" << REGIME_LOOKBACK <<  
+                 ", allow_ranging=" << (config.allow_ranging_trades ? "YES" : "NO") 
+                 << ", trend_only=" << (config.trade_with_trend_only ? "YES" : "NO") << ")");
+    }
+    
+    // Check each active zone for entry opportunity
+    for (auto& zone : active_zones) {
+        // Skip violated zones
+        if (zone.state == Core::ZoneState::VIOLATED) continue;
+        
+        // Skip if only trading fresh zones
+        if (config.only_fresh_zones && zone.state != Core::ZoneState::FRESH) continue;
+
+        // Zone age filter (min/max/exclude range)
+        int zone_age_days = 0;
+        if (is_zone_age_blocked(zone, bar, config, zone_age_days)) {
+            LOG_DEBUG("Zone " << zone.zone_id << " rejected by age filter: " << zone_age_days
+                     << " days (min=" << config.min_zone_age_days
+                     << ", max=" << config.max_zone_age_days
+                     << ", exclude=" << (config.exclude_zone_age_range ? "YES" : "NO") << ")");
+            continue;
+        }
+        
+        // price_in_zone: bar overlaps zone body (type-aware — see update_zone_states for rationale)
+        bool price_in_zone;
+        if (zone.type == Core::ZoneType::DEMAND) {
+            price_in_zone = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+        } else {
+            price_in_zone = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+        }
+        if (!price_in_zone) continue;
+        
+        // ⭐ EMA ALIGNMENT FILTER (moved from entry_decision_engine.cpp due to linker issues)
+        // Check EMA trend alignment before scoring to save computation
+        double ema_20 = Core::MarketAnalyzer::calculate_ema(bars, 20, bar_index);
+        double ema_50 = Core::MarketAnalyzer::calculate_ema(bars, 50, bar_index);
+        std::string direction = (zone.type == Core::ZoneType::DEMAND) ? "LONG" : "SHORT";
+        
+        if (direction == "LONG" && config.require_ema_alignment_for_longs) {
+            if (ema_20 <= ema_50) {
+                LOG_DEBUG("EMA filter rejected LONG zone " << zone.zone_id 
+                         << ": EMA20=" << ema_20 << " <= EMA50=" << ema_50);
+                continue;  // Skip this zone - downtrend
+            }
+        }
+        
+        if (direction == "SHORT" && config.require_ema_alignment_for_shorts) {
+            if (ema_20 >= ema_50) {
+                LOG_DEBUG("EMA filter rejected SHORT zone " << zone.zone_id 
+                         << ": EMA20=" << ema_20 << " >= EMA50=" << ema_50);
+                continue;  // Skip this zone - uptrend
+            }
+        }
+        
+        // Score the zone
+        Core::ZoneScore zone_score = scorer.evaluate_zone(zone, regime, bar);
+        
+        // Calculate entry decision
+        double atr = Core::MarketAnalyzer::calculate_atr(bars, config.atr_period, bar_index);
+        Core::EntryDecision decision;
+
+        // Prepare bar_history for entry metrics (last 10 bars including current)
+        std::vector<Core::Bar> bar_history;
+        int history_len = 10;
+        int start_idx = std::max(0, bar_index - history_len + 1);
+        for (int i = start_idx; i <= bar_index; ++i) {
+            bar_history.push_back(bars[i]);
+        }
+
+        if (config.enable_two_stage_scoring) {
+            Core::ZoneQualityScore zone_quality_score;
+            Core::EntryValidationScore entry_validation_score;
+            bool approved = entry_engine.should_enter_trade_two_stage(
+                zone,
+                bars,
+                bar_index,
+                zone.proximal_line,  // Preliminary entry for validation
+                0.0,                 // Preliminary stop for validation
+                &zone_quality_score,
+                &entry_validation_score
+            );
+            if (!approved) {
+                LOG_DEBUG("Zone rejected by two-stage scoring");
+                continue;
+            }
+            // Pass zone quality score to calculate_entry for aggressiveness calculation
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
+                config.enable_revamped_scoring ? &zone_quality_score : nullptr, &bar, &bar_history);
+            decision.should_enter = true;  // Already validated
+        } else {
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, &bar, &bar_history);
+        }
+        
+        if (!decision.should_enter) {
+            LOG_DEBUG("Zone rejected: " << decision.rejection_reason);
+            continue;
+        }
+        
+        // Enter trade
+        if (trade_manager.enter_trade(decision, zone, bar, bar_index, regime, "", &bars)) {
+            Trade& current_trade = const_cast<Trade&>(trade_manager.get_current_trade());
+            current_trade.trade_num = performance.get_trade_count() + 1;
+            
+            std::cout << "Trade #" << current_trade.trade_num << " entered: "
+                     << current_trade.direction << " @ " 
+                     << std::fixed << std::setprecision(2) << current_trade.entry_price
+                     << ", Score: " << zone_score.total_score << "/120"
+                     << std::endl;
+            
+            break;  // Only one trade at a time
+        }
+    }
+}
+
+void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
+    // Get mutable reference to current trade for trailing stop updates
+    Trade& trade = const_cast<Trade&>(trade_manager.get_current_trade());
+    
+    // ✅ NEW V6.0: Check volume-based exit signals
+    if (config.enable_volume_exit_signals) {
+        auto vol_exit = trade_manager.check_volume_exit_signals(trade, bar);
+        if (vol_exit == TradeManager::VolumeExitSignal::VOLUME_CLIMAX) {
+            LOG_INFO("🚨 VOLUME CLIMAX detected - Exiting trade #" << trade.trade_num);
+            Trade closed = trade_manager.close_trade(bar, "VOL_CLIMAX", bar.close);
+            performance.add_trade(closed);
+            return;
+        }
+    }
+    
+    // ✅ NEW V6.0: Check OI-based exit signals
+    if (config.enable_oi_exit_signals) {
+        auto oi_exit = trade_manager.check_oi_exit_signals(trade, bar, bars, bar_index);
+        if (oi_exit == TradeManager::OIExitSignal::OI_UNWINDING) {
+            LOG_INFO("🚨 OI UNWINDING detected - Exiting trade #" << trade.trade_num);
+            Trade closed = trade_manager.close_trade(bar, "OI_UNWIND", bar.close);
+            performance.add_trade(closed);
+            return;
+        }
+    }
+    
+    // ⭐ FIXED: Multi-Stage Trailing Stop
+    //
+    // BUG FIXES vs. original:
+    // 1. Stage ordering fixed — 4 distinct R thresholds with no overlap.
+    //    Original had Stage 2 (>=1.0R) and Stage 1 (>=trail_activation_rr=1.0R)
+    //    sharing the same threshold, making Stage 1 (breakeven) DEAD CODE.
+    //    Fix: Stage 1 = 0.5R, Stage 2 = 1.0R, Stage 3 = 2.0R, Stage 4 = 3.0R.
+    //
+    // 2. Stage 2 profit-lock direction fix for SHORT.
+    //    Original: SHORT trail = entry - 0.5*risk (BELOW entry).
+    //    check_stop_loss for SHORT fires when bar.high >= stop_loss.
+    //    A stop BELOW entry fires instantly on any bar above that level,
+    //    which for a SHORT at entry means it triggers the VERY NEXT BAR.
+    //    Fix: SHORT profit lock = entry + 0.5*risk (ABOVE entry but below orig SL),
+    //    mirroring LONG logic symmetrically.
+    //    LONG:  entry + 0.5R  → above entry, locks profit if price pulls back
+    //    SHORT: entry - 0.5R  → below entry, locks profit if price rallies back
+    //    Wait — for SHORT, check_stop_loss fires on bar.high >= stop_loss.
+    //    To protect SHORT profit, the stop must be ABOVE current price but BELOW orig SL.
+    //    After price has moved 1R in our favour (DOWN for SHORT), current price ≈ entry - R.
+    //    We want the stop to sit at entry + 0.5R so a rally back to that level exits us.
+    //    That is ABOVE entry and below the original SL — correct protective placement.
+    //    Fix (corrected): SHORT Stage 2 = entry + 0.5*risk  (ratchet: only if < orig SL)
+    //
+    // 3. ATR stages (3 & 4) now use a FLOOR of the previous stage's fixed level.
+    //    Original ATR stages could compute a new_trail_stop WORSE than the locked
+    //    Stage 2 level if ATR was wide, bypassing the ratchet due to direction check.
+    //    Fix: clamp new_trail_stop so it never retreats past the Stage 2 level.
+    //
+    // 4. trailing_activated is set on first stage transition regardless of which stage.
+    //    The original only set trailing_activated on the FIRST call to any stage's
+    //    !trailing_activated branch, meaning once set it was never logged again.
+    //    Kept consistent — trailing_activated = true on first activation.
+    //
+    // Config-driven thresholds (add to config if needed; hard-coded sensible defaults):
+    //   trail_activation_rr   (config) → Stage 1 (breakeven) threshold, default 0.5R
+    //   Stage 2 fixed at 1.0R
+    //   Stage 3 fixed at 2.0R
+    //   Stage 4 fixed at 3.0R
+    if (config.use_trailing_stop) {
+        // Risk = distance from entry to ORIGINAL stop loss (never changes)
+        double risk = std::abs(trade.entry_price - trade.original_stop_loss);
+        if (risk <= 0) risk = std::abs(trade.entry_price - trade.stop_loss);
+        if (risk < 0.01) risk = 1.0;
+
+        // Track best (most favourable) price reached using bar extremes
+        if (trade.direction == "LONG") {
+            if (bar.high > trade.highest_price || trade.highest_price <= 0.0)
+                trade.highest_price = bar.high;
+        } else {
+            if (bar.low < trade.lowest_price || trade.lowest_price <= 0.0)
+                trade.lowest_price = bar.low;
+        }
+
+        // Current R = best excursion / initial risk
+        double best_excursion = (trade.direction == "LONG")
+            ? (trade.highest_price - trade.entry_price)
+            : (trade.entry_price - trade.lowest_price);
+        double current_r = (risk > 0) ? (best_excursion / risk) : 0.0;
+
+        // ATR for buffer in Stages 3 & 4
+        double atr_trail = risk;  // fallback: use risk as ATR proxy
+        if (bar_index >= config.atr_period) {
+            double atr_sum = 0.0;
+            for (int i = bar_index - config.atr_period + 1; i <= bar_index; i++) {
+                double tr = std::max({
+                    bars[i].high - bars[i].low,
+                    std::abs(bars[i].high - bars[i - 1].close),
+                    std::abs(bars[i].low  - bars[i - 1].close)
+                });
+                atr_sum += tr;
+            }
+            atr_trail = atr_sum / config.atr_period;
+        }
+
+        // ── Compute stage-based candidate trail level ─────────────────────────
+        // Direction-aware profit-lock levels:
+        //   LONG : stop moves UP   (check_stop_loss fires when bar.low <= stop)
+        //   SHORT: stop moves DOWN (check_stop_loss fires when bar.high >= stop)
+        //
+        // Stage 1 (breakeven): stop = entry_price
+        //   LONG : entry_price — price must fall back to entry to exit
+        //   SHORT: entry_price — price must rally back to entry to exit
+        //
+        // Stage 2 (0.5R profit lock):
+        //   LONG : entry + 0.5R — price falls back 0.5R to exit, locking 0.5R profit
+        //   SHORT: entry - 0.5R — price rallies 0.5R to exit, locking 0.5R profit
+        //
+        // Stage 3 (1.0×ATR from extreme):
+        //   LONG : highest_price - 1.0×ATR  (tighter as market extends)
+        //   SHORT: lowest_price  + 1.0×ATR
+        //
+        // Stage 4 (tight, 0.5×ATR from extreme):
+        //   LONG : highest_price - 0.5×ATR
+        //   SHORT: lowest_price  + 0.5×ATR
+
+        // Pre-compute fixed stage levels used as floors in ATR stages
+        double stage1_level = trade.entry_price;  // breakeven
+        double stage2_level = (trade.direction == "LONG")
+            ? trade.entry_price + (risk * 0.5)
+            : trade.entry_price - (risk * 0.5);
+
+        double new_trail_stop = 0.0;
+        int    activated_stage = 0;
+
+        if (current_r >= 3.0) {
+            // Stage 4: Tight ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
+                ? trade.highest_price - (atr_trail * 0.5)
+                : trade.lowest_price  + (atr_trail * 0.5);
+            // Floor: never worse than Stage 2 lock
+            new_trail_stop = (trade.direction == "LONG")
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 4;
+        } else if (current_r >= 2.0) {
+            // Stage 3: Moderate ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
+                ? trade.highest_price - (atr_trail * 1.0)
+                : trade.lowest_price  + (atr_trail * 1.0);
+            new_trail_stop = (trade.direction == "LONG")
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 3;
+        } else if (current_r >= 1.0) {
+            // Stage 2: Lock 0.5R profit
+            // LONG : entry + 0.5R  (SL moves above entry — ratchets up as trade progresses)
+            // SHORT: entry - 0.5R  (SL moves below entry — ratchets down as trade progresses)
+            new_trail_stop = stage2_level;
+            activated_stage = 2;
+        } else if (current_r >= config.trail_activation_rr) {
+            // Stage 1: Breakeven lock — config-driven, default 0.5R in config
+            // trail_activation_rr should be set to 0.5 (not 1.0) so Stage 1 fires
+            // before Stage 2.  With the new ordering this is now reachable.
+            new_trail_stop = stage1_level;
+            activated_stage = 1;
+        }
+
+        // Log first activation
+        if (activated_stage > 0 && !trade.trailing_activated) {
+            trade.trailing_activated = true;
+            LOG_INFO("📈 Trail STAGE " << activated_stage << " first activated at "
+                     << std::fixed << std::setprecision(2) << current_r << "R"
+                     << "  new_trail=" << new_trail_stop);
+        }
+
+        // Ratchet: only advance stop in the profitable direction, never retreat
+        if (new_trail_stop > 0.0) {
+            if (trade.direction == "LONG" && new_trail_stop > trade.stop_loss) {
+                LOG_DEBUG("Trail SL ▲ " << trade.stop_loss << " → " << new_trail_stop
+                          << "  [Stage " << activated_stage << ", R=" << current_r << "]");
+                trade.stop_loss = new_trail_stop;
+                trade.current_trail_stop = new_trail_stop;
+            } else if (trade.direction == "SHORT" && new_trail_stop < trade.stop_loss) {
+                LOG_DEBUG("Trail SL ▼ " << trade.stop_loss << " → " << new_trail_stop
+                          << "  [Stage " << activated_stage << ", R=" << current_r << "]");
+                trade.stop_loss = new_trail_stop;
+                trade.current_trail_stop = new_trail_stop;
+            }
+        }
+    }
+    
+    // Increment bars in trade
+    trade.bars_in_trade++;
+    
+    // Check stop loss (may have been updated by trailing logic)
+    if (trade_manager.check_stop_loss(bar)) {
+        std::string exit_reason = trade.trailing_activated ? "TRAIL_SL" : "SL";
+        double sl_fill = (trade.direction == "LONG")
+            ? std::min(trade.stop_loss, bar.close)
+            : std::max(trade.stop_loss, bar.close);
+        Trade closed_trade = trade_manager.close_trade(
+            bar, exit_reason, sl_fill);
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_manager.get_capital());
+        if (!trade.trailing_activated) {
+            consecutive_losses++;
+        } else {
+            // Trailing stop hit is usually a win or small loss
+            if (closed_trade.pnl > 0) {
+                consecutive_losses = 0;
+            }
+        }
+        
+        // Increment retry counter for the zone if enabled
+        if (config.enable_per_zone_retry_limit) {
+            for (auto& zone : active_zones) {
+                // Match zone by price levels (approximate match)
+                double zone_mid = (zone.proximal_line + zone.distal_line) / 2.0;
+                double entry_dist = std::abs(closed_trade.entry_price - zone_mid);
+                if (entry_dist < 50.0) {  // Within 50 points of zone
+                    zone.entry_retry_count++;
+                    LOG_DEBUG("Zone " << zone.zone_id << " retry count: " << zone.entry_retry_count);
+                    break;
+                }
+            }
+        }
+        
+        std::cout << "Trade #" << closed_trade.trade_num << " stopped out (" << exit_reason << "): "
+                 << "P&L $" << std::fixed << std::setprecision(2) << closed_trade.pnl
+                 << std::endl;
+        
+        // Check if need to pause (only for regular SL, not trailing)
+        if (!trade.trailing_activated && consecutive_losses >= config.max_consecutive_losses) {
+            pause_counter = config.pause_bars_after_losses;
+            LOG_INFO("Pausing for " << pause_counter << " bars after "
+                    << consecutive_losses << " consecutive losses");
+        }
+        return;
+    }
+    
+    // Check take profit
+    if (trade_manager.check_take_profit(bar)) {
+        Trade closed_trade = trade_manager.close_trade(
+            bar, "TP", trade.take_profit);
+        
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_manager.get_capital());
+        
+        consecutive_losses = 0;  // Reset on win
+        
+        std::cout << "Trade #" << closed_trade.trade_num << " hit target: "
+                 << "P&L $" << std::fixed << std::setprecision(2) << closed_trade.pnl
+                 << std::endl;
+    }
+}
+
+void BacktestEngine::process_bar(const Core::Bar& bar, int bar_index) {
+    // Manage existing position
+    if (trade_manager.is_in_position()) {
+        manage_open_position(bar, bar_index);
+        return;
+    }
+    
+    // Handle pause after consecutive losses
+    if (pause_counter > 0) {
+        pause_counter--;
+        if (pause_counter == 0) {
+            LOG_INFO("Resuming trading after pause");
+        }
+        return;
+    }
+    
+    // Update zone states
+    update_zone_states(bar);
+    
+    // Check for entry opportunities
+    check_for_entries(bar, bar_index);
+}
+
+void BacktestEngine::run(int duration_minutes) {
+    LOG_INFO("=================================================");
+    LOG_INFO("  Starting backtest on " << bars.size() << " bars");
+    LOG_INFO("=================================================");
+    
+    // Use shared zone initialization (same as live engine)
+    active_zones = Core::ZoneInitializer::detect_initial_zones(bars, detector, next_zone_id_);
+
+    initial_zone_detection_summary_ = detector.get_last_detection_summary();
+    total_zones_created_ += initial_zone_detection_summary_.created;
+    total_zones_merged_ += initial_zone_detection_summary_.merged;
+    total_zones_skipped_ += initial_zone_detection_summary_.skipped;
+    
+    LOG_INFO("Found " << active_zones.size() << " zones across full dataset");
+    
+    // Score all initially detected zones (same as live engine)
+    LOG_INFO("Scoring " << active_zones.size() << " zones...");
+    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+    int zones_scored = 0;
+    for (auto& zone : active_zones) {
+        // Score the zone with current market context (using last bar)
+        zone.zone_score = scorer.evaluate_zone(zone, regime, bars.back());
+        zones_scored++;
+        
+        LOG_DEBUG("Zone " << zone.zone_id << " scored: total=" << zone.zone_score.total_score
+                 << " (" << zone.zone_score.entry_rationale << ")");
+    }
+    LOG_INFO("Scored " << zones_scored << " zones (avg: " 
+             << (zones_scored > 0 ? (std::accumulate(active_zones.begin(), active_zones.end(), 0.0,
+                [](double sum, const Core::Zone& z) { return sum + z.zone_score.total_score; }) / zones_scored) : 0.0)
+             << ")");
+    
+    // NOTE: Unlike live engine, backtest doesn't need historical replay because
+    // the forward processing loop (process_bar) will update all zone states anyway
+    // as it simulates trading through each bar
+    
+    std::cout << "\nProcessing bars..." << std::endl;
+    
+    // Process each bar
+    for (size_t i = 0; i < bars.size(); i++) {
+        process_bar(bars[i], i);
+        
+        // Progress indicator (reduced frequency for better performance)
+        if (i % 5000 == 0 && i > 0) {
+            std::cout << "Progress: " << i << "/" << bars.size() 
+                     << " (" << (i * 100 / bars.size()) << "%)" << std::endl;
+        }
+    }
+    
+    // Close any open position at end
+    if (trade_manager.is_in_position()) {
+        Trade closed_trade = trade_manager.close_trade(
+            bars.back(), "EOD", bars.back().close);
+        performance.add_trade(closed_trade);
+        performance.update_capital(trade_manager.get_capital());
+        
+        LOG_INFO("Closed open position at end of data");
+    }
+    
+    // Batch save zones once at end of backtest (performance optimization)
+    LOG_INFO("Saving final zone state...");
+    if (zone_persistence_.save_zones(active_zones, next_zone_id_)) {
+        LOG_INFO("Zones saved: " << active_zones.size() << " zones");
+    } else {
+        LOG_WARN("Failed to save zones");
+    }
+
+    write_zone_detection_summary();
+    
+    LOG_INFO("=================================================");
+    LOG_INFO("  Backtest complete");
+    LOG_INFO("=================================================");
+}
+
+void BacktestEngine::export_results() {
+    LOG_INFO("Exporting results to CSV...");
+    
+    try {
+        CSVReporter reporter(output_dir_);
+        const auto& trades = get_trades();
+        PerformanceMetrics metrics = performance.calculate_metrics();
+        metrics.total_bars = bars.size();
+        
+        // Export trade log
+        bool trades_ok = reporter.export_trades(trades, "trades.csv");
+        if (trades_ok) {
+            std::cout << "  ✓ Trade log:    " << output_dir_ << "/trades.csv" << std::endl;
+        }
+        
+        // Export performance metrics
+        bool metrics_ok = reporter.export_metrics(metrics, "metrics.csv");
+        if (metrics_ok) {
+            std::cout << "  ✓ Performance:  " << output_dir_ << "/metrics.csv" << std::endl;
+        }
+        
+        // Export equity curve
+        bool equity_ok = reporter.export_equity_curve(
+            trades, config.starting_capital, "equity_curve.csv");
+        if (equity_ok) {
+            std::cout << "  ✓ Equity curve: " << output_dir_ << "/equity_curve.csv" << std::endl;
+        }
+        
+        // Display zone file location
+        std::cout << "  ✓ Zones file:   " << zone_persistence_.get_zone_file_path() << std::endl;
+        
+        std::cout << std::endl;
+        
+        // Display performance summary
+        performance.print_summary();
+        
+        // Display zone statistics
+        print_zone_statistics();
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Export error: " << e.what());
+    }
+}
+
+void BacktestEngine::write_zone_detection_summary() const {
+    std::string output_path = output_dir_ + "/zone_detection_summary.txt";
+    std::ofstream file(output_path, std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        LOG_WARN("Failed to write zone detection summary to " << output_path);
+        return;
+    }
+
+    file << "ZONE DETECTION SUMMARY" << std::endl;
+    if (!bars.empty()) {
+        file << "Last bar datetime: " << bars.back().datetime << std::endl;
+    }
+    file << std::endl;
+    file << "Initial detection:" << std::endl;
+    file << "  created=" << initial_zone_detection_summary_.created
+         << ", merged=" << initial_zone_detection_summary_.merged
+         << ", skipped=" << initial_zone_detection_summary_.skipped
+         << ", detected=" << initial_zone_detection_summary_.detected << std::endl;
+    file << "Totals (initial + incremental):" << std::endl;
+    file << "  created=" << total_zones_created_
+         << ", merged=" << total_zones_merged_
+         << ", skipped=" << total_zones_skipped_ << std::endl;
+    file << "Active zones: " << active_zones.size() << std::endl;
+
+    file.close();
+    LOG_DEBUG("Zone detection summary saved: " << output_path);
+}
+
+void BacktestEngine::print_zone_statistics() const {
+    std::cout << "\n==================================================" << std::endl;
+    std::cout << "  ZONE STATISTICS" << std::endl;
+    std::cout << "==================================================" << std::endl;
+    
+    // Count zones by state
+    int total_zones = active_zones.size();
+    int fresh_zones = 0;
+    int tested_zones = 0;
+    int violated_zones = 0;
+    int reclaimed_zones = 0;
+    int demand_zones = 0;
+    int supply_zones = 0;
+    
+    double total_touches = 0;
+    int zones_with_touches = 0;
+    int swept_zones = 0;
+    
+    for (const auto& zone : active_zones) {
+        // Count by state
+        switch (zone.state) {
+            case Core::ZoneState::FRESH:
+                fresh_zones++;
+                break;
+            case Core::ZoneState::TESTED:
+                tested_zones++;
+                break;
+            case Core::ZoneState::VIOLATED:
+                violated_zones++;
+                break;
+            case Core::ZoneState::RECLAIMED:
+                reclaimed_zones++;
+                break;
+        }
+        
+        // Count by type
+        if (zone.type == Core::ZoneType::DEMAND) {
+            demand_zones++;
+        } else {
+            supply_zones++;
+        }
+        
+        // Touch statistics
+        if (zone.touch_count > 0) {
+            total_touches += zone.touch_count;
+            zones_with_touches++;
+        }
+        
+        // Sweep statistics
+        if (zone.was_swept) {
+            swept_zones++;
+        }
+    }
+    
+    double avg_touches = (zones_with_touches > 0) ? (total_touches / zones_with_touches) : 0.0;
+    
+    std::cout << std::fixed << std::setprecision(2);
+    
+    std::cout << "\nZONE COUNTS:" << std::endl;
+    std::cout << "  Total Zones:     " << total_zones << std::endl;
+    std::cout << "  Demand Zones:    " << demand_zones << std::endl;
+    std::cout << "  Supply Zones:    " << supply_zones << std::endl;
+    
+    std::cout << "\nZONE STATES:" << std::endl;
+    std::cout << "  Fresh:           " << fresh_zones 
+              << " (" << (total_zones > 0 ? (fresh_zones * 100.0 / total_zones) : 0.0) << "%)" << std::endl;
+    std::cout << "  Tested:          " << tested_zones 
+              << " (" << (total_zones > 0 ? (tested_zones * 100.0 / total_zones) : 0.0) << "%)" << std::endl;
+    std::cout << "  Violated:        " << violated_zones 
+              << " (" << (total_zones > 0 ? (violated_zones * 100.0 / total_zones) : 0.0) << "%)" << std::endl;
+    std::cout << "  Reclaimed:       " << reclaimed_zones 
+              << " (" << (total_zones > 0 ? (reclaimed_zones * 100.0 / total_zones) : 0.0) << "%)" << std::endl;
+    
+    std::cout << "\nZONE ACTIVITY:" << std::endl;
+    std::cout << "  Zones Touched:   " << zones_with_touches << std::endl;
+    std::cout << "  Total Touches:   " << static_cast<int>(total_touches) << std::endl;
+    std::cout << "  Avg Touches:     " << avg_touches << std::endl;
+    std::cout << "  Zones Swept:     " << swept_zones 
+              << " (" << (total_zones > 0 ? (swept_zones * 100.0 / total_zones) : 0.0) << "%)" << std::endl;
+    
+    // Calculate zones per bar (density)
+    if (bars.size() > 0) {
+        double zones_per_100_bars = (total_zones * 100.0) / bars.size();
+        std::cout << "\nZONE DENSITY:" << std::endl;
+        std::cout << "  Total Bars:      " << bars.size() << std::endl;
+        std::cout << "  Zones/100 Bars:  " << zones_per_100_bars << std::endl;
+    }
+    
+    std::cout << "\n==================================================" << std::endl;
+}
+
+void BacktestEngine::stop() {
+    LOG_INFO("Stopping BacktestEngine...");
+    
+    // Export all results
+    export_results();
+    
+    LOG_INFO("BacktestEngine stopped");
+}
+
+std::optional<Core::Zone> BacktestEngine::detect_zone_flip(const Core::Zone& violated_zone, int bar_index) {
+    // Look back for consolidation before the breakdown
+    int lookback_start = std::max(0, bar_index - config.flip_lookback_bars);
+    
+    if (lookback_start >= bar_index - 1) {
+        return std::nullopt;  // Not enough bars
+    }
+    
+    // Find consolidation period before breakdown
+    double flip_base_low = bars[lookback_start].low;
+    double flip_base_high = bars[lookback_start].high;
+    
+    for (int i = lookback_start; i < bar_index; i++) {
+        flip_base_low = std::min(flip_base_low, bars[i].low);
+        flip_base_high = std::max(flip_base_high, bars[i].high);
+    }
+    
+    // Check if breakdown is vigorous enough
+    if (bar_index + 5 >= static_cast<int>(bars.size())) {
+        return std::nullopt;  // Not enough bars ahead
+    }
+    
+    double price_at_breakdown = bars[bar_index].close;
+    double price_after_impulse = bars[bar_index + 5].close;
+    double impulse_move = std::abs(price_after_impulse - price_at_breakdown);
+    double atr = Core::MarketAnalyzer::calculate_atr(bars, config.atr_period, bar_index);
+    
+    if (impulse_move < config.flip_min_impulse_atr * atr) {
+        return std::nullopt;  // Impulse too weak
+    }
+    
+    // Create flipped zone (opposite type)
+    Core::Zone flipped;
+    flipped.type = (violated_zone.type == Core::ZoneType::DEMAND) ? 
+                   Core::ZoneType::SUPPLY : Core::ZoneType::DEMAND;
+    flipped.base_low = flip_base_low;
+    flipped.base_high = flip_base_high;
+    flipped.distal_line = (flipped.type == Core::ZoneType::DEMAND) ? flip_base_low : flip_base_high;
+    flipped.proximal_line = (flipped.type == Core::ZoneType::DEMAND) ? flip_base_high : flip_base_low;
+    flipped.formation_bar = lookback_start;
+    flipped.formation_datetime = bars[lookback_start].datetime;
+    flipped.state = Core::ZoneState::FRESH;
+    flipped.touch_count = 0;
+    flipped.is_flipped_zone = true;
+    flipped.parent_zone_id = violated_zone.zone_id;
+    
+    // Calculate strength
+    double range = flip_base_high - flip_base_low;
+    if (atr > 0.0001) {
+        double ratio = range / atr;
+        flipped.strength = 100.0 * (1.0 - std::min(ratio / config.max_consolidation_range, 1.0));
+    } else {
+        flipped.strength = 0.0;
+    }
+    
+    // Only return if strength is acceptable
+    if (flipped.strength < config.min_zone_strength) {
+        return std::nullopt;
+    }
+    
+    return flipped;
+}
+
+const std::vector<Trade>& BacktestEngine::get_trades() const {
+    return performance.get_trades();
+}
+
+const PerformanceTracker& BacktestEngine::get_performance() const {
+    return performance;
+}
+
+} // namespace Backtest
+} // namespace SDTrading

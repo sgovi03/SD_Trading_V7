@@ -1,4 +1,3 @@
-
 #include "entry_decision_engine.h"
 #include <vector>
 #include <algorithm>
@@ -37,19 +36,29 @@ EntryVolumeMetrics EntryDecisionEngine::calculate_entry_volume_metrics(
     // ── PULLBACK VOLUME: the bar currently hitting the zone ──────────────
     metrics.pullback_volume_ratio = current_bar.volume / baseline;
 
-    if (metrics.pullback_volume_ratio > 1.8) {
-        // AUTOMATIC REJECTION — zone being absorbed on pullback
-        metrics.rejection_reason =
-            "HIGH PULLBACK VOL (" +
-            std::to_string(metrics.pullback_volume_ratio) +
-            "x) — zone under absorption";
-        metrics.volume_score = -50;
-        return metrics;  // early exit
-    }
-    else if (metrics.pullback_volume_ratio < 0.5) { metrics.volume_score += 30; }  // Excellent — very dry
+    // ⭐ FIX 1: Removed hardcoded early-exit (score=-50, return) for high pullback vol.
+    //
+    // The old block treated pullback_volume_ratio > 1.8 as automatic rejection
+    // ("zone under absorption"), bypassing config.pullback_volume_very_high_penalty
+    // and config.absorption_penalty entirely regardless of their configured values.
+    //
+    // EMPIRICAL FINDING (v0_2 CSV, 164 trades):
+    //   VOL_CLIMAX wins  (38 trades): 59% had HIGH PULLBACK VOL flagged
+    //   TRAIL_SL losses  (45 trades): 27% had HIGH PULLBACK VOL flagged
+    //   → High pullback vol = institutional participation AT zone = GOOD signal
+    //   → The old -50 penalty was scoring AGAINST the entries that actually win
+    //
+    // Config v0_6 already sets:
+    //   pullback_volume_very_high_penalty = 0    (data-proven inversion fix)
+    //   absorption_penalty = 0                   (data-proven inversion fix)
+    // But those config values were irrelevant while this early-exit block existed.
+    //
+    // Now scoring is driven entirely by the tiered thresholds below:
+    if      (metrics.pullback_volume_ratio < 0.5) { metrics.volume_score += 30; }  // Excellent — very dry
     else if (metrics.pullback_volume_ratio < 0.8) { metrics.volume_score += 20; }  // Good — light
     else if (metrics.pullback_volume_ratio < 1.2) { metrics.volume_score += 10; }  // Acceptable
-    else if (metrics.pullback_volume_ratio < 1.5) { metrics.volume_score -= 10; }  // Warning zone
+    else if (metrics.pullback_volume_ratio < 1.5) { metrics.volume_score -=  0; }  // Neutral (was -10, data-disproven)
+    // pullback_volume_ratio >= 1.5: No penalty — institutional absorption is positive
 
     // ── ENTRY BAR QUALITY ────────────────────────────────────────────────
     double body = std::abs(current_bar.close - current_bar.open);
@@ -83,6 +92,12 @@ EntryDecisionEngine::EntryDecisionEngine(const Config& cfg)
     LOG_INFO("EntryDecisionEngine initialized");
 }
 
+// ============================================================================
+// FIXED calculate_stop_loss() function
+// File: src/scoring/entry_decision_engine.cpp
+// Lines: 95-116 (REPLACE THIS FUNCTION)
+// ============================================================================
+
 double EntryDecisionEngine::calculate_stop_loss(const Zone& zone, double entry_price, double atr) const {
     // Always calculate the ORIGINAL stop loss (not breakeven)
     // The breakeven logic is applied later in calculate_entry()
@@ -90,21 +105,41 @@ double EntryDecisionEngine::calculate_stop_loss(const Zone& zone, double entry_p
     
     double zone_height = std::abs(zone.proximal_line - zone.distal_line);
     
-    // Calculate buffer as the larger of:
-    // 1. Percentage of zone height
-    // 2. ATR multiplier
-    double buffer = std::max<double>(
-        zone_height * config.sl_buffer_zone_pct / 100.0,
-        atr * config.sl_buffer_atr
-    );
+    // ⭐ STOP LOSS WIDENING FIX (Feb 28, 2026)
+    // Based on live results analysis: 8/24 (33%) trades hit stop with 32-55pt distances
+    // Problem: Stops too tight for NIFTY 1-min volatility
+    // Solution: Enforce minimum 100-point stop distance
+    //
+    // Calculate buffer as the LARGEST of:
+    // 1. Percentage of zone height (structural buffer)
+    // 2. ATR multiplier (volatility buffer)
+    // 3. Minimum distance (prevents noise stops) ⭐ NEW
     
-    // Place stop loss beyond zone with buffer
+    double buffer_zone = zone_height * config.sl_buffer_zone_pct / 100.0;
+    double buffer_atr = atr * config.sl_buffer_atr;
+    double buffer_min = config.min_stop_distance_points;
+    
+    // Use the LARGEST buffer (most conservative)
+    double buffer = std::max<double>({buffer_zone, buffer_atr, buffer_min});
+    
+    // Debug logging to track buffer selection
+    LOG_DEBUG("Stop buffer calculation:"
+             << " zone=" << std::fixed << std::setprecision(1) << buffer_zone
+             << " pts, atr=" << buffer_atr
+             << " pts, min=" << buffer_min
+             << " pts → final=" << buffer << " pts");
+    
+    // Place stop loss beyond zone with calculated buffer
+    double stop_loss;
     if (zone.type == ZoneType::DEMAND) {
-        return zone.distal_line - buffer;  // Below demand zone
+        stop_loss = zone.distal_line - buffer;  // Below demand zone
     } else {
-        return zone.distal_line + buffer;  // Above supply zone
+        stop_loss = zone.distal_line + buffer;  // Above supply zone
     }
+    
+    return stop_loss;
 }
+
 
 double EntryDecisionEngine::calculate_take_profit(const Zone& zone, double entry_price, 
                                                     double stop_loss, double recommended_rr) const {
@@ -298,66 +333,98 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
     //
     // ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
     
+    // ─────────────────────────────────────────────────────────────────────
+    // ENTRY PRICE POSITIONING: identical logic for both zone types
+    //
+    //   proximal = zone ENTRY edge (where price arrives from)
+    //   distal   = zone FAR boundary (where SL is placed beyond)
+    //   zone_height = |proximal - distal|
+    //
+    //   Conservative (low aggressiveness) → enter near PROXIMAL
+    //     → wide SL distance, confirms zone is holding before going deeper
+    //   Aggressive (high aggressiveness)  → enter near DISTAL
+    //     → tight SL distance, best R:R if zone holds perfectly
+    //
+    //   DEMAND:  proximal = base_high (top),  distal = base_low (bottom)
+    //     entry = proximal - aggressiveness × height
+    //     Low  aggressiveness (0.2): entry = 25100 - 10 = 25090  (near top, safe)
+    //     High aggressiveness (0.8): entry = 25100 - 40 = 25060  (deep, tight SL)
+    //
+    //   SUPPLY:  proximal = base_low (bottom), distal = base_high (top)
+    //     entry = proximal + aggressiveness × height
+    //     Low  aggressiveness (0.2): entry = 25200 + 8  = 25208  (near bottom, safe)
+    //     High aggressiveness (0.8): entry = 25200 + 32 = 25232  (near top, tight SL)
+    // ─────────────────────────────────────────────────────────────────────
+    double zone_height = std::abs(zone.proximal_line - zone.distal_line);
+
     if (zone.type == ZoneType::DEMAND) {
-        // DEMAND: Conservative entry (inverted logic)
-        double conservative_factor = 1.0 - aggressiveness;
-        
-        // Entry price: Start at distal, move toward proximal based on score
-        decision.entry_price = zone.distal_line + 
-            conservative_factor * (zone.proximal_line - zone.distal_line);
-        
-        // Entry location percentage (for logging/analysis)
-        decision.entry_location_pct = conservative_factor * 100.0;
-        
-        LOG_DEBUG("DEMAND zone: score=" + std::to_string(score.total_score) +
-                  ", conservative_factor=" + std::to_string(conservative_factor) +
-                  ", entry at " + std::to_string(decision.entry_location_pct) + "% from distal");
-        
-    } else {
-        // SUPPLY: Aggressive entry (original logic)
-        
-        // Entry price: Start at distal, move toward proximal based on score
-        decision.entry_price = zone.distal_line - 
-            aggressiveness * (zone.distal_line - zone.proximal_line);
-        
-        // Entry location percentage (for logging/analysis)
+        // LONG: price enters from above through proximal (base_high)
+        decision.entry_price = zone.proximal_line - aggressiveness * zone_height;
         decision.entry_location_pct = aggressiveness * 100.0;
-        
+
+        LOG_DEBUG("DEMAND zone: score=" + std::to_string(score.total_score) +
+                  ", aggressiveness=" + std::to_string(aggressiveness) +
+                  ", entry=" + std::to_string(decision.entry_price) +
+                  " (" + std::to_string(decision.entry_location_pct) + "% from proximal toward distal)");
+    } else {
+        // SHORT: price enters from below through proximal (base_low)
+        decision.entry_price = zone.proximal_line + aggressiveness * zone_height;
+        decision.entry_location_pct = aggressiveness * 100.0;
+
         LOG_DEBUG("SUPPLY zone: score=" + std::to_string(score.total_score) +
                   ", aggressiveness=" + std::to_string(aggressiveness) +
-                  ", entry at " + std::to_string(decision.entry_location_pct) + "% from distal");
+                  ", entry=" + std::to_string(decision.entry_price) +
+                  " (" + std::to_string(decision.entry_location_pct) + "% from proximal toward distal)");
     }
     
     // Calculate stop loss and take profit
-    double original_entry = decision.entry_price;
-    double original_sl = calculate_stop_loss(zone, original_entry, atr);
-    double sl_distance = std::abs(original_entry - original_sl);
+    // ⭐ FIX 2: Structural SL and TP are locked from original entry and zone geometry.
+    //
+    // The old code had a "BREAKEVEN MODE" block (lines 350-369 in original) that ran
+    // when config.use_breakeven_stop_loss=YES.  It did this at CALCULATION time:
+    //
+    //   decision.entry_price = original_sl;              // shifted entry to SL level
+    //   decision.stop_loss   = new_entry - sl_distance;  // doubled the SL buffer
+    //   TP = calculate_take_profit(new_entry, new_sl)    // TP from shifted/wrong anchors
+    //
+    // This is NOT breakeven protection.  Breakeven = moving SL to entry AFTER the
+    // trade is in profit.  What the old code did was shift the entire trade frame
+    // downward at calculation time, before any fill.  For narrow zones or aggressive
+    // entries (entry deep inside zone → entry ≈ distal → sl_distance ≈ 0), this
+    // caused:
+    //   sl_distance → ~0
+    //   decision.stop_loss = entry - 0  → SL == entry
+    //   TP = entry + (0 * RR) = entry + ~0    ← TP a few points away
+    //
+    // OBSERVED IMPACT (12 live trades analysed):
+    //   Trades #8261, #9465, #9961: SL exactly == entry → TP 7-20pt from entry
+    //   Trades #7016, #7089, #8553, #9487, #9867: TP 7-34pt from entry (RR 0.11–0.51)
+    //   Trade #9867: TP ABOVE entry on a SHORT → "TAKE_PROFIT" exit at a LOSS (-₹804)
+    //
+    // CORRECT BEHAVIOUR:
+    //   1. Calculate structural SL from zone geometry + ATR buffer (as before)
+    //   2. Calculate TP from (original entry, structural SL) — locked, never shifted
+    //   3. Breakeven (SL → entry after profit) is a RUNTIME operation in TradeManager,
+    //      NOT a calculation-time entry shift here.
+    //
+    // The config flag use_breakeven_stop_loss=YES is intentionally left in config
+    // so TradeManager can still apply real breakeven protection post-fill.
+    // This function must NOT act on it.
+
+    double original_entry = decision.entry_price;   // locked — never modified
+    double original_sl    = calculate_stop_loss(zone, original_entry, atr);
+
+    // SL and TP both anchored to original_entry and original_sl.
+    // TradeManager may move SL to entry later (runtime breakeven), but TP stays fixed.
+    decision.stop_loss          = original_sl;
+    decision.original_stop_loss = original_sl;
     
-    // BREAKEVEN MODE: Enter at original SL level, maintain same risk distance
-    if (config.use_breakeven_stop_loss) {
-        // Swap: Entry becomes the original SL level
-        decision.entry_price = original_sl;
-        
-        // New SL: Move same distance away from new entry
-        if (zone.type == ZoneType::DEMAND) {
-            // LONG: New SL below new entry
-            decision.stop_loss = decision.entry_price - sl_distance;
-        } else {
-            // SHORT: New SL above new entry
-            decision.stop_loss = decision.entry_price + sl_distance;
-        }
-        
-        // For position sizing: use the new entry and new SL (distance is same)
-        decision.original_stop_loss = decision.stop_loss;
-    } else {
-        // Normal mode: Use original entry and SL
-        decision.stop_loss = original_sl;
-        decision.original_stop_loss = original_sl;
-    }
-    
-    // Calculate TP based on current entry price
-    decision.take_profit = calculate_take_profit(zone, decision.entry_price, 
-                                                   decision.stop_loss, score.recommended_rr);
+    // ⭐ TP is calculated from original_entry vs original_sl — the structural risk distance.
+    // These are the values locked above and are NEVER modified before this call.
+    // This ensures TP = entry + (structural_SL_dist × RR) regardless of any post-fill
+    // breakeven move that TradeManager may apply later.
+    decision.take_profit = calculate_take_profit(zone, original_entry,
+                                                  original_sl, score.recommended_rr);
     
     // Calculate actual risk/reward
     double risk = std::abs(decision.entry_price - decision.stop_loss);
@@ -451,13 +518,45 @@ bool EntryDecisionEngine::validate_decision(const EntryDecision& decision) const
     
     // Validate prices are reasonable
     if (decision.entry_price <= 0 || decision.stop_loss <= 0 || decision.take_profit <= 0) {
-        LOG_WARN("Invalid decision: negative or zero prices");
+        LOG_WARN("Invalid decision: negative or zero prices"
+                 " entry=" + std::to_string(decision.entry_price) +
+                 " sl=" + std::to_string(decision.stop_loss) +
+                 " tp=" + std::to_string(decision.take_profit));
+        return false;
+    }
+
+    // ⭐ FIX 3a: TP direction sanity — TP must be on the profit side of entry.
+    // Before Fix 2 this could fire for SHORT trades where a degenerate TP ended up
+    // above entry (observed: trade #9867 "TAKE_PROFIT" exit at -₹804).
+    bool tp_direction_ok = (decision.stop_loss < decision.entry_price)   // LONG: SL below entry
+                           ? (decision.take_profit > decision.entry_price)  // TP must be above
+                           : (decision.take_profit < decision.entry_price); // SHORT: TP must be below
+    if (!tp_direction_ok) {
+        LOG_WARN("Invalid decision: TP on wrong side of entry"
+                 " entry=" + std::to_string(decision.entry_price) +
+                 " sl=" + std::to_string(decision.stop_loss) +
+                 " tp=" + std::to_string(decision.take_profit));
+        return false;
+    }
+
+    // ⭐ FIX 3b: SL must not equal entry (zero risk distance → degenerate TP).
+    double sl_dist = std::abs(decision.entry_price - decision.stop_loss);
+    if (sl_dist < 1.0) {
+        LOG_WARN("Invalid decision: SL == entry (zero risk distance)"
+                 " entry=" + std::to_string(decision.entry_price) +
+                 " sl=" + std::to_string(decision.stop_loss));
         return false;
     }
     
     // Validate risk/reward ratio
-    if (decision.expected_rr < 1.0) {
-        LOG_WARN("Invalid decision: RR ratio < 1.0");
+    double risk   = sl_dist;
+    double reward = std::abs(decision.take_profit - decision.entry_price);
+    double rr     = reward / risk;
+    if (rr < 1.0) {
+        LOG_WARN("Invalid decision: RR ratio " + std::to_string(rr) + " < 1.0"
+                 " (entry=" + std::to_string(decision.entry_price) +
+                 " sl=" + std::to_string(decision.stop_loss) +
+                 " tp=" + std::to_string(decision.take_profit) + ")");
         return false;
     }
     

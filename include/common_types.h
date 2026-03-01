@@ -555,8 +555,9 @@ struct Trade {
 // ============================================================
 
 struct Config {
-                // Enable/disable entry time restriction
-                bool enable_entry_time_block;
+public:
+    // Enable/disable entry time restriction
+    bool enable_entry_time_block;
             // Entry Time Restriction (configurable)
             std::string entry_block_start_time; // e.g. "09:15"
             std::string entry_block_end_time;   // e.g. "09:45"
@@ -710,10 +711,25 @@ struct Config {
     bool entry_at_proximal;
     double rejection_wick_ratio;
     double entry_buffer_pct;
+
+    // ⭐ Live Fill Quality Guards
+    // min_zone_penetration_pct: minimum % of zone height price must have entered
+    //   before a live market order is placed.
+    //   SUPPLY: LTP must be >= proximal + pct × height  (risen into zone)
+    //   DEMAND: LTP must be <= proximal - pct × height  (fallen into zone)
+    //   Prevents filling at the very edge of the zone on the first tick.
+    //   Recommended: 0.15-0.30 (15-30% into zone). Default: 0.20
+    double min_zone_penetration_pct;
+    // require_price_at_entry: additionally require LTP to have reached
+    //   decision.entry_price before firing the market order.
+    //   SUPPLY: LTP >= decision.entry_price (already risen to intended short level)
+    //   DEMAND: LTP <= decision.entry_price (already fallen to intended long level)
+    bool require_price_at_entry_level;
     
     // Risk Management
     //double sl_buffer_zone_pct;
     //double sl_buffer_atr;
+    double min_stop_distance_points = 0.0;  // ⭐ NEW
     double risk_reward_ratio;
     bool use_breakeven_stop_loss;           // Move stop to entry price (breakeven) and original SL to next level
     
@@ -840,6 +856,12 @@ struct Config {
     
     // Zone Detection (LIVE: periodic zone detection to maintain fresh pipeline)
     int live_zone_detection_interval_bars; // Run zone detection every N bars (0 = bootstrap only, recommended: 20-30)
+    
+    // LIVE Zone Detection: Relaxed Thresholds (NEW - FEB 2026)
+    bool use_relaxed_live_detection;       // Use more aggressive detection in live mode
+    double live_min_zone_width_atr;        // Relaxed width for live (e.g., 0.9 vs 1.3)
+    double live_min_zone_strength;         // Relaxed strength for live (e.g., 40 vs 50)
+    int live_zone_detection_lookback_bars; // How many bars to rescan during periodic detection (0 = incremental only)
 
     // LIVE Entry Gating (NEW)
     bool live_entry_require_new_bar;       // Only evaluate entries on new bar
@@ -867,6 +889,14 @@ struct Config {
     // ========== Stop Loss Configuration ==========
     double sl_buffer_zone_pct = 0.1;             // SL buffer as % of zone width
     double sl_buffer_atr = 0.1;                  // SL buffer in ATR
+    // ⭐ FIX: Max fill slippage — reject trade if fill is too far from intended entry.
+    // When bar.open gaps 30-93pts beyond the entry zone, the trade geometry is violated:
+    // SL ends up inside the zone buffer, R:R collapses, win rate drops to 38%.
+    // These gap-filled trades collectively produce 0.99× PF (breakeven) vs 3.40×
+    // for clean fills. Rejecting them costs ₹0 in total P&L but massively
+    // improves backtest quality and live predictability.
+    // Set to 0 to disable (always tighten, old behaviour). Default: 25pts.
+    double max_fill_slippage_pts = 25.0;         // Max gap from intended entry before rejecting
     
     // ⭐ FIX #1: MAX LOSS CAP PER TRADE
     // Root Cause: 81 trades (33%) = ₹268,030 loss (81% of total losses)
@@ -907,11 +937,30 @@ struct Config {
     int exclude_zone_age_start = 30;             // ⭐ NEW: Start of exclusion (30 days)
     int exclude_zone_age_end = 60;               // ⭐ NEW: End of exclusion (60 days)
 
-    
+    int zone_max_age_days = 90;
+	int zone_max_touch_count = 50;
+	
+	// ============================================================
+    // VOLUME EXHAUSTION EXIT SETTINGS
+    // ============================================================
+    bool enable_volume_exhaustion_exit = true;
+    double vol_exhaustion_spike_min_ratio = 1.8;
+    double vol_exhaustion_spike_min_body_atr = 0.5;
+    double vol_exhaustion_absorption_min_ratio = 2.0;
+    double vol_exhaustion_absorption_max_body_atr = 0.25;
+    double vol_exhaustion_flow_min_ratio = 1.2;
+    int vol_exhaustion_flow_min_bars = 3;
+    double vol_exhaustion_drift_max_ratio = 0.6;
+    double vol_exhaustion_drift_min_loss_atr = 0.5;
+    double vol_exhaustion_max_loss_pct = 0.70;
+	
+	
+	
     // Constructor with defaults
 
     Config()
-        : starting_capital(100000),
+        : enable_entry_time_block(false),
+          starting_capital(100000),
           risk_per_trade_pct(1.0),
           base_height_max_atr(1.5),
           consolidation_min_bars(1),
@@ -1026,6 +1075,8 @@ struct Config {
           entry_at_proximal(false),
           rejection_wick_ratio(0.4),
           entry_buffer_pct(0.1),
+          min_zone_penetration_pct(0.20),
+          require_price_at_entry_level(true),
           sl_buffer_zone_pct(10.0),
           sl_buffer_atr(0.5),
           risk_reward_ratio(2.0),
@@ -1062,6 +1113,10 @@ struct Config {
           live_zone_refresh_interval_minutes(30),
           max_zone_distance_atr(10.0),
           live_zone_detection_interval_bars(25),
+          use_relaxed_live_detection(false),
+          live_min_zone_width_atr(0.9),
+          live_min_zone_strength(40.0),
+          live_zone_detection_lookback_bars(200),
           live_entry_require_new_bar(true),
           live_skip_when_in_position(true),
           live_zone_entry_cooldown_seconds(60),
@@ -1085,7 +1140,7 @@ struct Config {
           low_volume_size_multiplier(0.5),
           high_institutional_size_mult(1.5),
           max_lot_size(100),
-          enable_volume_exit_signals(true),
+          enable_volume_exit_signals(false),  // Default OFF — enable explicitly in config file
           volume_climax_exit_threshold(3.0),
           enable_oi_exit_signals(true),
           oi_unwinding_threshold(-0.01),
@@ -1371,7 +1426,7 @@ struct VolumeOIConfig {
     
     VolumeOIConfig()
         : enable_volume_entry_filters(true),
-          enable_volume_exit_signals(true),
+          enable_volume_exit_signals(false),  // Default OFF — enable explicitly in config file
           min_entry_volume_ratio(0.8),
           institutional_volume_threshold(2.0),
           extreme_volume_threshold(3.0),

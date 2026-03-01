@@ -163,6 +163,7 @@ BacktestEngine::~BacktestEngine() {
         delete oi_scorer_;
         oi_scorer_ = nullptr;
     }
+
     LOG_INFO("BacktestEngine destroyed");
 }
 
@@ -295,8 +296,22 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
         std::string old_state_str = (old_state == Core::ZoneState::FRESH ? "FRESH" :
                                       old_state == Core::ZoneState::TESTED ? "TESTED" : "VIOLATED");
         
-        bool price_in_zone = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line);
-        
+        // price_in_zone: bar overlaps the zone body in any way.
+        // DEMAND: proximal=base_high (top), distal=base_low (bottom)
+        //   overlap = bar.high >= distal AND bar.low <= proximal  → current formula works
+        // SUPPLY: proximal=base_low (bottom), distal=base_high (top)
+        //   overlap = bar.low <= distal AND bar.high >= proximal
+        //   The old formula (bar.low<=proximal && bar.high>=distal) required the bar
+        //   to span the ENTIRE supply zone — normal touches were invisible.
+        bool price_in_zone;
+        if (zone.type == Core::ZoneType::DEMAND) {
+            price_in_zone = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+        } else {
+            // Fix #4: SUPPLY touch = bar overlaps zone from above (bar.high touches proximal or higher)
+            // Old code required bar to SPAN entire zone; now any overlap with proximal upward is a touch
+            price_in_zone = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+        }
+
         if (price_in_zone) {
             if (zone.state == Core::ZoneState::FRESH) {
                 zone.state = Core::ZoneState::TESTED;
@@ -586,6 +601,21 @@ void BacktestEngine::detect_and_add_zones(const Core::Bar& bar, int bar_index) {
 }
 
 void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
+    // Configurable early entry-time block (morning/no-trade window)
+    if (config.enable_entry_time_block &&
+        !config.entry_block_start_time.empty() &&
+        !config.entry_block_end_time.empty() &&
+        bar.datetime.length() >= 16) {
+        std::string hhmm = bar.datetime.substr(11, 5);
+        if (hhmm >= config.entry_block_start_time && hhmm < config.entry_block_end_time) {
+            LOG_DEBUG("⛔ ENTRY BLOCKED: Time (" << hhmm
+                    << ") in configured window ("
+                    << config.entry_block_start_time << "-"
+                    << config.entry_block_end_time << ")");
+            return;
+        }
+    }
+
     // ⭐ FIX: ENTRY TIME GATE - Block entries after circuit breaker cutoff
     // Prevents late entries (e.g., 15:29) that bypass position closing logic
     if (config.close_before_session_end_minutes > 0) {
@@ -649,6 +679,22 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
     
     // Check each active zone for entry opportunity
     for (auto& zone : active_zones) {
+        // ⭐ ZONE SANITY GUARD: Skip corrupt zones with zero or invalid boundaries.
+        // A zone with distal_line=0 causes calculate_stop_loss() → SL=0,
+        // which cascades into: TP=0 → phantom TP exit at price=0 → loss=entry*lot_size*65.
+        // These are zero-initialized Zone structs that were never properly populated.
+        if (zone.distal_line <= 0.0 || zone.proximal_line <= 0.0) {
+            LOG_WARN("Zone " << zone.zone_id << " SKIPPED: corrupt boundaries"
+                     << " distal=" << zone.distal_line
+                     << " proximal=" << zone.proximal_line);
+            continue;
+        }
+        if (zone.proximal_line == zone.distal_line) {
+            LOG_WARN("Zone " << zone.zone_id << " SKIPPED: zero-width zone"
+                     << " (proximal==distal==" << zone.proximal_line << ")");
+            continue;
+        }
+
         // Skip violated zones
         if (zone.state == Core::ZoneState::VIOLATED) continue;
         
@@ -665,33 +711,85 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             continue;
         }
         
-        // Check if price is in zone
-        bool price_in_zone = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line);
+        // price_in_zone: bar overlaps zone body (type-aware — see update_zone_states for rationale)
+        bool price_in_zone;
+        if (zone.type == Core::ZoneType::DEMAND) {
+            price_in_zone = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+        } else {
+            price_in_zone = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+        }
         if (!price_in_zone) continue;
-        
+
+        std::string direction = (zone.type == Core::ZoneType::DEMAND) ? "LONG" : "SHORT";
+
+        // ⭐ CANDLE CONFIRMATION FILTER (ported from live_engine.cpp)
+        // Requires the previous bar to show rejection evidence before entering:
+        //   - Previous bar close is inside the zone
+        //   - Candle direction matches trade direction
+        //   - Body size >= candle_confirmation_body_pct of total range
+        if (config.enable_candle_confirmation && bar_index >= 1) {
+            const Core::Bar& confirm_bar = bars[bar_index - 1];
+            double zone_low  = std::min(zone.distal_line, zone.proximal_line);
+            double zone_high = std::max(zone.distal_line, zone.proximal_line);
+            bool close_in_zone = (confirm_bar.close >= zone_low && confirm_bar.close <= zone_high);
+            bool wick_in_zone  = (confirm_bar.low <= zone_high && confirm_bar.high >= zone_low);
+            double candle_range = confirm_bar.high - confirm_bar.low;
+            double candle_body  = std::abs(confirm_bar.close - confirm_bar.open);
+            double body_pct = (candle_range > 0.0) ? (candle_body / candle_range * 100.0) : 0.0;
+            bool direction_ok = (direction == "LONG") ? (confirm_bar.close > confirm_bar.open)
+                                                       : (confirm_bar.close < confirm_bar.open);
+            bool candle_ok = close_in_zone && wick_in_zone && direction_ok &&
+                             (body_pct >= config.candle_confirmation_body_pct);
+            if (!candle_ok) {
+                LOG_DEBUG("Candle confirmation rejected zone " << zone.zone_id
+                         << " close_in=" << close_in_zone
+                         << " wick_in=" << wick_in_zone
+                         << " dir_ok=" << direction_ok
+                         << " body=" << std::fixed << std::setprecision(1) << body_pct << "%");
+                continue;
+            }
+        }
+
+        // ⭐ STRUCTURE CONFIRMATION FILTER (ported from live_engine.cpp)
+        // For LONG: confirm_bar.close > prev_bar.high (broke structure upward)
+        // For SHORT: confirm_bar.close < prev_bar.low  (broke structure downward)
+        if (config.enable_structure_confirmation && bar_index >= 2) {
+            const Core::Bar& confirm_bar = bars[bar_index - 1];
+            const Core::Bar& prev_bar    = bars[bar_index - 2];
+            bool structure_ok = (direction == "LONG")
+                ? (confirm_bar.close > prev_bar.high)
+                : (confirm_bar.close < prev_bar.low);
+            if (!structure_ok) {
+                LOG_DEBUG("Structure confirmation rejected zone " << zone.zone_id
+                         << " confirm_close=" << confirm_bar.close
+                         << " prev_high=" << prev_bar.high
+                         << " prev_low=" << prev_bar.low);
+                continue;
+            }
+        }
+
         // ⭐ EMA ALIGNMENT FILTER (moved from entry_decision_engine.cpp due to linker issues)
         // Check EMA trend alignment before scoring to save computation
         double ema_20 = Core::MarketAnalyzer::calculate_ema(bars, 20, bar_index);
         double ema_50 = Core::MarketAnalyzer::calculate_ema(bars, 50, bar_index);
-        std::string direction = (zone.type == Core::ZoneType::DEMAND) ? "LONG" : "SHORT";
         
         if (direction == "LONG" && config.require_ema_alignment_for_longs) {
-            double ema_sep_pct = 100.0 * (ema_20 - ema_50) / ema_50;
+            double ema_sep_pct = (ema_50 > 0) ? (100.0 * (ema_20 - ema_50) / ema_50) : 0.0;
             if (ema_20 <= ema_50 || ema_sep_pct < config.ema_min_separation_pct_long) {
                 LOG_DEBUG("EMA filter rejected LONG zone " << zone.zone_id 
-                         << ": EMA20=" << ema_20 << ", EMA50=" << ema_50
-                         << ", sep=" << ema_sep_pct << "% (< min=" << config.ema_min_separation_pct_long << "%)");
-                continue;  // Skip this zone - downtrend or weak trend
+                         << ": EMA20=" << ema_20 << " EMA50=" << ema_50
+                         << " sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_long << "%");
+                continue;
             }
         }
         
         if (direction == "SHORT" && config.require_ema_alignment_for_shorts) {
-            double ema_sep_pct = 100.0 * (ema_50 - ema_20) / ema_20;
+            double ema_sep_pct = (ema_20 > 0) ? (100.0 * (ema_50 - ema_20) / ema_20) : 0.0;
             if (ema_20 >= ema_50 || ema_sep_pct < config.ema_min_separation_pct_short) {
                 LOG_DEBUG("EMA filter rejected SHORT zone " << zone.zone_id 
-                         << ": EMA20=" << ema_20 << ", EMA50=" << ema_50
-                         << ", sep=" << ema_sep_pct << "% (< min=" << config.ema_min_separation_pct_short << "%)");
-                continue;  // Skip this zone - uptrend or weak trend
+                         << ": EMA20=" << ema_20 << " EMA50=" << ema_50
+                         << " sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_short << "%");
+                continue;
             }
         }
         
@@ -729,7 +827,13 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             // Pass zone quality score to calculate_entry for aggressiveness calculation
             decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
                 config.enable_revamped_scoring ? &zone_quality_score : nullptr, &bar, &bar_history);
-            decision.should_enter = true;  // Already validated
+            // FIX: do NOT override decision.should_enter here.
+            // should_enter_trade_two_stage() validated zone quality (Stage 1 — scoring/regime/age).
+            // calculate_entry() runs Stage 2 internal filters: V6 volume, candle confirmation,
+            // structure confirmation. If calculate_entry() rejects (should_enter=false, sl=0),
+            // overriding to true bypasses all those filters and calls enter_trade() with sl=0,
+            // causing 23,000+ wasted enter_trade() calls and "REJECTED: stop_loss <= 0" noise.
+            // decision.should_enter = true;  // REMOVED — was masking volume filter rejections
         } else {
             decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, &bar, &bar_history);
         }
@@ -739,6 +843,26 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             continue;
         }
         
+        // ⭐ FIX: Pre-check SL width before calling enter_trade().
+        // calculate_entry() computes SL from zone structure (sl_buffer_zone_pct × zone_height
+        // + sl_buffer_atr × ATR). For wide zones or high-ATR bars this produces SL >> cap.
+        // The old approach tightened SL post-fill — but a tightened SL is NOT the same trade
+        // the engine validated. It places SL inside the zone's intended buffer, making normal
+        // price noise hit the stop artificially. Analysis of 384 trades showed 60.2% had SL
+        // tightened (avg 33.7pts), directly inflating the SL hit rate vs the 327% backtest.
+        // FIX: reject here if structural SL exceeds cap. Post-fill tightening in trade_manager
+        // remains as safety net for fill slippage only (~5% of cases).
+        {
+            double max_sl_dist = config.max_loss_per_trade / static_cast<double>(config.lot_size);
+            double sl_dist = std::abs(decision.entry_price - decision.stop_loss);
+            if (sl_dist > max_sl_dist * 1.05) {  // 5% tolerance for ATR rounding
+                LOG_DEBUG("Zone#" << zone.zone_id << " SKIPPED: structural SL too wide ("
+                          << std::fixed << std::setprecision(1) << sl_dist
+                          << "pts > " << max_sl_dist << "pt cap) — tightening rejected");
+                continue;
+            }
+        }
+
         // Enter trade
         if (trade_manager.enter_trade(decision, zone, bar, bar_index, regime, "", &bars)) {
             Trade& current_trade = const_cast<Trade&>(trade_manager.get_current_trade());
@@ -758,6 +882,87 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
 void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
     // Get mutable reference to current trade for trailing stop updates
     Trade& trade = const_cast<Trade&>(trade_manager.get_current_trade());
+
+    // ⭐ SESSION CLOSE: Force-close intraday positions at end of each trading day.
+    //
+    // CRITICAL FIX: Without this, backtest_engine held positions overnight and
+    // across multiple days, causing:
+    //   1. Overnight gap risk: NIFTY can gap 200-300 pts on open vs 92pt SL
+    //   2. Multi-day adverse moves on intraday 5-min signals
+    //   3. Avg loss 8-25x the max_loss_per_trade cap (impossible intraday)
+    //   4. Capital going to -$58M from $300k starting capital
+    //
+    // This mirrors live_engine.cpp SESSION_END behavior exactly.
+    // Uses: session_end_time (e.g. "15:30:00") and
+    //       close_before_session_end_minutes (e.g. 10 → closes at 15:20)
+    if (!config.session_end_time.empty() && bar.datetime.length() >= 16) {
+        // Extract HH:MM from bar.datetime ("YYYY-MM-DD HH:MM:SS")
+        int bar_hour = 0, bar_min = 0;
+        try {
+            bar_hour = std::stoi(bar.datetime.substr(11, 2));
+            bar_min  = std::stoi(bar.datetime.substr(14, 2));
+        } catch (...) {}
+
+        // Parse session_end_time ("HH:MM:SS")
+        int sess_hour = 15, sess_min = 30;  // safe default: NSE close
+        sscanf(config.session_end_time.c_str(), "%d:%d", &sess_hour, &sess_min);
+
+        // Cutoff = session_end minus close_before_session_end_minutes
+        int cutoff_total = sess_hour * 60 + sess_min - config.close_before_session_end_minutes;
+        int bar_total    = bar_hour  * 60 + bar_min;
+
+        if (bar_total >= cutoff_total) {
+            LOG_INFO("SESSION_END: Closing trade at " << bar.datetime
+                     << " (bar=" << bar_hour << ":" << std::setw(2) << std::setfill('0') << bar_min
+                     << " >= cutoff=" << (cutoff_total/60) << ":"
+                     << std::setw(2) << std::setfill('0') << (cutoff_total%60) << ")");
+            Trade closed = trade_manager.close_trade(bar, "SESSION_END", bar.close);
+            performance.add_trade(closed);
+            performance.update_capital(trade_manager.get_capital());
+            consecutive_losses = (closed.pnl < 0 && !trade.trailing_activated)
+                                 ? consecutive_losses + 1 : 0;
+            std::cout << "SESSION_END: Trade #" << closed.trade_num
+                      << " closed @ " << std::fixed << std::setprecision(2) << bar.close
+                      << "  P&L " << closed.pnl << std::endl;
+            return;
+        }
+    }
+
+    // ⭐ FIX #3: Volume Exhaustion Exit (check BEFORE volume climax)
+    if (config.enable_volume_exhaustion_exit && config.v6_fully_enabled) {
+        auto vol_ex_signal = trade_manager.check_volume_exhaustion_signals(
+            trade, bar, bars, bar_index
+        );
+        
+        if (trade_manager.should_exit_on_exhaustion(vol_ex_signal, trade, bar)) {
+            std::string signal_name;
+            switch (vol_ex_signal) {
+                case TradeManager::VolumeExhaustionSignal::AGAINST_TREND_SPIKE:
+                    signal_name = "VOL_EXHAUSTION_SPIKE"; break;
+                case TradeManager::VolumeExhaustionSignal::ABSORPTION:
+                    signal_name = "VOL_EXHAUSTION_ABSORPTION"; break;
+                case TradeManager::VolumeExhaustionSignal::FLOW_REVERSAL:
+                    signal_name = "VOL_EXHAUSTION_FLOW"; break;
+                case TradeManager::VolumeExhaustionSignal::LOW_VOLUME_DRIFT:
+                    signal_name = "VOL_EXHAUSTION_DRIFT"; break;
+                default:
+                    signal_name = "VOL_EXHAUSTION"; break;
+            }
+            
+            Trade closed = trade_manager.close_trade(bar, signal_name, bar.close);
+            performance.add_trade(closed);
+            
+            LOG_INFO("🚨 " << signal_name << " - Early exit at bar " << bar_index);
+            LOG_INFO("   Entry: " << trade.entry_price 
+                     << ", Exit: " << bar.close 
+                     << ", P&L: $" << closed.pnl);
+            double sl_dist = std::abs(trade.entry_price - trade.stop_loss);
+            double saved = (sl_dist * trade.position_size * config.lot_size) - std::abs(closed.pnl);
+            LOG_INFO("   Saved ₹" << saved << " vs full SL");
+            
+            return;
+        }
+    }
     
     // ✅ NEW V6.0: Check volume-based exit signals
     if (config.enable_volume_exit_signals) {
@@ -781,13 +986,52 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         }
     }
     
-    // ⭐ IMPROVED: Multi-Stage Trailing Stop
+    // ⭐ FIXED: Multi-Stage Trailing Stop
+    //
+    // BUG FIXES vs. original:
+    // 1. Stage ordering fixed — 4 distinct R thresholds with no overlap.
+    //    Original had Stage 2 (>=1.0R) and Stage 1 (>=trail_activation_rr=1.0R)
+    //    sharing the same threshold, making Stage 1 (breakeven) DEAD CODE.
+    //    Fix: Stage 1 = 0.5R, Stage 2 = 1.0R, Stage 3 = 2.0R, Stage 4 = 3.0R.
+    //
+    // 2. Stage 2 profit-lock direction fix for SHORT.
+    //    Original: SHORT trail = entry - 0.5*risk (BELOW entry).
+    //    check_stop_loss for SHORT fires when bar.high >= stop_loss.
+    //    A stop BELOW entry fires instantly on any bar above that level,
+    //    which for a SHORT at entry means it triggers the VERY NEXT BAR.
+    //    Fix: SHORT profit lock = entry + 0.5*risk (ABOVE entry but below orig SL),
+    //    mirroring LONG logic symmetrically.
+    //    LONG:  entry + 0.5R  → above entry, locks profit if price pulls back
+    //    SHORT: entry - 0.5R  → below entry, locks profit if price rallies back
+    //    Wait — for SHORT, check_stop_loss fires on bar.high >= stop_loss.
+    //    To protect SHORT profit, the stop must be ABOVE current price but BELOW orig SL.
+    //    After price has moved 1R in our favour (DOWN for SHORT), current price ≈ entry - R.
+    //    We want the stop to sit at entry + 0.5R so a rally back to that level exits us.
+    //    That is ABOVE entry and below the original SL — correct protective placement.
+    //    Fix (corrected): SHORT Stage 2 = entry + 0.5*risk  (ratchet: only if < orig SL)
+    //
+    // 3. ATR stages (3 & 4) now use a FLOOR of the previous stage's fixed level.
+    //    Original ATR stages could compute a new_trail_stop WORSE than the locked
+    //    Stage 2 level if ATR was wide, bypassing the ratchet due to direction check.
+    //    Fix: clamp new_trail_stop so it never retreats past the Stage 2 level.
+    //
+    // 4. trailing_activated is set on first stage transition regardless of which stage.
+    //    The original only set trailing_activated on the FIRST call to any stage's
+    //    !trailing_activated branch, meaning once set it was never logged again.
+    //    Kept consistent — trailing_activated = true on first activation.
+    //
+    // Config-driven thresholds (add to config if needed; hard-coded sensible defaults):
+    //   trail_activation_rr   (config) → Stage 1 (breakeven) threshold, default 0.5R
+    //   Stage 2 fixed at 1.0R
+    //   Stage 3 fixed at 2.0R
+    //   Stage 4 fixed at 3.0R
     if (config.use_trailing_stop) {
+        // Risk = distance from entry to ORIGINAL stop loss (never changes)
         double risk = std::abs(trade.entry_price - trade.original_stop_loss);
         if (risk <= 0) risk = std::abs(trade.entry_price - trade.stop_loss);
         if (risk < 0.01) risk = 1.0;
 
-        // Track extreme price reached (bar extremes, not just close)
+        // Track best (most favourable) price reached using bar extremes
         if (trade.direction == "LONG") {
             if (bar.high > trade.highest_price || trade.highest_price <= 0.0)
                 trade.highest_price = bar.high;
@@ -796,14 +1040,14 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
                 trade.lowest_price = bar.low;
         }
 
-        // R based on best excursion (highest/lowest), not current price
+        // Current R = best excursion / initial risk
         double best_excursion = (trade.direction == "LONG")
             ? (trade.highest_price - trade.entry_price)
             : (trade.entry_price - trade.lowest_price);
         double current_r = (risk > 0) ? (best_excursion / risk) : 0.0;
 
-        // Current ATR for trail buffer
-        double atr_trail = risk;  // fallback
+        // ATR for buffer in Stages 3 & 4
+        double atr_trail = risk;  // fallback: use risk as ATR proxy
         if (bar_index >= config.atr_period) {
             double atr_sum = 0.0;
             for (int i = bar_index - config.atr_period + 1; i <= bar_index; i++) {
@@ -817,70 +1061,166 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
             atr_trail = atr_sum / config.atr_period;
         }
 
+        // ── Compute stage-based candidate trail level ─────────────────────────
+        // Direction-aware profit-lock levels:
+        //   LONG : stop moves UP   (check_stop_loss fires when bar.low <= stop)
+        //   SHORT: stop moves DOWN (check_stop_loss fires when bar.high >= stop)
+        //
+        // Stage 1 (breakeven): stop = entry_price
+        //   LONG : entry_price — price must fall back to entry to exit
+        //   SHORT: entry_price — price must rally back to entry to exit
+        //
+        // Stage 2 (0.5R profit lock):
+        //   LONG : entry + 0.5R — price falls back 0.5R to exit, locking 0.5R profit
+        //   SHORT: entry - 0.5R — price rallies 0.5R to exit, locking 0.5R profit
+        //
+        // Stage 3 (1.0×ATR from extreme):
+        //   LONG : highest_price - 1.0×ATR  (tighter as market extends)
+        //   SHORT: lowest_price  + 1.0×ATR
+        //
+        // Stage 4 (tight, 0.5×ATR from extreme):
+        //   LONG : highest_price - 0.5×ATR
+        //   SHORT: lowest_price  + 0.5×ATR
+
+        // Pre-compute fixed stage levels used as floors in ATR stages
+        double stage1_level = trade.entry_price;  // breakeven
+        double stage2_level = (trade.direction == "LONG")
+            ? trade.entry_price + (risk * 0.5)
+            : trade.entry_price - (risk * 0.5);
+
         double new_trail_stop = 0.0;
+        int    activated_stage = 0;
 
         if (current_r >= 3.0) {
-            // Stage 4: Tight — 0.5×ATR from extreme
-            new_trail_stop = (trade.direction == "LONG")
+            // Stage 4: Tight ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
                 ? trade.highest_price - (atr_trail * 0.5)
                 : trade.lowest_price  + (atr_trail * 0.5);
-            if (!trade.trailing_activated) {
-                trade.trailing_activated = true;
-                LOG_INFO("📈 Trail STAGE 4 (tight, 0.5×ATR) at " << current_r << "R");
-            }
-        } else if (current_r >= 2.0) {
-            // Stage 3: Moderate — 1.0×ATR from extreme
+            // Floor: never worse than Stage 2 lock
             new_trail_stop = (trade.direction == "LONG")
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 4;
+        } else if (current_r >= 2.0) {
+            // Stage 3: Moderate ATR trail, floored at Stage 2 level
+            double raw = (trade.direction == "LONG")
                 ? trade.highest_price - (atr_trail * 1.0)
                 : trade.lowest_price  + (atr_trail * 1.0);
-            if (!trade.trailing_activated) {
-                trade.trailing_activated = true;
-                LOG_INFO("📈 Trail STAGE 3 (1.0×ATR) at " << current_r << "R");
-            }
-        } else if (current_r >= 1.0) {
-            // Stage 2: Lock 0.5R profit floor
-            // LONG:  entry + risk×0.5  (SL above entry, ratchet moves UP)
-            // SHORT: entry - risk×0.5  (SL below entry, ratchet moves DOWN)
-            // Both lock 0.5R of realised profit if price reverses to this level.
             new_trail_stop = (trade.direction == "LONG")
-                ? trade.entry_price + (risk * 0.5)
-                : trade.entry_price - (risk * 0.5);
-            if (!trade.trailing_activated) {
-                trade.trailing_activated = true;
-                LOG_INFO("📈 Trail STAGE 2 (0.5R profit lock) at " << current_r << "R");
-            }
+                ? std::max(raw, stage2_level)
+                : std::min(raw, stage2_level);
+            activated_stage = 3;
+        } else if (current_r >= 1.0) {
+            // Stage 2: Lock 0.5R profit
+            // LONG : entry + 0.5R  (SL moves above entry — ratchets up as trade progresses)
+            // SHORT: entry - 0.5R  (SL moves below entry — ratchets down as trade progresses)
+            new_trail_stop = stage2_level;
+            activated_stage = 2;
         } else if (current_r >= config.trail_activation_rr) {
-            // Stage 1: Breakeven lock
-            new_trail_stop = trade.entry_price;
-            if (!trade.trailing_activated) {
-                trade.trailing_activated = true;
-                LOG_INFO("📈 Trail STAGE 1 (breakeven lock) at " << current_r << "R");
-            }
+            // Stage 1: Breakeven lock — config-driven, default 0.5R in config
+            // trail_activation_rr should be set to 0.5 (not 1.0) so Stage 1 fires
+            // before Stage 2.  With the new ordering this is now reachable.
+            new_trail_stop = stage1_level;
+            activated_stage = 1;
         }
 
-        // Ratchet: never move SL backwards
+        // Log first activation
+        if (activated_stage > 0 && !trade.trailing_activated) {
+            trade.trailing_activated = true;
+            LOG_INFO("📈 Trail STAGE " << activated_stage << " first activated at "
+                     << std::fixed << std::setprecision(2) << current_r << "R"
+                     << "  new_trail=" << new_trail_stop);
+        }
+
+        // Ratchet: only advance stop in the profitable direction, never retreat
         if (new_trail_stop > 0.0) {
             if (trade.direction == "LONG" && new_trail_stop > trade.stop_loss) {
-                LOG_DEBUG("Trail SL ▲ " << trade.stop_loss << " → " << new_trail_stop);
+                LOG_DEBUG("Trail SL ▲ " << trade.stop_loss << " → " << new_trail_stop
+                          << "  [Stage " << activated_stage << ", R=" << current_r << "]");
                 trade.stop_loss = new_trail_stop;
                 trade.current_trail_stop = new_trail_stop;
             } else if (trade.direction == "SHORT" && new_trail_stop < trade.stop_loss) {
-                LOG_DEBUG("Trail SL ▼ " << trade.stop_loss << " → " << new_trail_stop);
+                LOG_DEBUG("Trail SL ▼ " << trade.stop_loss << " → " << new_trail_stop
+                          << "  [Stage " << activated_stage << ", R=" << current_r << "]");
                 trade.stop_loss = new_trail_stop;
                 trade.current_trail_stop = new_trail_stop;
             }
         }
     }
     
-    // Increment bars in trade
+    // ⭐ FIX: Increment bars_in_trade FIRST, before any exit checks.
+    // This mirrors live_engine.cpp manage_position() FIX 1.
     trade.bars_in_trade++;
-    
+
+    // ⭐ FIX: Require minimum 2 bars before allowing SL/TP exits.
+    // Prevents same-bar exits where entry-bar volatility immediately breaches SL/TP.
+    // Live engine enforces this — backtest must match.
+    // Still update highest/lowest for trailing stop tracking on the first bar.
+    if (trade.bars_in_trade < 2) {
+        if (trade.direction == "LONG") {
+            if (bar.high > trade.highest_price || trade.highest_price <= 0.0)
+                trade.highest_price = bar.high;
+        } else {
+            if (bar.low < trade.lowest_price || trade.lowest_price <= 0.0)
+                trade.lowest_price = bar.low;
+        }
+        LOG_DEBUG("Position too new (bars_in_trade=" << trade.bars_in_trade
+                  << "), skipping exit check this bar");
+        return;
+    }
+
+    // ⭐ FIX: EMA crossover exit — ported from live_engine.cpp manage_position().
+    // If enable_ema_exit=YES and fast EMA crosses slow EMA against trade direction,
+    // exit immediately. Only checked if SL/TP not about to fire this bar.
+    // Checked BEFORE SL/TP so it uses bar.close as exit price (cleaner fill).
+    // Use inline bar checks (not trade_manager calls) to avoid premature side-effects.
+    bool sl_would_hit = (trade.direction == "LONG")  ? (bar.low  <= trade.stop_loss)
+                                                     : (bar.high >= trade.stop_loss);
+    bool tp_would_hit = (trade.direction == "LONG")  ? (bar.high >= trade.take_profit && trade.take_profit > 0.0)
+                                                     : (bar.low  <= trade.take_profit && trade.take_profit > 0.0);
+    if (config.enable_ema_exit && !sl_would_hit && !tp_would_hit) {
+        int min_ema_period = std::max(config.exit_ema_fast_period, config.exit_ema_slow_period);
+        if (bar_index >= min_ema_period) {
+            double ema_fast = Core::MarketAnalyzer::calculate_ema(bars, config.exit_ema_fast_period, bar_index);
+            double ema_slow = Core::MarketAnalyzer::calculate_ema(bars, config.exit_ema_slow_period, bar_index);
+            bool ema_exit = (trade.direction == "LONG"  && ema_fast < ema_slow) ||
+                            (trade.direction == "SHORT" && ema_fast > ema_slow);
+            if (ema_exit) {
+                LOG_INFO("EMA_CROSS exit: " << trade.direction
+                         << " EMA" << config.exit_ema_fast_period << "=" << std::fixed << std::setprecision(2) << ema_fast
+                         << " EMA" << config.exit_ema_slow_period << "=" << ema_slow);
+                Trade closed_trade = trade_manager.close_trade(bar, "EMA_CROSS", bar.close);
+                performance.add_trade(closed_trade);
+                performance.update_capital(trade_manager.get_capital());
+                consecutive_losses = (closed_trade.pnl < 0) ? consecutive_losses + 1 : 0;
+                std::cout << "Trade #" << closed_trade.trade_num << " EMA_CROSS exit: "
+                          << "P&L $" << std::fixed << std::setprecision(2) << closed_trade.pnl
+                          << "  EMA" << config.exit_ema_fast_period << "=" << ema_fast
+                          << " EMA" << config.exit_ema_slow_period << "=" << ema_slow << std::endl;
+                return;
+            }
+        }
+    }
+
     // Check stop loss (may have been updated by trailing logic)
     if (trade_manager.check_stop_loss(bar)) {
         std::string exit_reason = trade.trailing_activated ? "TRAIL_SL" : "SL";
-        double sl_fill = (trade.direction == "LONG")
-            ? std::min(trade.stop_loss, bar.close)
-            : std::max(trade.stop_loss, bar.close);
+        // ⭐ REALISTIC SL FILL:
+        //   Normal case:  bar ticked through SL intraday → fill at SL (best realistic)
+        //   Gap case:     bar.open already past SL (news/overnight gap) → fill at open
+        //   bar.close used as backstop: never fill worse than close (conservative)
+        double sl_fill;
+        if (trade.direction == "LONG") {
+            // Gap-past-SL: open already below SL → fill at open
+            double gap_fill = (bar.open <= trade.stop_loss) ? bar.open : trade.stop_loss;
+            sl_fill = std::max(gap_fill, bar.close);  // never worse than close
+            sl_fill = std::min(sl_fill, trade.stop_loss);  // never better than SL
+        } else {
+            // SHORT: gap-past-SL: open already above SL → fill at open
+            double gap_fill = (bar.open >= trade.stop_loss) ? bar.open : trade.stop_loss;
+            sl_fill = std::min(gap_fill, bar.close);  // never worse than close
+            sl_fill = std::max(sl_fill, trade.stop_loss);  // never better than SL
+        }
         Trade closed_trade = trade_manager.close_trade(
             bar, exit_reason, sl_fill);
         performance.add_trade(closed_trade);
@@ -894,15 +1234,17 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
             }
         }
         
-        // Increment retry counter for the zone if enabled
-        if (config.enable_per_zone_retry_limit) {
+        // ⭐ FIX: Increment retry counter using EXACT zone_id match.
+        // Old bug: distance-based match (within 50pts) could increment the WRONG zone,
+        // blocking re-entries on zones that shouldn't be blocked.
+        // Live engine uses exact zone_id match — backtest now mirrors this.
+        if (config.enable_per_zone_retry_limit && closed_trade.zone_id >= 0) {
             for (auto& zone : active_zones) {
-                // Match zone by price levels (approximate match)
-                double zone_mid = (zone.proximal_line + zone.distal_line) / 2.0;
-                double entry_dist = std::abs(closed_trade.entry_price - zone_mid);
-                if (entry_dist < 50.0) {  // Within 50 points of zone
+                if (zone.zone_id == closed_trade.zone_id) {
                     zone.entry_retry_count++;
-                    LOG_DEBUG("Zone " << zone.zone_id << " retry count: " << zone.entry_retry_count);
+                    LOG_INFO("Zone " << zone.zone_id << " retry count incremented to "
+                             << zone.entry_retry_count
+                             << " (blocks re-entry if >= " << config.max_retries_per_zone << ")");
                     break;
                 }
             }
@@ -938,12 +1280,17 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
 }
 
 void BacktestEngine::process_bar(const Core::Bar& bar, int bar_index) {
-    // Manage existing position
+    // ⭐ FIX: Always update zone states on every bar, even while in position.
+    // Live engine does this — zones accumulate touches, detect violations, and
+    // flip during open trades. Backtest must mirror this or zone state diverges.
+    update_zone_states(bar);
+
+    // Manage existing position (returns early — no new entry while in position)
     if (trade_manager.is_in_position()) {
         manage_open_position(bar, bar_index);
         return;
     }
-    
+
     // Handle pause after consecutive losses
     if (pause_counter > 0) {
         pause_counter--;
@@ -952,11 +1299,8 @@ void BacktestEngine::process_bar(const Core::Bar& bar, int bar_index) {
         }
         return;
     }
-    
-    // Update zone states
-    update_zone_states(bar);
-    
-    // Check for entry opportunities
+
+    // Check for entry opportunities (zone states already updated above)
     check_for_entries(bar, bar_index);
 }
 

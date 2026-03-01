@@ -96,12 +96,16 @@ private:
      * @param direction "BUY" or "SELL"
      * @param quantity Position size
      * @param price Limit price (for backtest)
+     * @param bar  Current bar — used in backtest to clamp fill to bar's
+     *             actual high/low range (prevents phantom fills above bar.high
+     *             for SHORTs or below bar.low for LONGs). nullptr = no clamp.
      * @return Actual fill price
      */
     double execute_entry(const std::string& symbol,
                         const std::string& direction,
                         int quantity,
-                        double price);
+                        double price,
+                        const Bar* bar = nullptr);
     
     /**
      * Execute exit order (simulated or real)
@@ -150,6 +154,28 @@ public:
         const Bar& current_bar,
         const std::vector<Bar>& bars,
         int current_index
+    ) const;
+    
+    // Volume Exhaustion exit signals (for early loss exits)
+    enum class VolumeExhaustionSignal {
+        NONE,
+        AGAINST_TREND_SPIKE,
+        ABSORPTION,
+        FLOW_REVERSAL,
+        LOW_VOLUME_DRIFT
+    };
+    
+    VolumeExhaustionSignal check_volume_exhaustion_signals(
+        const Trade& trade,
+        const Bar& current_bar,
+        const std::vector<Bar>& bars,
+        int current_index
+    ) const;
+    
+    bool should_exit_on_exhaustion(
+        VolumeExhaustionSignal signal,
+        const Trade& trade,
+        const Bar& current_bar
     ) const;
     
     /**

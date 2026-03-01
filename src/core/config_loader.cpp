@@ -277,7 +277,11 @@ bool ConfigLoader::parse_section_scoring(const std::string& key, const std::stri
         config.entry_validation_acceptable_stop_atr_min = std::stod(value);
     } else if (key == "entry_validation_acceptable_stop_atr_max") {
         config.entry_validation_acceptable_stop_atr_max = std::stod(value);
-    }
+    } else if (key == "zone_max_age_days") {
+      config.zone_max_age_days = std::stoi(value);
+	} else if (key == "zone_max_touch_count") {
+      config.zone_max_touch_count = std::stoi(value);
+	}
     // Scoring Weights
     else if (key == "scoring_weight_base_strength") {
         config.scoring.weight_base_strength = std::stod(value);
@@ -345,7 +349,38 @@ bool ConfigLoader::parse_section_scoring(const std::string& key, const std::stri
         config.trade_with_trend_only = parse_bool(value);
     } else if (key == "allow_ranging_trades") {
         config.allow_ranging_trades = parse_bool(value);
+    } else if (key == "enable_volume_exhaustion_exit") {
+        config.enable_volume_exhaustion_exit = (value == "YES" || value == "yes");
     }
+    else if (key == "vol_exhaustion_spike_min_ratio") {
+        config.vol_exhaustion_spike_min_ratio = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_spike_min_body_atr") {
+        config.vol_exhaustion_spike_min_body_atr = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_absorption_min_ratio") {
+        config.vol_exhaustion_absorption_min_ratio = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_absorption_max_body_atr") {
+        config.vol_exhaustion_absorption_max_body_atr = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_flow_min_ratio") {
+        config.vol_exhaustion_flow_min_ratio = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_flow_min_bars") {
+        config.vol_exhaustion_flow_min_bars = std::stoi(value);
+    }
+    else if (key == "vol_exhaustion_drift_max_ratio") {
+        config.vol_exhaustion_drift_max_ratio = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_drift_min_loss_atr") {
+        config.vol_exhaustion_drift_min_loss_atr = std::stod(value);
+    }
+    else if (key == "vol_exhaustion_max_loss_pct") {
+        config.vol_exhaustion_max_loss_pct = std::stod(value);
+    }
+	
+	
     // EMA Filter
     else if (key == "use_ema_trend_filter") {
         config.use_ema_trend_filter = parse_bool(value);
@@ -386,12 +421,20 @@ bool ConfigLoader::parse_section_indicators_and_entry(const std::string& key, co
         config.rejection_wick_ratio = std::stod(value);
     } else if (key == "entry_buffer_pct") {
         config.entry_buffer_pct = std::stod(value);
+    } else if (key == "min_zone_penetration_pct") {
+        config.min_zone_penetration_pct = std::stod(value);
+    } else if (key == "require_price_at_entry_level") {
+        config.require_price_at_entry_level = parse_bool(value);
     }
     // Risk Management
     else if (key == "sl_buffer_zone_pct") {
         config.sl_buffer_zone_pct = std::stod(value);
     } else if (key == "sl_buffer_atr") {
         config.sl_buffer_atr = std::stod(value);
+    } else if (key == "min_stop_distance_points") {
+    config.min_stop_distance_points = std::stod(value);
+	} else if (key == "max_fill_slippage_pts") {
+        config.max_fill_slippage_pts = std::stod(value);
     } else if (key == "risk_reward_ratio") {
         config.risk_reward_ratio = std::stod(value);
     } else if (key == "use_breakeven_stop_loss") {
@@ -441,6 +484,12 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.session_end_time = value;
     } else if (key == "close_before_session_end_minutes") {
         config.close_before_session_end_minutes = std::stoi(value);
+    } else if (key == "enable_entry_time_block") {
+        config.enable_entry_time_block = parse_bool(value);
+    } else if (key == "entry_block_start_time") {
+        config.entry_block_start_time = value;
+    } else if (key == "entry_block_end_time") {
+        config.entry_block_end_time = value;
     }
     // Position Sizing
     else if (key == "lot_size") {
@@ -477,6 +526,14 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.max_zone_distance_atr = std::stod(value);
     } else if (key == "live_zone_detection_interval_bars") {
         config.live_zone_detection_interval_bars = std::stoi(value);
+    } else if (key == "use_relaxed_live_detection") {
+        config.use_relaxed_live_detection = parse_bool(value);
+    } else if (key == "live_min_zone_width_atr") {
+        config.live_min_zone_width_atr = std::stod(value);
+    } else if (key == "live_min_zone_strength") {
+        config.live_min_zone_strength = std::stod(value);
+    } else if (key == "live_zone_detection_lookback_bars") {
+        config.live_zone_detection_lookback_bars = std::stoi(value);
     } else if (key == "live_entry_require_new_bar") {
         config.live_entry_require_new_bar = parse_bool(value);
     } else if (key == "live_skip_when_in_position") {
@@ -676,6 +733,45 @@ void ConfigLoader::parse_line(const std::string& line, Config& config) {
     
     if (key.empty() || value.empty()) {
         throw std::runtime_error("Empty key or value");
+    }
+
+    // Check for legacy/unknown keys first - silently ignore them
+    if (key == "stop_loss_atr_multiplier" || 
+        key == "target_rr_ratio" ||
+        key == "entry_score_zone_quality_max" ||
+        key == "entry_score_volume_entry_max" ||
+        key == "entry_score_market_context_max" ||
+        key == "entry_score_total_max" ||
+        key == "entry_score_zone_quality_min" ||
+        key == "entry_score_volume_entry_min" ||
+        key == "entry_score_market_context_min" ||
+        key == "entry_score_total_min" ||
+        key == "departure_volume_extreme_ratio" ||
+        key == "departure_volume_strong_ratio" ||
+        key == "departure_volume_moderate_ratio" ||
+        key == "departure_volume_normal_ratio" ||
+        key == "departure_volume_weak_penalty" ||
+        key == "initiative_bonus" ||
+        key == "absorption_penalty" ||
+        key == "multi_touch_rising_penalty" ||
+        key == "pullback_volume_very_low" ||
+        key == "pullback_volume_low" ||
+        key == "pullback_volume_moderate" ||
+        key == "pullback_volume_elevated" ||
+        key == "pullback_volume_high" ||
+        key == "pullback_volume_very_high_penalty" ||
+        key == "entry_bar_strong_body_pct" ||
+        key == "entry_bar_moderate_body_pct" ||
+        key == "entry_bar_weak_penalty" ||
+        key == "recent_volume_declining_bonus" ||
+        key == "recent_volume_stable_bonus" ||
+        key == "recent_volume_rising_penalty" ||
+        key == "volume_pattern_sweet_spot_min" ||
+        key == "volume_pattern_sweet_spot_max" ||
+        key == "volume_pattern_inst_min" ||
+        key == "volume_pattern_high_trap_penalty") {
+        // Legacy parameter - silently ignored
+        return;
     }
 
     if (parse_section_capital_and_zones(key, value, config)) {

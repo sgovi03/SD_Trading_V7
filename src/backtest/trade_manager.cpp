@@ -136,6 +136,28 @@ void TradeManager::calculate_pnl(Trade& trade) const {
     
     // Total P&L
     trade.pnl = pnl_per_unit * trade.position_size * config.lot_size;
+
+    // ⭐ PNL SANITY GUARD: Catch impossibly large losses before they corrupt results.
+    // Max realistic intraday loss = 3 lots * 500pts * 65 lot_size = Rs97,500
+    // If we exceed Rs200,000 on a single trade, print full forensic detail and abort.
+    if (std::abs(trade.pnl) > 200000.0) {
+        std::cerr << "\n\n[FATAL PNL SANITY BREACH] Trade #" << trade.trade_num << "\n"
+                  << "  Direction:      " << trade.direction << "\n"
+                  << "  Entry Price:    " << std::fixed << std::setprecision(2) << trade.entry_price << "\n"
+                  << "  Exit Price:     " << trade.exit_price << "\n"
+                  << "  Stop Loss:      " << trade.stop_loss << "\n"
+                  << "  pnl_per_unit:   " << pnl_per_unit << " pts\n"
+                  << "  position_size:  " << trade.position_size << " (lots or units?)\n"
+                  << "  config.lot_size:" << config.lot_size << "\n"
+                  << "  COMPUTED PNL:   Rs" << trade.pnl << "\n"
+                  << "  Expected max:   Rs97,500 (3lots x 500pts x 65)\n"
+                  << "  bars_in_trade:  " << trade.bars_in_trade << "\n"
+                  << "  entry_date:     " << trade.entry_date << "\n"
+                  << "  exit_date:      " << trade.exit_date << "\n"
+                  << "  exit_reason:    " << trade.exit_reason << "\n"
+                  << ">>> ABORTING to prevent data corruption. Fix position_size bug first. <<<\n\n";
+        std::abort();
+    }
     
     // Subtract commissions
     trade.pnl -= (2 * config.commission_per_trade);  // Entry + Exit
@@ -148,8 +170,15 @@ void TradeManager::calculate_pnl(Trade& trade) const {
     trade.return_pct = (trade.pnl / current_capital) * 100.0;
     
     // Risk amount
+    // FIX: In breakeven mode entry_price == stop_loss → stop_distance = 0 → risk_amount
+    // reports as ₹0 in the CSV, which caused incorrect forensic analysis. The system
+    // always enforces max_loss_per_trade as the hard cap, so report that as effective risk.
     double stop_distance = std::abs(trade.entry_price - trade.stop_loss);
-    trade.risk_amount = stop_distance * trade.position_size * config.lot_size;
+    if (stop_distance < 1.0 && config.max_loss_per_trade > 0) {
+        trade.risk_amount = config.max_loss_per_trade;
+    } else {
+        trade.risk_amount = stop_distance * trade.position_size * config.lot_size;
+    }
     
     // Reward amount
     double target_distance = std::abs(trade.take_profit - trade.entry_price);
@@ -164,12 +193,42 @@ void TradeManager::calculate_pnl(Trade& trade) const {
 double TradeManager::execute_entry(const std::string& symbol,
                                    const std::string& direction,
                                    int quantity,
-                                   double price) {
+                                   double price,
+                                   const Bar* bar) {
     if (mode == ExecutionMode::BACKTEST) {
-        // Simulated execution
+        // ── REALISTIC FILL CLAMPING ──────────────────────────────────────────
+        // A limit order can only fill at a price the bar actually traded.
+        //   SHORT (SELL limit): the sell order sits at our target price above
+        //     the market — it fills only if bar.high reaches that level.
+        //     If bar.high < target, we get filled at bar.high (best available).
+        //   LONG (BUY limit): the buy order sits below the market — it fills
+        //     only if bar.low reaches that level.
+        //     If bar.low > target, we get filled at bar.low (best available).
+        // Without this clamp, backtest fills phantom trades at unreachable prices
+        // (e.g. SHORT target at 25232 on a bar whose high was only 25220).
+        if (bar != nullptr) {
+            if (direction == "SELL") {
+                // SHORT: cannot fill above bar.high — clamp down to bar.high
+                if (price > bar->high) {
+                    LOG_DEBUG("SHORT fill clamped: target=" + std::to_string(price) +
+                              " > bar.high=" + std::to_string(bar->high) +
+                              " → fill at " + std::to_string(bar->high));
+                    price = bar->high;
+                }
+            } else {
+                // LONG: cannot fill below bar.low — clamp up to bar.low
+                if (price < bar->low) {
+                    LOG_DEBUG("LONG fill clamped: target=" + std::to_string(price) +
+                              " < bar.low=" + std::to_string(bar->low) +
+                              " → fill at " + std::to_string(bar->low));
+                    price = bar->low;
+                }
+            }
+        }
+        // ────────────────────────────────────────────────────────────────────
         LOG_INFO("SIMULATED: Entry " + direction + " " + std::to_string(quantity) + 
                 " @ " + std::to_string(price));
-        return price;  // Perfect fill in backtest
+        return price;
     }
 
     if (!broker) {
@@ -267,6 +326,30 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
         return false;
     }
 
+    // ⭐ CRITICAL GUARD: Reject trades with zero/negative SL or TP.
+    // Root cause: zones with distal_line=0 (corrupt/zero-initialized zone) cause
+    // calculate_stop_loss() to return 0, which then cascades:
+    //   1. SL=0 → breakeven mode sets entry_price=0
+    //   2. Fill clamp corrects entry to bar.low (e.g. 22238) but take_profit stays 0
+    //   3. check_take_profit: bar.high >= 0 → ALWAYS TRUE → exits at price 0
+    //   4. pnl = (0 - 22238) * 1 * 65 = -Rs1,445,470
+    // This single guard eliminates all catastrophic ₹1.4M+ losses.
+    if (decision.stop_loss <= 0.0) {
+        LOG_WARN("Trade REJECTED: stop_loss=" + std::to_string(decision.stop_loss) +
+                 " is zero or negative. Zone distal_line=" +
+                 std::to_string(zone.distal_line) + " may be corrupt.");
+        std::cout << "[TRADE_MGR] REJECTED: stop_loss <= 0 (zone distal_line corrupt)\n";
+        std::cout.flush();
+        return false;
+    }
+    if (decision.take_profit <= 0.0) {
+        LOG_WARN("Trade REJECTED: take_profit=" + std::to_string(decision.take_profit) +
+                 " is zero or negative.");
+        std::cout << "[TRADE_MGR] REJECTED: take_profit <= 0\n";
+        std::cout.flush();
+        return false;
+    }
+
     // ⭐ FIX: Enforce max loss cap using THE ACTUAL STOP LOSS, not sizing SL
     // In breakeven mode, decision.stop_loss is the REAL stop that will be hit
     // We must check against this, not the "sl_for_sizing" used for position calculation
@@ -349,7 +432,7 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
     std::cout << "  Total units (lots x lot_size): " << total_units << "\n";
     std::cout.flush();
     // total_units = 1;
-    double fill_price = execute_entry(symbol, order_direction, total_units, decision.entry_price);
+    double fill_price = execute_entry(symbol, order_direction, total_units, decision.entry_price, &bar);
     //fill_price = decision.entry_price; // HARDCODED TEMPORARY OVERRIDE FOR TESTING
     std::cout << "  execute_entry() returned fill_price: " << fill_price << "\n";
     std::cout.flush();
@@ -364,8 +447,40 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
     // ⭐ POST-FILL CAP CHECK: Revalidate risk using ACTUAL fill price
     // Breakeven mode: decision.entry_price is the intended SL level, NOT the actual fill.
     // Broker fills at market price (inside zone), making actual risk larger than pre-fill estimate.
-    // effective_stop_loss starts as decision.stop_loss; the tightening path below may override it.
-    double effective_stop_loss = decision.stop_loss;
+    // effective_stop_loss / effective_take_profit start as decision values;
+    // the tightening path below may override both when SL rescue fires.
+    double effective_stop_loss   = decision.stop_loss;
+    double effective_take_profit = decision.take_profit;  // may be overridden below
+
+    // FIX (Issue G): Fix TP when entry is in breakeven mode.
+    // In breakeven mode, entry_price ≈ stop_loss so risk_dist ≈ 0–15pts.
+    // TP = tiny_dist × RR gives a target only 20-40pts away — VOL_CLIMAX fires before TP.
+    // Backtest uses zone_height × RR as the reward base in this situation. Mirror that here.
+    double zone_height = std::abs(zone.distal_line - zone.proximal_line);
+    {
+        double be_risk_dist = std::abs(decision.entry_price - decision.stop_loss);
+        if (be_risk_dist < zone_height * 0.25 && zone_height > 10.0) {
+            // Breakeven entry: re-anchor TP to zone_height × RR from entry
+            double rr_to_use = (decision.expected_rr > 0.5) ? decision.expected_rr
+                             : decision.score.recommended_rr;
+            if (rr_to_use < 1.0) rr_to_use = 1.5;
+            double new_reward = zone_height * rr_to_use;
+            double zone_anchored_tp = (direction == "LONG")
+                ? decision.entry_price + new_reward
+                : decision.entry_price - new_reward;
+            if (zone_anchored_tp > 0.0) {
+                effective_take_profit = zone_anchored_tp;
+                LOG_INFO("Breakeven TP re-anchored to zone_height: zone_h=" +
+                         std::to_string(zone_height) + "pts × RR=" +
+                         std::to_string(rr_to_use) + " = reward " +
+                         std::to_string(new_reward) + "pts → TP=" +
+                         std::to_string(zone_anchored_tp));
+                std::cout << "  Breakeven TP fix: zone_height=" << zone_height
+                          << "pts × RR=" << rr_to_use << " → TP=" << zone_anchored_tp << "\n";
+            }
+        }
+    }
+
     {
         double actual_fill_risk = std::abs(fill_price - decision.stop_loss) * position_size * config.lot_size;
         std::cout << "  Post-fill Cap Recheck:\n";
@@ -381,26 +496,61 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
                 config.max_loss_per_trade / (config.lot_size * fill_stop_dist));
 
             if (affordable_at_fill < 1) {
-                // ⭐ FIX: SL TIGHTENING — save the trade instead of squaring off.
+                // ⭐ FIX: REJECT-vs-TIGHTEN decision based on fill gap.
                 //
-                // Root cause: In breakeven entry mode, decision.entry_price is set to
-                // the zone's breakeven level (e.g. 25597.22), but the broker fills at
-                // the actual market price deeper inside the zone (e.g. 25511.50).
-                // The SL was correctly sized against the decision entry, but the real
-                // fill makes the actual SL distance slightly wider than the cap allows
-                // (e.g. 169 pts vs 153 pt cap — only 15 pts over).
+                // Analysis of 231 tightened trades (60% of all trades) showed:
+                //   • Gap (fill - intended entry): avg 50.4pts, range 15-93pts
+                //   • Tightened trade stats: 38.2% WR, 0.99× PF  ← breakeven drag
+                //   • Clean trade stats:     61.8% WR, 3.40× PF  ← real edge
+                //   • All 231 tightened trades combined: -₹1,626 loss
                 //
-                // Old behaviour: square off → trade completely lost (Rs0 outcome).
-                // New behaviour: tighten SL to exactly max_allowed_distance from fill
-                //               → trade proceeds at capped risk (Rs10,000 max).
+                // Root cause: bar.open gaps 30-93pts beyond the intended zone entry.
+                // The fill places entry deep inside the zone — SL ends up inside the
+                // zone's own noise buffer. R:R collapses. These trades destroy edge.
+                //
+                // Decision rule:
+                //   gap <= max_fill_slippage_pts → minor slippage → TIGHTEN (old path)
+                //   gap >  max_fill_slippage_pts → entry geometry violated → REJECT
                 //
                 // For SHORT: adjusted_sl = fill + max_sl_distance  (SL stays above fill)
                 // For LONG:  adjusted_sl = fill - max_sl_distance  (SL stays below fill)
                 //
+
+                // CHECK: Is the fill gap too large to salvage?
+                double fill_gap = std::abs(fill_price - decision.entry_price);
+                double max_gap  = config.max_fill_slippage_pts;  // default 25pts; 0=always tighten
+                if (max_gap > 0.0 && fill_gap > max_gap) {
+                    LOG_WARN("Post-fill REJECTED (fill too far from entry): fill=" +
+                             std::to_string(fill_price) + " intended=" +
+                             std::to_string(decision.entry_price) + " gap=" +
+                             std::to_string(fill_gap) + "pts > max=" +
+                             std::to_string(max_gap) + "pts — entry geometry violated");
+                    std::cout << "  ❌ POST-FILL REJECT: Fill " << std::fixed << std::setprecision(1)
+                              << fill_gap << "pts from intended entry (max=" << max_gap
+                              << "pts) — zone geometry violated, squaring off\n";
+                    std::cout.flush();
+                    std::string exit_dir = (direction == "LONG") ? "SELL" : "BUY";
+                    execute_exit(symbol, exit_dir, total_units, fill_price);
+                    return false;
+                }
+
+                // Gap is within tolerance — tighten SL (minor slippage path).
+                //
                 double max_sl_distance = config.max_loss_per_trade /
                                          (config.lot_size * static_cast<double>(position_size));
                 double adjusted_sl = 0.0;
-
+				
+				// ⭐ FIX: Respect min_stop_distance_points
+if (config.min_stop_distance_points > 0.0 && 
+    max_sl_distance < config.min_stop_distance_points) {
+    LOG_WARN("Post-fill REJECTED: Cannot honor both max_loss_per_trade and min_stop_distance_points");
+    std::cout << "  ❌ CONFLICT: max_loss allows " << max_sl_distance
+              << " pts but minimum is " << config.min_stop_distance_points << " pts\n";
+    std::string exit_dir = (direction == "LONG") ? "SELL" : "BUY";
+    execute_exit(symbol, exit_dir, total_units, fill_price);
+    return false;
+}
+				
                 if (direction == "LONG") {
                     adjusted_sl = fill_price - max_sl_distance;
                 } else {
@@ -436,6 +586,24 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
                 double tightened_by = std::abs(fill_price - old_sl) - max_sl_distance;
                 double new_risk     = max_sl_distance * config.lot_size * position_size;
                 effective_stop_loss = adjusted_sl;   // ← overrides decision.stop_loss for trade record
+
+                // ⭐ CRITICAL: Also recalculate take_profit using fill_price and adjusted SL.
+                // When decision.stop_loss was 0 (corrupt zone), decision.take_profit is also 0.
+                // check_take_profit (LONG: bar.high >= 0.0) fires IMMEDIATELY on next bar,
+                // exiting at price=0 for a catastrophic loss of Rs1.4M+
+                // Recalculate: use same R:R ratio, based on actual fill and new SL.
+                double rr_to_use = (decision.expected_rr > 0.1) ? decision.expected_rr
+                                 : decision.score.recommended_rr;
+                if (rr_to_use < 0.5) rr_to_use = 1.5;  // Minimum 1.5 R:R safety net
+                double new_reward = max_sl_distance * rr_to_use;
+                effective_take_profit = (direction == "LONG")
+                    ? fill_price + new_reward
+                    : fill_price - new_reward;
+
+                std::cout << "  ⭐ TP recalculated after SL rescue:\n"
+                          << "    Old TP: " << std::fixed << std::setprecision(2) << decision.take_profit
+                          << "  New TP: " << effective_take_profit
+                          << "  (fill=" << fill_price << " +/- " << new_reward << " pts)\n";
 
                 LOG_WARN("Post-fill SL TIGHTENED (cap rescue): fill=" + std::to_string(fill_price) +
                          " original_sl=" + std::to_string(old_sl) +
@@ -482,7 +650,7 @@ bool TradeManager::enter_trade(const EntryDecision& decision,
     current_trade.entry_date = bar.datetime;
     current_trade.entry_price = fill_price;
     current_trade.stop_loss = effective_stop_loss;
-    current_trade.take_profit = decision.take_profit;
+    current_trade.take_profit = effective_take_profit;  // uses recalculated TP if SL rescue fired
     current_trade.position_size = position_size;
     current_trade.zone_score = decision.score.total_score;
     current_trade.entry_aggressiveness = decision.entry_location_pct;
@@ -635,7 +803,10 @@ bool TradeManager::check_stop_loss(double current_price) const {
 // SHARED LOGIC: Check take profit (same for both modes)
 bool TradeManager::check_take_profit(const Bar& bar) const {
     if (!in_position) return false;
-    
+    // ⭐ SAFETY GUARD: Never trigger TP if take_profit is 0 or negative.
+    // A TP of 0 means it was never computed (corrupt zone / SL=0 chain).
+    // Without this guard: LONG bar.high >= 0.0 is ALWAYS TRUE → phantom TP exit at price=0.
+    if (current_trade.take_profit <= 0.0) return false;
     if (current_trade.direction == "LONG") {
         return (bar.high >= current_trade.take_profit);
     } else {
@@ -645,7 +816,8 @@ bool TradeManager::check_take_profit(const Bar& bar) const {
 
 bool TradeManager::check_take_profit(double current_price) const {
     if (!in_position) return false;
-    
+    // ⭐ SAFETY GUARD: Never trigger TP if take_profit is 0 or negative.
+    if (current_trade.take_profit <= 0.0) return false;
     if (current_trade.direction == "LONG") {
         return (current_price >= current_trade.take_profit);
     } else {
@@ -861,6 +1033,101 @@ TradeManager::OIExitSignal TradeManager::check_oi_exit_signals(
     // Future: Add OI_REVERSAL and OI_STAGNATION signals
     
     return OIExitSignal::NONE;
+}
+
+TradeManager::VolumeExhaustionSignal TradeManager::check_volume_exhaustion_signals(
+    const Trade& trade,
+    const Bar& current_bar,
+    const std::vector<Bar>& bars,
+    int current_index
+) const {
+    if (volume_baseline_ == nullptr || !volume_baseline_->is_loaded()) {
+        return VolumeExhaustionSignal::NONE;
+    }
+    
+    if (!config.v6_fully_enabled || !config.enable_volume_exhaustion_exit) {
+        return VolumeExhaustionSignal::NONE;
+    }
+    
+    double unrealized_pnl = 0.0;
+    if (trade.direction == "LONG") {
+        unrealized_pnl = (current_bar.close - trade.entry_price) * trade.position_size;
+    } else {
+        unrealized_pnl = (trade.entry_price - current_bar.close) * trade.position_size;
+    }
+    
+    if (unrealized_pnl >= 0) {
+        return VolumeExhaustionSignal::NONE;
+    }
+    
+    double loss_points = std::abs(unrealized_pnl) / trade.position_size;
+    std::string time_slot = extract_time_slot(current_bar.datetime);
+    double volume_ratio = volume_baseline_->get_normalized_ratio(time_slot, current_bar.volume);
+    double candle_body = std::abs(current_bar.close - current_bar.open);
+    double candle_range = current_bar.high - current_bar.low;
+    bool is_against_us = (trade.direction == "LONG") ? (current_bar.close < current_bar.open) : (current_bar.close > current_bar.open);
+    double atr = candle_range;
+    
+    if (volume_ratio >= config.vol_exhaustion_spike_min_ratio && is_against_us && candle_body > atr * config.vol_exhaustion_spike_min_body_atr) {
+        return VolumeExhaustionSignal::AGAINST_TREND_SPIKE;
+    }
+    
+    if (volume_ratio >= config.vol_exhaustion_absorption_min_ratio && candle_body < atr * config.vol_exhaustion_absorption_max_body_atr && unrealized_pnl < 0) {
+        return VolumeExhaustionSignal::ABSORPTION;
+    }
+    
+    if (bars.size() > 0 && current_index >= 5) {
+        int bars_against = 0;
+        int lookback = std::min(5, current_index);
+        for (int i = current_index - lookback; i < current_index; i++) {
+            if (i < 0 || i >= static_cast<int>(bars.size())) continue;
+            const Bar& bar = bars[i];
+            std::string slot = extract_time_slot(bar.datetime);
+            double vol_ratio = volume_baseline_->get_normalized_ratio(slot, bar.volume);
+            bool bar_against = (trade.direction == "LONG") ? (bar.close < bar.open) : (bar.close > bar.open);
+            if (vol_ratio > config.vol_exhaustion_flow_min_ratio && bar_against) {
+                bars_against++;
+            }
+        }
+        if (bars_against >= config.vol_exhaustion_flow_min_bars) {
+            return VolumeExhaustionSignal::FLOW_REVERSAL;
+        }
+    }
+    
+    if (volume_ratio < config.vol_exhaustion_drift_max_ratio && loss_points > atr * config.vol_exhaustion_drift_min_loss_atr) {
+        return VolumeExhaustionSignal::LOW_VOLUME_DRIFT;
+    }
+    
+    return VolumeExhaustionSignal::NONE;
+}
+
+bool TradeManager::should_exit_on_exhaustion(
+    VolumeExhaustionSignal signal,
+    const Trade& trade,
+    const Bar& current_bar
+) const {
+    if (signal == VolumeExhaustionSignal::NONE) {
+        return false;
+    }
+    
+    double current_loss_points = 0.0;
+    if (trade.direction == "LONG") {
+        current_loss_points = std::max(0.0, trade.entry_price - current_bar.close);
+    } else {
+        current_loss_points = std::max(0.0, current_bar.close - trade.entry_price);
+    }
+    
+    double sl_distance_points = std::abs(trade.entry_price - trade.stop_loss);
+    double loss_ratio = 0.0;
+    if (sl_distance_points > 0) {
+        loss_ratio = current_loss_points / sl_distance_points;
+    }
+    
+    if (loss_ratio < config.vol_exhaustion_max_loss_pct) {
+        LOG_INFO("VOL_EXHAUSTION: Exiting at " + std::to_string(loss_ratio * 100.0) + "% of SL");
+        return true;
+    }
+    return false;
 }
 
 std::string TradeManager::extract_time_slot(const std::string& datetime) const {

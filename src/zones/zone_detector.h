@@ -67,15 +67,19 @@ private:
     bool is_consolidation(int start_index, int length, double& high, double& low) const;
 
     /**
-     * Check for impulsive move before consolidation
-     * @param index Bar index to check before
+     * Check for impulsive move before consolidation.
+     * Measures the move ending at bars[index-1] (bar immediately before the base),
+     * looking back config.consolidation_min_bars bars.
+     * @param index First bar index of the consolidation base (loop variable 'i')
      * @return true if impulse detected
      */
     bool has_impulse_before(int index) const;
 
     /**
-     * Check for impulsive move after consolidation
-     * @param index Bar index to check after
+     * Check for impulsive move after consolidation.
+     * Measures the move starting at bars[index] (last bar of the base),
+     * looking forward config.consolidation_min_bars bars.
+     * @param index Last bar index of the consolidation base (i.e. i + len - 1)
      * @return true if impulse detected
      */
     bool has_impulse_after(int index) const;
@@ -150,10 +154,11 @@ public:
     void update_last_bar(const Bar& bar);
 
     /**
-     * Detect all valid zones in current bar data
+     * Detect all valid zones in current bar data.
+     * Delegates to detect_zones_no_duplicates with an empty existing zone list.
+     * @param start_bar_override If >= 0, scan from this bar index instead of the trailing window
      * @return Vector of detected zones
      */
-    // std::vector<Zone> detect_zones();
     std::vector<Zone> detect_zones(int start_bar_override = -1);
 
     /**

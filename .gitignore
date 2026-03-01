@@ -92,6 +92,8 @@ venv/
 env/
 
 # Data files (comment out if you want to commit data)
+data/
+data/**
 # data/*.csv
 # data/*.txt
 
