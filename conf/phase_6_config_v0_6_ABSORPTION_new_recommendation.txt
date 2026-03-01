@@ -72,8 +72,8 @@ only_fresh_zones = NO
 freshness_bars_threshold = 30
 # Block entries in last hour
 enable_entry_time_block = YES
-entry_block_start_time = 9:15  # No new entries after 2:30 PM
-entry_block_end_time = 9:30    # Market closes 3:30 PM
+entry_block_start_time = 09:15  # No new entries after 2:30 PM
+entry_block_end_time = 09:30    # Market closes 3:30 PM
 
 
 gap_over_invalidation = NO
@@ -315,8 +315,6 @@ rr_scale_with_score = YES
 trail_atr_multiplier = 0.70
 trail_ema_period = 9
 trail_use_hybrid = YES
-
-enable_entry_time_block = NO
 
 invalidate_on_body_close = NO
 max_zone_age_days = 980

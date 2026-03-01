@@ -4,6 +4,48 @@
 #include <sstream>
 #include <stdexcept>
 #include <algorithm>
+#include <cctype>
+#include <iomanip>
+#include <unordered_map>
+
+namespace {
+bool normalize_hhmm(const std::string& raw, std::string& normalized) {
+    std::string value = raw;
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), value.end());
+
+    size_t colon = value.find(':');
+    if (colon == std::string::npos) {
+        return false;
+    }
+
+    std::string hour_str = value.substr(0, colon);
+    std::string minute_str = value.substr(colon + 1);
+
+    if (hour_str.empty() || minute_str.empty() || hour_str.size() > 2 || minute_str.size() > 2) {
+        return false;
+    }
+
+    if (!std::all_of(hour_str.begin(), hour_str.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; }) ||
+        !std::all_of(minute_str.begin(), minute_str.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        return false;
+    }
+
+    int hour = std::stoi(hour_str);
+    int minute = std::stoi(minute_str);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return false;
+    }
+
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << hour
+        << ":"
+        << std::setw(2) << std::setfill('0') << minute;
+    normalized = oss.str();
+    return true;
+}
+}
 
 namespace SDTrading {
 namespace Core {
@@ -15,6 +57,7 @@ Config ConfigLoader::load_from_file(const std::string& filepath) {
 
 Config ConfigLoader::load_from_file(const std::string& filepath, std::string& error_message) {
     Config config;  // Start with defaults
+    std::unordered_map<std::string, int> seen_keys;
     
     std::ifstream file(filepath);
     if (!file.is_open()) {
@@ -37,6 +80,20 @@ Config ConfigLoader::load_from_file(const std::string& filepath, std::string& er
         if (line.empty() || line[0] == '#') {
             continue;
         }
+
+        size_t eq_pos = line.find('=');
+        if (eq_pos != std::string::npos) {
+            std::string key = trim(line.substr(0, eq_pos));
+            if (!key.empty()) {
+                auto it = seen_keys.find(key);
+                if (it != seen_keys.end()) {
+                    LOG_WARN("Duplicate configuration key '" << key
+                             << "' at line " << line_number
+                             << " overrides previous value from line " << it->second);
+                }
+                seen_keys[key] = line_number;
+            }
+        }
         
         try {
             parse_line(line, config);
@@ -46,6 +103,18 @@ Config ConfigLoader::load_from_file(const std::string& filepath, std::string& er
     }
     
     file.close();
+
+    if (config.enable_entry_time_block) {
+        if (config.entry_block_start_time.empty() || config.entry_block_end_time.empty()) {
+            error_message = "Entry time block enabled, but start/end time is missing";
+            throw std::runtime_error(error_message);
+        }
+        if (config.entry_block_start_time >= config.entry_block_end_time) {
+            error_message = "Invalid entry block window: start time must be earlier than end time (" +
+                           config.entry_block_start_time + " >= " + config.entry_block_end_time + ")";
+            throw std::runtime_error(error_message);
+        }
+    }
     
     // Validate configuration
     if (!config.validate()) {
@@ -487,9 +556,23 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
     } else if (key == "enable_entry_time_block") {
         config.enable_entry_time_block = parse_bool(value);
     } else if (key == "entry_block_start_time") {
-        config.entry_block_start_time = value;
+        std::string normalized;
+        if (!normalize_hhmm(value, normalized)) {
+            throw std::runtime_error("Invalid entry_block_start_time '" + value + "' (expected HH:MM, 24-hour format)");
+        }
+        if (normalized != value) {
+            LOG_WARN("Normalized entry_block_start_time from '" << value << "' to '" << normalized << "'");
+        }
+        config.entry_block_start_time = normalized;
     } else if (key == "entry_block_end_time") {
-        config.entry_block_end_time = value;
+        std::string normalized;
+        if (!normalize_hhmm(value, normalized)) {
+            throw std::runtime_error("Invalid entry_block_end_time '" + value + "' (expected HH:MM, 24-hour format)");
+        }
+        if (normalized != value) {
+            LOG_WARN("Normalized entry_block_end_time from '" << value << "' to '" << normalized << "'");
+        }
+        config.entry_block_end_time = normalized;
     }
     // Position Sizing
     else if (key == "lot_size") {
