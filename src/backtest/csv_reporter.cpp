@@ -32,7 +32,7 @@ std::string CSVReporter::sanitize_csv(const std::string& str) const {
 void CSVReporter::write_trade_header(std::ofstream& file) const {
         file << "Trade#,Direction,Entry Date,Exit Date,Entry Price,Exit Price," 
             << "Stop Loss,Take Profit,Position Size,Risk Amount,Reward Amount," 
-            << "P&L,Return %,Exit Reason,Zone ID,Zone Score,Base Strength,Elite Bonus," 
+            << "P&L,Return %,Bars in Trade,Exit Reason,Zone ID,Zone Score,Base Strength,Elite Bonus," 
             << "Swing Score,Regime Score,State Freshness,Rejection Score," 
             << "Recommended RR,Score Rationale,Aggressiveness," 
             << "Regime,Zone Formation,Zone Distal,Zone Proximal," 
@@ -58,6 +58,7 @@ void CSVReporter::write_trade_row(std::ofstream& file, const Trade& trade) const
             << trade.reward_amount << "," 
             << trade.pnl << "," 
             << std::setprecision(2) << trade.return_pct << "," 
+            << trade.bars_in_trade << ","
             << sanitize_csv(trade.exit_reason) << "," 
             << trade.zone_id << "," 
             << std::setprecision(2) << trade.zone_score << "," 

@@ -95,37 +95,6 @@ bool is_zone_age_blocked(const Zone& zone, const Bar& current_bar, const Config&
     return false;
 }
 
-MarketPhase parse_market_phase_value(const Json::Value& phase_val) {
-    if (phase_val.isInt()) {
-        int value = phase_val.asInt();
-        if (value >= static_cast<int>(MarketPhase::LONG_BUILDUP) &&
-            value <= static_cast<int>(MarketPhase::NEUTRAL)) {
-            return static_cast<MarketPhase>(value);
-        }
-        return MarketPhase::NEUTRAL;
-    }
-
-    if (phase_val.isString()) {
-        const std::string phase_str = phase_val.asString();
-        if (phase_str == "LONG_BUILDUP") return MarketPhase::LONG_BUILDUP;
-        if (phase_str == "SHORT_COVERING") return MarketPhase::SHORT_COVERING;
-        if (phase_str == "SHORT_BUILDUP") return MarketPhase::SHORT_BUILDUP;
-        if (phase_str == "LONG_UNWINDING") return MarketPhase::LONG_UNWINDING;
-        if (phase_str == "NEUTRAL") return MarketPhase::NEUTRAL;
-
-        try {
-            int value = std::stoi(phase_str);
-            if (value >= static_cast<int>(MarketPhase::LONG_BUILDUP) &&
-                value <= static_cast<int>(MarketPhase::NEUTRAL)) {
-                return static_cast<MarketPhase>(value);
-            }
-        } catch (...) {
-        }
-    }
-
-    return MarketPhase::NEUTRAL;
-}
-
 }  // namespace
 
 LiveEngine::LiveEngine(
@@ -374,8 +343,10 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
     if (col_count == 11) {
         LOG_INFO("✅ CSV format validated: 11 columns (V6.0 compatible with OI metadata)");
     } else {
-        LOG_WARN("⚠️ CSV format: 9 columns (legacy format - applying hardcoded OI_Fresh=1, OI_Age_Seconds=0)");
+        LOG_WARN("⚠️ CSV format: 9 columns (legacy format - V6.0 OI features degraded)");
     }
+    
+    bool has_oi_metadata = (col_count == 11);
     
     int line_num = 1;
     while (std::getline(file, line)) {
@@ -400,8 +371,16 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
                     case 6: bar.close = std::stod(field); break;
                     case 7: bar.volume = static_cast<double>(std::stoll(field)); break;
                     case 8: bar.oi = static_cast<double>(std::stoll(field)); break;
-                    case 9: break;
-                    case 10: break;
+                    case 9: // OI_Fresh (V6.0 only)
+                        if (has_oi_metadata) {
+                            bar.oi_fresh = (std::stoi(field) == 1);
+                        }
+                        break;
+                    case 10: // OI_Age_Seconds (V6.0 only)
+                        if (has_oi_metadata) {
+                            bar.oi_age_seconds = std::stoi(field);
+                        }
+                        break;
                 }
             } catch (const std::exception& e) {
                 LOG_WARN("Failed to parse field at line " << line_num << ", col " << col << ": " << e.what());
@@ -409,9 +388,7 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
             col++;
         }
         
-        if (col >= 9) {  // Valid bar with all required fields (through OI column)
-            bar.oi_fresh = true;
-            bar.oi_age_seconds = 0;
+        if (col >= 8) {  // Valid bar with all required fields
             bars.push_back(bar);
         } else if (col > 0) {
             LOG_WARN("Skipping incomplete line " << line_num << " (only " << col << " fields)");
@@ -425,11 +402,7 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
     // to ensure comprehensive zone detection and more trade opportunities.
     
     LOG_INFO("CSV file closed: " << csv_path);
-    if (bars.empty()) {
-        LOG_WARN("Loaded 0 bars from CSV after parsing rows");
-    } else {
-        LOG_INFO("Loaded " << bars.size() << " bars (from " << bars.front().datetime << " to " << bars.back().datetime << ")");
-    }
+    LOG_INFO("Loaded " << bars.size() << " bars (from " << bars.front().datetime << " to " << bars.back().datetime << ")");
     return bars;
 }
 
@@ -714,40 +687,35 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
             
             // ✅ BUG #144 FIX: Update volume/OI profiles with FRESH data on zone touch
             // CRITICAL: Only if V6 metrics were properly loaded (have valid baselines)
-            if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
-                int profile_bar_idx = zone.formation_bar;
-                if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bar_history.size())) {
-                    // Recalculate profiles anchored to ORIGINAL formation bar (not touch bar)
-                    zone.volume_profile = volume_scorer_->calculate_volume_profile(
-                        zone,
-                        bar_history,
-                        profile_bar_idx
-                    );
-                    
-                    zone.oi_profile = oi_scorer_->calculate_oi_profile(
-                        zone,
-                        bar_history,
-                        profile_bar_idx
-                    );
-                    
-                    // Recalculate institutional index (from Utils namespace)
-                    zone.institutional_index = Utils::calculate_institutional_index(
-                        zone.volume_profile,
-                        zone.oi_profile
-                    );
-                    
-                    LOG_INFO("🔄 Zone " << zone.zone_id << " profiles UPDATED on touch"
-                            << " | anchor_bar: " << profile_bar_idx
-                            << " | Vol ratio: " << std::fixed << std::setprecision(2)
-                            << zone.volume_profile.departure_volume_ratio
-                            << " | OI change: " << zone.oi_profile.oi_change_during_formation
-                            << " | Inst idx: " << zone.institutional_index);
-                } else {
-                    LOG_WARN("⚠️ Zone " << zone.zone_id << " has invalid formation_bar="
-                             << zone.formation_bar << " (history size=" << bar_history.size()
-                             << "), skipping profile update on touch");
-                }
-            } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline == 0.0) {
+            if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base > 0.0) {
+                int current_idx = static_cast<int>(bar_history.size()) - 1;
+                
+                // Recalculate volume profile with current data
+                zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                    zone,
+                    bar_history,
+                    current_idx
+                );
+                
+                // Recalculate OI profile with current data
+                zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                    zone,
+                    bar_history,
+                    current_idx
+                );
+                
+                // Recalculate institutional index (from Utils namespace)
+                zone.institutional_index = Utils::calculate_institutional_index(
+                    zone.volume_profile,
+                    zone.oi_profile
+                );
+                
+                LOG_INFO("🔄 Zone " << zone.zone_id << " profiles UPDATED on touch"
+                        << " | Vol ratio: " << std::fixed << std::setprecision(2) 
+                        << zone.volume_profile.departure_volume_ratio
+                        << " | OI change: " << zone.oi_profile.oi_change_during_formation
+                        << " | Inst idx: " << zone.institutional_index);
+            } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base == 0.0) {
                 LOG_WARN("⚠️ Zone " << zone.zone_id << " has corrupted V6 baseline (avg_volume=0), skipping profile update");
             }
         }
@@ -922,37 +890,31 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
                         
                         // ✅ BUG #144 FIX: Update profiles on RECLAIM with fresh institutional data
                         // CRITICAL: Only if V6 metrics were properly loaded (have valid baselines)
-                        if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
-                            int profile_bar_idx = zone.formation_bar;
-                            if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bar_history.size())) {
-                                zone.volume_profile = volume_scorer_->calculate_volume_profile(
-                                    zone,
-                                    bar_history,
-                                    profile_bar_idx
-                                );
-                                
-                                zone.oi_profile = oi_scorer_->calculate_oi_profile(
-                                    zone,
-                                    bar_history,
-                                    profile_bar_idx
-                                );
-                                
-                                zone.institutional_index = Utils::calculate_institutional_index(
-                                    zone.volume_profile,
-                                    zone.oi_profile
-                                );
-                                
-                                LOG_INFO("🔄 Zone " << zone.zone_id << " profiles UPDATED on RECLAIM"
-                                        << " | anchor_bar: " << profile_bar_idx
-                                        << " | Vol climax: " << (zone.volume_profile.has_volume_climax ? "YES" : "NO")
-                                        << " | OI change: " << std::fixed << std::setprecision(0) << zone.oi_profile.oi_change_during_formation
-                                        << " | Inst idx: " << std::fixed << std::setprecision(2) << zone.institutional_index);
-                            } else {
-                                LOG_WARN("⚠️ Zone " << zone.zone_id << " has invalid formation_bar="
-                                         << zone.formation_bar << " (history size=" << bar_history.size()
-                                         << "), skipping profile update on RECLAIM");
-                            }
-                        } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline == 0.0) {
+                        if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base > 0.0) {
+                            int current_idx = static_cast<int>(bar_history.size()) - 1;
+                            
+                            zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                                zone,
+                                bar_history,
+                                current_idx
+                            );
+                            
+                            zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                                zone,
+                                bar_history,
+                                current_idx
+                            );
+                            
+                            zone.institutional_index = Utils::calculate_institutional_index(
+                                zone.volume_profile,
+                                zone.oi_profile
+                            );
+                            
+                            LOG_INFO("🔄 Zone " << zone.zone_id << " profiles UPDATED on RECLAIM"
+                                    << " | Vol climax: " << (zone.volume_profile.has_volume_climax ? "YES" : "NO")
+                                    << " | OI change: " << std::fixed << std::setprecision(0) << zone.oi_profile.oi_change_during_formation
+                                    << " | Inst idx: " << std::fixed << std::setprecision(2) << zone.institutional_index);
+                        } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base == 0.0) {
                             LOG_WARN("⚠️ Zone " << zone.zone_id << " has corrupted V6 baseline on RECLAIM, skipping profile update");
                         }
                         
@@ -1230,31 +1192,24 @@ void LiveEngine::replay_historical_zone_states() {
                             
                             // ✅ BUG #144 FIX: Update profiles on RECLAIM (replay mode)
                             // CRITICAL: Only if V6 metrics were properly loaded (have valid baselines)
-                            if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
-                                int profile_bar_idx = zone.formation_bar;
-                                if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bar_history.size())) {
-                                    zone.volume_profile = volume_scorer_->calculate_volume_profile(
-                                        zone,
-                                        bar_history,
-                                        profile_bar_idx
-                                    );
-                                    
-                                    zone.oi_profile = oi_scorer_->calculate_oi_profile(
-                                        zone,
-                                        bar_history,
-                                        profile_bar_idx
-                                    );
-                                    
-                                    zone.institutional_index = Utils::calculate_institutional_index(
-                                        zone.volume_profile,
-                                        zone.oi_profile
-                                    );
-                                } else {
-                                    LOG_WARN("⚠️ Zone " << zone.zone_id << " has invalid formation_bar="
-                                             << zone.formation_bar << " (history size=" << bar_history.size()
-                                             << "), skipping profile update in replay RECLAIM");
-                                }
-                            } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline == 0.0) {
+                            if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base > 0.0) {
+                                zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                                    zone,
+                                    bar_history,
+                                    i
+                                );
+                                
+                                zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                                    zone,
+                                    bar_history,
+                                    i
+                                );
+                                
+                                zone.institutional_index = Utils::calculate_institutional_index(
+                                    zone.volume_profile,
+                                    zone.oi_profile
+                                );
+                            } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_in_base == 0.0) {
                                 LOG_WARN("⚠️ Zone " << zone.zone_id << " has corrupted V6 baseline in replay RECLAIM, skipping profile update");
                             }
                             
@@ -1400,11 +1355,20 @@ bool LiveEngine::try_load_backtest_zones() {
             zone.oi_profile.price_oi_correlation = op.get("price_oi_correlation", 0.0).asDouble();
             zone.oi_profile.oi_data_quality = op.get("oi_data_quality", false).asBool();
 
+            int market_phase = 0;
             if (op.isMember("market_phase")) {
-                zone.oi_profile.market_phase = parse_market_phase_value(op["market_phase"]);
-            } else {
-                zone.oi_profile.market_phase = MarketPhase::NEUTRAL;
+                const Json::Value& mp = op["market_phase"];
+                if (mp.isInt()) {
+                    market_phase = mp.asInt();
+                } else if (mp.isString()) {
+                    try {
+                        market_phase = std::stoi(mp.asString());
+                    } catch (...) {
+                        market_phase = 0;
+                    }
+                }
             }
+            zone.oi_profile.market_phase = static_cast<MarketPhase>(market_phase);
             zone.oi_profile.oi_score = op.get("oi_score", 0.0).asDouble();
         }
 

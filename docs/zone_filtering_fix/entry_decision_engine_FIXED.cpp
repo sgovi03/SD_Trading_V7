@@ -7,10 +7,7 @@
 #include "entry_validation_scorer.h"
 #include "../utils/volume_baseline.h"
 #include "oi_scorer.h"
-#include <chrono>
-#include <sstream>
-#include <iomanip>
-#include <ctime>
+
 
 // All method definitions must be outside the namespace block, but use full namespace qualification
 
@@ -468,21 +465,6 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
     return decision;
 }
 
-
-
-std::time_t parse_datetime_to_time_t(const std::string& dt)
-{
-    std::tm tm = {};
-    std::istringstream ss(dt);
-    ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-
-    if (ss.fail()) {
-        return 0;  // handle parse failure safely
-    }
-
-    return std::mktime(&tm);  // converts to time_t (local time)
-}
-
 bool EntryDecisionEngine::should_enter_trade_two_stage(
     const Zone& zone,
     const std::vector<Bar>& bars,
@@ -518,15 +500,9 @@ bool EntryDecisionEngine::should_enter_trade_two_stage(
         curr_ss >> std::get_time(&current_tm, "%Y-%m-%d %H:%M:%S");
         
         if (!form_ss.fail() && !curr_ss.fail()) {
-            std::time_t current_time = std::mktime(&current_tm);
-            std::time_t zone_time = parse_datetime_to_time_t(zone.formation_datetime);
-
-            auto current_tp = std::chrono::system_clock::from_time_t(current_time);
-            auto zone_tp = std::chrono::system_clock::from_time_t(zone_time);
-
-            auto diff = current_tp - zone_tp;
-
-            auto age_hours = std::chrono::duration_cast<std::chrono::hours>(diff).count();
+            auto formation_time = std::chrono::system_clock::from_time_t(std::mktime(&formation_tm));
+            auto current_time = std::chrono::system_clock::from_time_t(std::mktime(&current_tm));
+            auto age_hours = std::chrono::duration_cast<std::chrono::hours>(current_time - formation_time).count();
             int age_days = static_cast<int>(age_hours / 24);
             
             // Check minimum age

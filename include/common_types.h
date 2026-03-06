@@ -931,10 +931,15 @@ public:
     //   - 45-60d zones: 25% WR, -₹1,554/trade
     // Fresh zones work: <7d: 66.7% WR, +₹950/trade
     int min_zone_age_days = 0;                   // ⭐ NEW: Minimum zone age (0 = no min)
-    int max_zone_age_days = 30;                  // ⭐ NEW: Maximum zone age (30 days)
-                                                 // Blocks toxic 30-60d range
-    bool exclude_zone_age_range = true;          // ⭐ NEW: Enable age range exclusion
+    int max_zone_age_days = 60;                  // ⭐ FIXED: Maximum zone age (60 days, was 30)
+                                                 // Blocks stale zones
+    bool exclude_zone_age_range = false;         // ⭐ DISABLED: Not needed with max_zone_age
     int exclude_zone_age_start = 30;             // ⭐ NEW: Start of exclusion (30 days)
+    
+    // Zone State Filtering (CRITICAL FIX for Run 2 issue)
+    bool skip_violated_zones = true;             // ⭐ NEW: Don't trade VIOLATED zones
+    bool skip_tested_zones = false;              // ⭐ NEW: Optionally skip TESTED zones (usually NO)
+    bool prefer_fresh_zones = true;              // ⭐ NEW: Prioritize FRESH over TESTED
     int exclude_zone_age_end = 60;               // ⭐ NEW: End of exclusion (60 days)
 
     int zone_max_age_days = 90;
@@ -1085,7 +1090,7 @@ public:
           trail_activation_rr(1.5),
           trail_ema_period(20),
           trail_ema_buffer_pct(0.2),
-          trail_atr_multiplier(2.0),
+          trail_atr_multiplier(1.0),
           trail_use_hybrid(true),
           trail_fallback_tp_rr(5.0),
           max_consecutive_losses(4),
