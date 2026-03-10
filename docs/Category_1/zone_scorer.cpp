@@ -160,17 +160,16 @@ ZoneScore ZoneScorer::evaluate_zone(const Zone& zone, MarketRegime regime, const
     score.rejection_confirmation_score = calculate_rejection_score(zone, current_bar);
     
     // === BUG #152 FIX: ADD VOLUME AND INSTITUTIONAL SCORES ===
-    // Volume profile contribution (max 25 points) 
-	/*
+    // Volume profile contribution (max 25 points)
     double volume_max = config.scoring.weight_volume_profile * 100.0;
     score.volume_profile_score = (zone.volume_profile.volume_score / 100.0) * volume_max;
     
     // Institutional participation contribution (max 15 points)
     double inst_max = config.scoring.weight_institutional * 100.0;
     score.institutional_score = (zone.institutional_index / 100.0) * inst_max;
-    */
+    
     // Calculate composite score (calls method defined in common_types.h)
-    //score.calculate_composite();
+    score.calculate_composite();
     score.calculate_composite();
     
     // Calculate recommended risk/reward ratio

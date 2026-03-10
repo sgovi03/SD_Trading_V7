@@ -168,10 +168,13 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
     LOG_INFO("  enable_volume_entry_filters: " + std::string(config.enable_volume_entry_filters ? "YES" : "NO"));
     LOG_INFO("  min_entry_volume_ratio: " + std::to_string(config.min_entry_volume_ratio));
 
-    // Initialize to safe default. Dynamic sizing is applied after entry/SL are computed.
+    // Force position sizing to always execute (with default if needed)
     decision.lot_size = 1; // Safe default
-    if (current_bar == nullptr) {
-        LOG_WARN("Using default position size (current_bar is nullptr)");
+    if (current_bar != nullptr && volume_baseline_ != nullptr) {
+        decision.lot_size = calculate_dynamic_lot_size(zone, *current_bar);
+        LOG_INFO("V6 position sizing used: " + std::to_string(decision.lot_size));
+    } else {
+        LOG_WARN("Using default position size (current_bar or baseline nullptr)");
     }
 
     // THEN do validations
@@ -442,18 +445,12 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
     
     // ✅ NEW V6.0: Dynamic position sizing
     if (current_bar != nullptr) {
-        decision.lot_size = calculate_dynamic_lot_size(
-            zone,
-            *current_bar,
-            decision.entry_price,
-            decision.stop_loss
-        );
-        LOG_INFO("V6 position sizing used: " + std::to_string(decision.lot_size));
+        decision.lot_size = calculate_dynamic_lot_size(zone, *current_bar);
     }
 
     // === BUG #153 FIX: PENETRATION DEPTH CHECK ===
     // Reject entries that are too deep into the zone (>50%)
-   /* if (current_bar != nullptr) {
+    if (current_bar != nullptr) {
         double zone_range = std::abs(zone.distal_line - zone.proximal_line);
         double penetration = 0.0;
         
@@ -473,7 +470,7 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
             return decision;
         }
     }
-  */
+
     // === VOLUME METRICS: Calculate and store pullback/pattern metrics ===
     if (current_bar != nullptr && bar_history != nullptr) {
         EntryVolumeMetrics metrics = calculate_entry_volume_metrics(zone, *current_bar, *bar_history);
@@ -491,32 +488,32 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
         }
     }
     
-    // === GAP #155 FIX: ACTIVE VOLUME/INSTITUTIONAL PENALTIES (LOWERED THRESHOLDS) ===
-    // Lowered from strict institutional-grade to match actual data quality
-    /*if (zone.volume_profile.volume_score < 0) {  // Lowered from 20 to 0
+    // === GAP #155 FIX: ACTIVE VOLUME/INSTITUTIONAL PENALTIES ===
+    // Apply penalties for weak institutional participation
+    if (zone.volume_profile.volume_score < 20) {
         decision.should_enter = false;
-        decision.rejection_reason = "Volume score negative (" + 
-            std::to_string(static_cast<int>(zone.volume_profile.volume_score)) + " < 0)";
+        decision.rejection_reason = "Weak zone volume score (" + 
+            std::to_string(static_cast<int>(zone.volume_profile.volume_score)) + " < 20)";
         LOG_INFO("VOLUME PENALTY REJECTED: " + decision.rejection_reason);
         return decision;
     }
     
-    if (zone.institutional_index < 10) {  // Lowered from 40 to 10
+    if (zone.institutional_index < 40) {
         decision.should_enter = false;
         decision.rejection_reason = "Low institutional participation (" + 
-            std::to_string(static_cast<int>(zone.institutional_index)) + " < 10)";
+            std::to_string(static_cast<int>(zone.institutional_index)) + " < 40)";
         LOG_INFO("INSTITUTIONAL PENALTY REJECTED: " + decision.rejection_reason);
         return decision;
     }
     
-    if (zone.volume_profile.departure_volume_ratio < 0.6) {  // Lowered from 1.3 to 0.6
+    if (zone.volume_profile.departure_volume_ratio < 1.3) {
         decision.should_enter = false;
         decision.rejection_reason = "Weak departure volume (" + 
-            std::to_string(zone.volume_profile.departure_volume_ratio) + "x < 0.6x)";
+            std::to_string(zone.volume_profile.departure_volume_ratio) + "x < 1.3x)";
         LOG_INFO("DEPARTURE PENALTY REJECTED: " + decision.rejection_reason);
         return decision;
     }
-    */
+
     return decision;
 }
 
@@ -829,29 +826,10 @@ bool EntryDecisionEngine::validate_entry_oi(
 
 int EntryDecisionEngine::calculate_dynamic_lot_size(
     const Zone& zone,
-    const Bar& current_bar,
-    double entry_price,
-    double stop_loss
+    const Bar& current_bar
 ) const {
-    (void)current_bar; // Position sizing uses zone-level features + computed trade geometry
-
-    int base_position = 1;  // Safe fallback
+    int base_position = 1;  // Default: 1 contract
     double multiplier = 1.0;
-
-    // Base lots from risk budget: lots = floor(max_loss / (lot_size * stop_distance))
-    double stop_distance = std::abs(entry_price - stop_loss);
-    if (stop_distance > 0.0 && config.lot_size > 0 && config.max_loss_per_trade > 0.0) {
-        double raw_base = config.max_loss_per_trade /
-                          (static_cast<double>(config.lot_size) * stop_distance);
-        base_position = std::max(1, static_cast<int>(std::floor(raw_base)));
-    } else {
-        std::ostringstream oss;
-        oss << "V6 Position sizing fallback: invalid stop_distance/lot_size/max_loss"
-            << " (stop_distance=" << stop_distance
-            << ", lot_size=" << config.lot_size
-            << ", max_loss_per_trade=" << config.max_loss_per_trade << ")";
-        LOG_WARN(oss.str());
-    }
 
     // ✅ USE ZONE-LEVEL VOLUME (not bar-level!)
     double zone_volume_ratio = zone.volume_profile.volume_ratio;
@@ -894,12 +872,11 @@ int EntryDecisionEngine::calculate_dynamic_lot_size(
     }
     
     int final_position = static_cast<int>(std::round(base_position * multiplier));
-    int max_lots = std::max(1, config.max_lot_size);
-    final_position = std::max(1, std::min(final_position, max_lots));
+    // Enforce safety limits (min 1, max 3 contracts)
+    final_position = std::max(1, std::min(final_position, 3));
 
     LOG_INFO("V6 Position sizing: Base=" + std::to_string(base_position) +
-             " contracts, StopDist=" + std::to_string(stop_distance) +
-             " pts, Multiplier=" + std::to_string(multiplier) +
+             " contracts, Multiplier=" + std::to_string(multiplier) +
              ", Final=" + std::to_string(final_position) + " contracts");
 
     return final_position;

@@ -2474,6 +2474,8 @@ void LiveEngine::manage_position() {
     std::cout << "  Direction:   " << trade.direction << "\n";
     std::cout << "  Entry Price: " << std::fixed << std::setprecision(2) << trade.entry_price << "\n";
     std::cout << "  Entry Date:  " << trade.entry_date << "\n";
+    std::cout << "  Position Size: " << trade.position_size << " lot(s)"
+              << " (Qty: " << (trade.position_size * config.lot_size) << ")\n";
     std::cout << "  Bars in Trade: " << trade.bars_in_trade << "\n";  // ⭐ NEW: Show bars
     std::cout << "  Current Price: " << current_price << "\n";
     std::cout << "  Stop Loss:   " << trade.stop_loss;

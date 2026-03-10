@@ -87,7 +87,9 @@ private:
     // V6.0: Dynamic position sizing
     int calculate_dynamic_lot_size(
         const Zone& zone,
-        const Bar& current_bar
+        const Bar& current_bar,
+        double entry_price,
+        double stop_loss
     ) const;
     
     // V6.0: Extract time slot from datetime
