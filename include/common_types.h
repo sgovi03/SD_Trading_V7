@@ -231,6 +231,8 @@ struct ZoneScore {
     double regime_alignment_score;
     double state_freshness_score;
     double rejection_confirmation_score;
+    double volume_profile_score;      // NEW - Bug #152 fix
+    double institutional_score;       // NEW - Bug #152 fix
     double total_score;
     double entry_aggressiveness;
     double recommended_rr;
@@ -241,12 +243,14 @@ struct ZoneScore {
         : base_strength_score(0), elite_bonus_score(0),
           swing_position_score(0), regime_alignment_score(0),
           state_freshness_score(0), rejection_confirmation_score(0),
+          volume_profile_score(0), institutional_score(0),
           total_score(0), entry_aggressiveness(0), recommended_rr(2.0) {}
     
     void calculate_composite() {
         total_score = base_strength_score + elite_bonus_score +
                      swing_position_score + regime_alignment_score +
-                     state_freshness_score + rejection_confirmation_score;
+                     state_freshness_score + rejection_confirmation_score +
+                     volume_profile_score + institutional_score;
         
         entry_aggressiveness = total_score / 100.0;
         
@@ -258,6 +262,8 @@ struct ZoneScore {
             << " Regime:" << regime_alignment_score
             << " State:" << state_freshness_score
             << " Reject:" << rejection_confirmation_score
+            << " Vol:" << volume_profile_score
+            << " Inst:" << institutional_score
             << " = " << total_score;
         score_breakdown = oss.str();
     }
@@ -336,6 +342,8 @@ struct ScoringConfig {
     double weight_regime_alignment;
     double weight_state_freshness;
     double weight_rejection_confirmation;
+    double weight_volume_profile;        // NEW - volume/OI contribution
+    double weight_institutional;         // NEW - institutional participation
     
     // Entry decision thresholds
     double entry_minimum_score;
@@ -360,11 +368,13 @@ struct ScoringConfig {
     int max_zone_touch_count;
     
     ScoringConfig()
-        : weight_base_strength(0.40),
-          weight_elite_bonus(0.25),
-          weight_regime_alignment(0.20),
+        : weight_base_strength(0.20),      // Reduced from 0.40 - structure less important
+          weight_elite_bonus(0.15),        // Reduced from 0.25 - structure less important
+          weight_regime_alignment(0.10),   // Reduced from 0.20 - trend less critical
           weight_state_freshness(0.10),
           weight_rejection_confirmation(0.05),
+          weight_volume_profile(0.25),     // NEW - volume/OI important
+          weight_institutional(0.15),      // NEW - institutional participation important
           entry_minimum_score(30.0),
           entry_optimal_score(70.0),
           rr_base_ratio(2.0),
@@ -381,7 +391,8 @@ struct ScoringConfig {
     bool validate() const {
         double weight_sum = weight_base_strength + weight_elite_bonus +
                           weight_regime_alignment + weight_state_freshness +
-                          weight_rejection_confirmation;
+                          weight_rejection_confirmation + weight_volume_profile +
+                          weight_institutional;
         
         if (std::abs(weight_sum - 1.0) > 0.01) {
             std::cerr << "❌ ERROR: Scoring weights must sum to 1.0 (current: "
@@ -562,7 +573,7 @@ public:
             std::string entry_block_start_time; // e.g. "09:15"
             std::string entry_block_end_time;   // e.g. "09:45"
         // Entry Volume Score Filter (V6.0)
-        int min_volume_entry_score = -50;  // -50 = off (all pass); raise to 10+ to activate
+        int min_volume_entry_score = 10;  // Activated - reject entries with volume score < 10
     // Capital & Risk
     double starting_capital;
     double risk_per_trade_pct;
