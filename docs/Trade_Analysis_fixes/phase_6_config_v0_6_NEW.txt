@@ -385,7 +385,7 @@ departure_volume_normal_ratio = 1.2
 # After zone_consecutive_loss_max SL losses from the same zone, mark it EXHAUSTED.
 # Prevents re-entering a "burnt" zone until a TP win resets it.
 # Evidence: Zone 25 = -₹29,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
-enable_zone_exhaustion    = NO
+enable_zone_exhaustion    = YES
 zone_consecutive_loss_max = 1     # Block after 2nd consecutive SL loss
 
 # Priority 2: ADX transition-zone position size reduction

@@ -1440,7 +1440,6 @@ bool LiveEngine::try_load_backtest_zones() {
         return false;
     }
 
-    
     next_zone_id_ = root.get("next_zone_id", next_zone_id_).asInt();
 
     // Clear state history from loaded zones if disabled
@@ -1448,30 +1447,6 @@ bool LiveEngine::try_load_backtest_zones() {
         LOG_INFO("Clearing state history from loaded zones (state history disabled)");
         for (auto& zone : active_zones) {
             zone.state_history.clear();
-        }
-    }
-
-    // ⭐ BUG FIX: Reset EXHAUSTED state on load when enable_zone_exhaustion = NO
-    // Problem: zones_live_master.json persists EXHAUSTED state and consecutive_losses
-    // from prior runs. When the flag is disabled, the skip gate doesn't fire, but
-    // the stale EXHAUSTED state still causes zone cascade effects (altered zone
-    // ranking, different downstream detections). Fix: clear exhaustion metadata
-    // on load so the zone pool is fully clean when the feature is disabled.
-    if (!config.enable_zone_exhaustion) {
-        int reset_count = 0;
-        for (auto& zone : active_zones) {
-            if (zone.state == ZoneState::EXHAUSTED || zone.consecutive_losses > 0) {
-                if (zone.state == ZoneState::EXHAUSTED) {
-                    zone.state = ZoneState::TESTED;  // Restore to last valid state
-                }
-                zone.consecutive_losses   = 0;
-                zone.exhausted_at_datetime = "";
-                reset_count++;
-            }
-        }
-        if (reset_count > 0) {
-            LOG_INFO("⚠️  enable_zone_exhaustion=NO: reset " << reset_count
-                     << " zone(s) from EXHAUSTED/dirty state on load");
         }
     }
 
@@ -1856,31 +1831,6 @@ std::stable_sort(active_zones.begin(), active_zones.end(),
         return;
     }
 
-    // === SAME-SESSION RE-ENTRY GUARD: Clear stale entries from PRIOR trading day ===
-    // CRITICAL: last_guard_date must be initialised to today on first bar, NOT empty-string.
-    // If initialised to "" then the very first bar of any new date triggers a clear —
-    // including the SAME date the guard was just set on, wiping it before the next
-    // entry check runs. e.g. Guard set on Sep-05 13:10, cleared at Sep-05 13:15,
-    // Trade 8 enters freely at Sep-05 13:30.
-    {
-        const std::string today = bar_history.back().datetime.substr(0, 10);
-        static std::string last_guard_date = "";
-        if (last_guard_date.empty()) {
-            // First bar ever — initialise silently, nothing to clear yet
-            last_guard_date = today;
-        } else if (today != last_guard_date) {
-            // Genuine new trading day — expire all prior-session blocks
-            if (!zone_sl_session_.empty()) {
-                LOG_INFO("[RE-ENTRY GUARD] New session " << today
-                         << " — clearing " << zone_sl_session_.size()
-                         << " blocked zone(s) from prior session");
-                zone_sl_session_.clear();
-            }
-            last_guard_date = today;
-        }
-        // Same day → do nothing — guard entries from earlier this session remain valid
-    }
-
     // Check each active zone for entry opportunity
     for (auto& zone : active_zones) {
         zones_checked++;
@@ -1906,18 +1856,6 @@ std::stable_sort(active_zones.begin(), active_zones.end(),
             LOG_WARN("Zone " << zone.zone_id << " SKIPPED: zero-width zone"
                      << " (proximal==distal==" << zone.proximal_line << ")");
             continue;
-        }
-
-        // === SAME-SESSION RE-ENTRY GUARD: Skip zone if it already exited (any reason) today ===
-        if (!zone_sl_session_.empty()) {
-            const std::string today = bar_history.back().datetime.substr(0, 10);
-            auto it = zone_sl_session_.find(zone.zone_id);
-            if (it != zone_sl_session_.end() && it->second == today) {
-                zones_rejected++;
-                LOG_INFO("[RE-ENTRY GUARD] Zone " << zone.zone_id
-                         << " SKIPPED: already exited in session " << today);
-                continue;
-            }
         }
 
         // Skip violated zones
@@ -2350,33 +2288,17 @@ void LiveEngine::manage_position() {
             // Only process once per trade
             last_exit_date = last_trade.exit_date;
             if (last_trade.pnl < 0) {
-                // Only count STOP_LOSS exits — not SESSION_END or TRAIL_SL
-                if (last_trade.exit_reason == "STOP_LOSS") {
-                    consecutive_losses++;
-                    LOG_INFO("[LOSS PROTECTION] Consecutive losses: " << consecutive_losses);
-                    if (consecutive_losses >= config.max_consecutive_losses) {
-                        pause_counter = config.pause_bars_after_losses;
-                        LOG_INFO("[LOSS PROTECTION] Triggered pause for " << pause_counter << " bars after "
-                                 << consecutive_losses << " consecutive losses.");
-                        consecutive_losses = 0;
-                    }
-                } else {
-                    LOG_INFO("[LOSS PROTECTION] " << last_trade.exit_reason
-                             << " loss ignored for consecutive count (not STOP_LOSS)");
+                consecutive_losses++;
+                LOG_INFO("[LOSS PROTECTION] Consecutive losses: " << consecutive_losses);
+                if (consecutive_losses >= config.max_consecutive_losses) {
+                    pause_counter = config.pause_bars_after_losses;
+                    LOG_INFO("[LOSS PROTECTION] Triggered pause for " << pause_counter << " bars after "
+                             << consecutive_losses << " consecutive losses.");
+                    consecutive_losses = 0;
                 }
             } else if (last_trade.pnl > 0) {
-                // WIN: reset loss counter AND cancel any active pause
-                if (consecutive_losses > 0 || pause_counter > 0) {
-                    LOG_INFO("[LOSS PROTECTION] Win detected - resetting consecutive_losses="
-                             << consecutive_losses << " pause_counter=" << pause_counter);
-                }
                 consecutive_losses = 0;
-                pause_counter = 0;
             }
-
-            // NOTE: Same-session re-entry guard SET is handled unconditionally in on_bar()
-            // (after manage_position() call), NOT here. Reason: manage_position() has an
-            // early return when !is_in_position(), so it would miss the bar after trade close.
         }
     }
 
@@ -2911,29 +2833,7 @@ void LiveEngine::process_tick() {
         // Don't return early - continue to process zones and check for signals
         // (but won't enter new trades while already in position)
     }
-
-    // === SAME-SESSION RE-ENTRY GUARD: SET — runs unconditionally every bar ===
-    // CRITICAL: Must NOT be inside manage_position() which has an early-return guard
-    // (if !is_in_position() return). On the bar AFTER a trade closes, is_in_position()
-    // is FALSE so manage_position() returns immediately — the guard would never be set.
-    // By running here unconditionally we guarantee the guard is set on the SAME bar
-    // the trade closes (or at worst the very next bar), before check_for_entries() runs.
-    {
-        const auto& trades = performance.get_trades();
-        if (!trades.empty()) {
-            const auto& last_trade = trades.back();
-            static std::string guard_last_exit_date = "";
-            if (last_trade.exit_date != guard_last_exit_date && !last_trade.exit_date.empty()) {
-                guard_last_exit_date = last_trade.exit_date;
-                std::string session_date = last_trade.exit_date.substr(0, 10);
-                zone_sl_session_[last_trade.zone_id] = session_date;
-                LOG_INFO("[RE-ENTRY GUARD] Zone " << last_trade.zone_id
-                         << " blocked for rest of session " << session_date
-                         << " after " << last_trade.exit_reason << " exit");
-            }
-        }
-    }
-
+    
     // Process zones (even if in position, for monitoring)
     // if (bar_history.size() >= 100) {  // Need sufficient history
     //     process_zones();
@@ -2988,25 +2888,6 @@ bool LiveEngine::bootstrap_zones_on_startup() {
                     if (!active_zones.empty()) {
                         LOG_INFO("[DETERMINISM] First loaded zone volume_score=" << active_zones.front().volume_profile.volume_score
                                  << " zone_id=" << active_zones.front().zone_id);
-                    }
-                    // ⭐ BUG FIX: Reset EXHAUSTED state on load when flag is OFF
-                    // (mirrors the same fix in try_load_backtest_zones)
-                    if (!config.enable_zone_exhaustion) {
-                        int reset_count = 0;
-                        for (auto& zone : active_zones) {
-                            if (zone.state == ZoneState::EXHAUSTED || zone.consecutive_losses > 0) {
-                                if (zone.state == ZoneState::EXHAUSTED) {
-                                    zone.state = ZoneState::TESTED;
-                                }
-                                zone.consecutive_losses    = 0;
-                                zone.exhausted_at_datetime = "";
-                                reset_count++;
-                            }
-                        }
-                        if (reset_count > 0) {
-                            LOG_INFO("⚠️  enable_zone_exhaustion=NO: reset " << reset_count
-                                     << " zone(s) from EXHAUSTED/dirty state on cache load");
-                        }
                     }
                     return true;
                 } else {

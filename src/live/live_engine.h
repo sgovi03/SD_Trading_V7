@@ -121,7 +121,13 @@ protected:
     // === LOSS PROTECTION STATE ===
     int consecutive_losses = 0;
     int pause_counter = 0;
-    
+
+    // === SAME-SESSION RE-ENTRY GUARD ===
+    // Maps zone_id → session date (YYYY-MM-DD) of last STOP_LOSS exit.
+    // Any zone present here is blocked from re-entry for the remainder of that session.
+    // Cleared automatically at the start of each new trading day.
+    std::map<int, std::string> zone_sl_session_;
+
     // ⭐ NEW: DryRun bootstrap phase tracking
     int dryrun_bootstrap_end_bar_;  // Bar index where bootstrap ends (only used in dryrun mode)
     bool skip_trading_until_bar_;   // Flag to skip trading until reaching bootstrap end bar

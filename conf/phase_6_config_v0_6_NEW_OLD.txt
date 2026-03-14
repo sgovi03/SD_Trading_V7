@@ -376,34 +376,3 @@ departure_volume_normal_ratio = 1.2
 # ===== ZONE TOUCH LIMIT =====
 #zone_max_touch_count = 2
 #prefer_fresh_zones = YES
-
-# ============================================================================
-# ⭐ NEW FILTERS — from live trade analysis (March 2026)
-# ============================================================================
-
-# Priority 1: Zone consecutive-loss exhaustion
-# After zone_consecutive_loss_max SL losses from the same zone, mark it EXHAUSTED.
-# Prevents re-entering a "burnt" zone until a TP win resets it.
-# Evidence: Zone 25 = -₹29,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
-enable_zone_exhaustion    = NO
-zone_consecutive_loss_max = 1     # Block after 2nd consecutive SL loss
-
-# Priority 2: ADX transition-zone position size reduction
-# ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
-# Default: trade at half size. Set adx_transition_skip_entry=YES to skip entirely.
-enable_adx_transition_filter = YES
-adx_transition_min           = 40.0
-adx_transition_max           = 60.0
-adx_transition_size_factor   = 0.5   # Half position in danger band
-adx_transition_skip_entry    = NO    # NO=half-size; YES=skip entry entirely
-
-# Priority 3: Late-session entry cutoff
-# No new entries at or after this time. Trade #1719 (15:05) lost -₹9,274 in 1 bar.
-# Start conservative then tune based on live results.
-enable_late_entry_cutoff = YES
-late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
-
-# Priority 4: Hard cap on position lots
-# 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
-# Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
-max_position_lots = 4
