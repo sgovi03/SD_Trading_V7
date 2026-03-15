@@ -181,11 +181,15 @@ double PerformanceTracker::calculate_sharpe_ratio() const {
 PerformanceMetrics PerformanceTracker::calculate_metrics() const {
     PerformanceMetrics metrics;
     
-    // Capital metrics
+    // Capital metrics — derive from sum of trade P&Ls to stay consistent
+    // with equity_curve.csv (which also sums trade.pnl). Using current_capital
+    // can drift when trade_mgr.get_capital() is not perfectly in sync.
+    double sum_pnl = 0.0;
+    for (const auto& t : all_trades) sum_pnl += t.pnl;
     metrics.starting_capital = starting_capital;
-    metrics.ending_capital = current_capital;
-    metrics.total_pnl = current_capital - starting_capital;
-    metrics.total_return_pct = ((current_capital - starting_capital) / starting_capital) * 100.0;
+    metrics.ending_capital = starting_capital + sum_pnl;
+    metrics.total_pnl = sum_pnl;
+    metrics.total_return_pct = (starting_capital > 0.0) ? (sum_pnl / starting_capital) * 100.0 : 0.0;
     
     if (all_trades.empty()) {
         return metrics;

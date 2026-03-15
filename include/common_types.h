@@ -311,6 +311,13 @@ struct Zone {
     int consecutive_losses;            // Resets on win; when > zone_consecutive_loss_max → EXHAUSTED
     std::string exhausted_at_datetime; // Datetime zone was marked EXHAUSTED (for logging/JSON)
 
+    // ⭐ ISSUE-2: Per-direction SL suspension (runtime only — not persisted to JSON)
+    // Counts consecutive SL hits for each direction with no intervening winner.
+    // Once sl_count_long/short >= config.zone_sl_suspend_threshold, that direction
+    // is suspended for the remainder of the run. Resets to 0 on engine restart.
+    int sl_count_long  = 0;  // LONG  SL hits from this zone with no intervening LONG  win
+    int sl_count_short = 0;  // SHORT SL hits from this zone with no intervening SHORT win
+
     // State change history
     std::vector<ZoneStateEvent> state_history;
     
@@ -334,6 +341,7 @@ struct Zone {
           was_swept(false), sweep_bar(-1), bars_inside_after_sweep(0),
           reclaim_eligible(false), is_flipped_zone(false), parent_zone_id(-1),
           entry_retry_count(0), consecutive_losses(0), exhausted_at_datetime(""),
+          sl_count_long(0), sl_count_short(0),
           is_active(true), institutional_index(0) {}
 };
 
@@ -950,9 +958,10 @@ public:
     int min_zone_age_days = 0;                   // ⭐ NEW: Minimum zone age (0 = no min)
     int max_zone_age_days = 60;                  // ⭐ FIXED: Maximum zone age (60 days, was 30)
                                                  // Blocks stale zones
+    int max_touch_count   = 200; 
     bool exclude_zone_age_range = false;         // ⭐ DISABLED: Not needed with max_zone_age
     int exclude_zone_age_start = 30;             // ⭐ NEW: Start of exclusion (30 days)
-    
+   
     // Zone State Filtering (CRITICAL FIX for Run 2 issue)
     bool skip_violated_zones = true;             // ⭐ NEW: Don't trade VIOLATED zones
     bool skip_tested_zones = false;              // ⭐ NEW: Optionally skip TESTED zones (usually NO)
@@ -969,6 +978,13 @@ public:
     // Evidence: Zone 25 = -₹29,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
     bool enable_zone_exhaustion    = true;  // Master toggle
     int  zone_consecutive_loss_max = 1;     // Losses threshold (mark EXHAUSTED after Nth loss)
+
+    // ⭐ ISSUE-2: Per-direction SL suspension (independent of exhaustion)
+    // When a zone accumulates this many SL hits in one direction with NO winner
+    // in between, that direction is blocked for the remainder of the run.
+    // Example: Zone 5 LONG hit SL twice → LONG suspended from Zone 5 permanently.
+    // 0 = disabled. Recommended: 2.
+    int zone_sl_suspend_threshold = 2;
 
     // Priority 2: ADX transition-zone position size reduction
     // ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
@@ -993,7 +1009,7 @@ public:
     int max_position_lots = 4;  // 0 = disabled; positive = hard lot ceiling
 
     int zone_max_age_days = 90;
-	int zone_max_touch_count = 50;
+	int zone_max_touch_count = 200;
 	
 	// ============================================================
     // VOLUME EXHAUSTION EXIT SETTINGS

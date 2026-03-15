@@ -267,7 +267,10 @@ protected:
      * @return true if zones can be reused, false if regeneration needed
      */
     bool check_bootstrap_validity(const std::map<std::string, std::string>& metadata);
-
+// In private: section of class LiveEngine
+std::string last_exit_date_ ="";        // replaces static local in manage_position()
+std::string last_guard_date_ = "";       // replaces static local in check_for_entries()
+std::string guard_last_exit_date_ = "";  // replaces static local in process_tick()
     /**
      * 📝 LOG ORDER TO CSV FOR SIMULATION
      * Writes order details to simulated_orders.csv for DRY-run simulation

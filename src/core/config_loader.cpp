@@ -663,6 +663,8 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.min_zone_age_days = std::stoi(value);
     } else if (key == "max_zone_age_days") {
         config.max_zone_age_days = std::stoi(value);
+    } else if (key == "max_touch_count") {
+        config.max_touch_count = std::stoi(value);
     } else if (key == "skip_violated_zones") {
         config.skip_violated_zones = parse_bool(value);
     } else if (key == "skip_tested_zones") {
@@ -686,6 +688,8 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.enable_zone_exhaustion = parse_bool(value);
     } else if (key == "zone_consecutive_loss_max") {
         config.zone_consecutive_loss_max = std::stoi(value);
+    } else if (key == "zone_sl_suspend_threshold") {
+        config.zone_sl_suspend_threshold = std::stoi(value);
     }
     // Priority 2: ADX transition size filter
     else if (key == "enable_adx_transition_filter") {
