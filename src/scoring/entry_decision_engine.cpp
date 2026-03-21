@@ -156,7 +156,7 @@ double EntryDecisionEngine::calculate_take_profit(const Zone& zone, double entry
     }
 }
 
-EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneScore& score, double atr, MarketRegime regime, const ZoneQualityScore* zone_quality_score, const Bar* current_bar, const std::vector<Bar>* bar_history) const {
+EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneScore& score, double atr, MarketRegime regime, const ZoneQualityScore* zone_quality_score, const Bar* current_bar, const std::vector<Bar>* bar_history, bool is_continuation) const {
     EntryDecision decision;
     decision.score = score;
     LOG_INFO("=== CALCULATE_ENTRY START ===");
@@ -481,13 +481,31 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
         decision.entry_volume_score = metrics.volume_score;
         decision.entry_volume_pattern = metrics.rejection_reason;
         // V6.0: Entry rejection based on pullback volume score (activate after calibration)
-        if (config.min_volume_entry_score > -50 && metrics.volume_score < config.min_volume_entry_score) {
+        // ⭐ FIX P7: Skip pullback-vol gate for continuation re-entries.
+        //
+        // BUG (old): calculate_entry() applied the pullback vol filter unconditionally,
+        // including for overnight continuation re-entries. The next morning's opening
+        // bar often has high relative volume (gap open, first-bar surge) that scores
+        // 0/60 on the pullback gate, blocking every continuation regardless of zone quality.
+        // Zone 14 continuation (prior P&L ₹15,062 — the best continuation candidate in
+        // the dataset) was rejected with "Pullback vol score too low (0/60)" for this reason.
+        //
+        // FIX: When is_continuation=true, record the metrics for the CSV log but skip
+        // the hard rejection. The zone was already validated in the prior session;
+        // the opening bar's volume pattern is irrelevant to zone structural quality.
+        if (!is_continuation
+            && config.min_volume_entry_score > -50
+            && metrics.volume_score < config.min_volume_entry_score) {
             decision.should_enter = false;
             decision.rejection_reason = metrics.rejection_reason.empty()
                 ? "Pullback vol score too low (" + std::to_string(metrics.volume_score) + "/60)"
                 : metrics.rejection_reason;
             LOG_INFO("PULLBACK VOL REJECTED: " + decision.rejection_reason);
             return decision;
+        }
+        if (is_continuation && metrics.volume_score < config.min_volume_entry_score) {
+            LOG_INFO("[CONTINUATION] Pullback vol gate BYPASSED: score="
+                     + std::to_string(metrics.volume_score) + "/60 (would have blocked fresh entry)");
         }
     }
     

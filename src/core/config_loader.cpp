@@ -574,6 +574,16 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         }
         config.entry_block_end_time = normalized;
     }
+    // Overnight Continuation Trade (Issue 3)
+    else if (key == "enable_overnight_continuation") {
+        config.enable_overnight_continuation = parse_bool(value);
+    } else if (key == "continuation_min_profit_pts") {
+        config.continuation_min_profit_pts = std::stod(value);
+    } else if (key == "continuation_min_score_pct") {
+        config.continuation_min_score_pct = std::stod(value);
+    } else if (key == "continuation_max_gap_pct") {
+        config.continuation_max_gap_pct = std::stod(value);
+    }
     // Position Sizing
     else if (key == "lot_size") {
         config.lot_size = std::stoi(value);

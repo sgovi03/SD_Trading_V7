@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<!-- ============================================================
+  SD Engine V6 Optimizer Dashboard
+  ============================================================
+  HOW TO USE:
+  1. Place this file in:  SD_Trading_V6\optimizer  2. Run optimizer first to generate:  optimization_runsll_results.csv
+  3. Open a terminal in the optimizer folder and run:
+       python -m http.server 8080
+  4. Open browser at:  http://localhost:8080/dashboard.html
+  5. Click Refresh after each optimizer run to update charts.
+
+  NOTE: Cannot be opened as file:// due to browser CORS restrictions.
+        Must use the local HTTP server above.
+  ============================================================ -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SD Engine V6 — Optimizer Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface2: #1c2230;
+    --border: #30363d; --text: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --red: #f85149; --amber: #d29922;
+    --blue: #58a6ff; --purple: #bc8cff; --teal: #39d353;
+    --accent: #1f6feb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
+
+  /* ── Header ── */
+  .header {
+    background: linear-gradient(135deg, #0d1117 0%, #1a2332 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 18px 28px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .header-logo { font-size: 22px; font-weight: 700; color: var(--blue); letter-spacing: -0.5px; }
+  .header-sub { font-size: 12px; color: var(--muted); }
+  .header-badge {
+    margin-left: auto; background: var(--accent); color: #fff;
+    padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 600;
+  }
+
+  /* ── Layout ── */
+  .main { padding: 20px 28px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px; position: relative; overflow: hidden;
+  }
+  .card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  }
+  .card.green::before { background: var(--green); }
+  .card.red::before { background: var(--red); }
+  .card.blue::before { background: var(--blue); }
+  .card.amber::before { background: var(--amber); }
+  .card.purple::before { background: var(--purple); }
+
+  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px; }
+  .card-value { font-size: 26px; font-weight: 700; line-height: 1; }
+  .card-sub { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .card-value.pos { color: var(--green); }
+  .card-value.neg { color: var(--red); }
+  .card-value.neutral { color: var(--blue); }
+
+  /* ── Section header ── */
+  .section-title {
+    font-size: 13px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.8px;
+    margin-bottom: 12px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.green { background: var(--green); }
+  .dot.blue { background: var(--blue); }
+  .dot.amber { background: var(--amber); }
+
+  /* ── Chart canvas ── */
+  canvas { width: 100% !important; }
+
+  /* ── Table ── */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead { position: sticky; top: 0; }
+  th {
+    background: var(--surface2); color: var(--muted);
+    font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; padding: 10px 12px; text-align: right;
+    border-bottom: 1px solid var(--border);
+  }
+  th:first-child { text-align: left; }
+  td { padding: 9px 12px; text-align: right; border-bottom: 1px solid #21262d; }
+  td:first-child { text-align: left; }
+  tr:hover td { background: #1c2230; }
+  tr.best-row td { background: rgba(63, 185, 80, 0.08); }
+
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.3px;
+  }
+  .badge-gold { background: rgba(210,153,34,0.2); color: var(--amber); border: 1px solid rgba(210,153,34,0.3); }
+  .badge-silver { background: rgba(139,148,158,0.15); color: var(--muted); border: 1px solid var(--border); }
+  .badge-bronze { background: rgba(210,153,34,0.1); color: #c9713a; border: 1px solid rgba(210,153,34,0.2); }
+  .badge-ok { background: rgba(88,166,255,0.1); color: var(--blue); border: 1px solid rgba(88,166,255,0.2); }
+
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .neu { color: var(--muted); }
+
+  /* ── Progress ── */
+  .progress-bar-wrap {
+    background: var(--surface2); border-radius: 4px;
+    height: 8px; overflow: hidden; margin-top: 10px;
+  }
+  .progress-bar { height: 100%; border-radius: 4px; background: var(--blue); transition: width 0.4s ease; }
+
+  /* ── Param diff table ── */
+  .diff-table { font-size: 12px; }
+  .diff-table td { padding: 5px 10px; border-bottom: 1px solid #21262d; }
+  .diff-table .param-name { color: var(--muted); font-family: monospace; }
+  .diff-table .param-orig { color: var(--muted); text-decoration: line-through; }
+  .diff-table .param-new { color: var(--green); font-weight: 600; }
+
+  /* ── Config viewer ── */
+  .config-box {
+    background: #0d1117; border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+    font-family: 'Courier New', monospace; font-size: 11.5px;
+    max-height: 360px; overflow-y: auto; color: #cdd9e5;
+    white-space: pre; line-height: 1.6;
+  }
+  .cfg-comment { color: #4d5961; }
+  .cfg-key { color: var(--blue); }
+  .cfg-val { color: var(--green); }
+  .cfg-changed { color: var(--amber); background: rgba(210,153,34,0.08); border-radius: 2px; }
+
+  /* ── Tab system ── */
+  .tabs { display: flex; gap: 2px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 8px 18px; cursor: pointer; font-size: 13px;
+    border-radius: 6px 6px 0 0; color: var(--muted);
+    border: 1px solid transparent; border-bottom: none;
+  }
+  .tab.active {
+    background: var(--surface); color: var(--text);
+    border-color: var(--border); border-bottom: 1px solid var(--surface);
+    margin-bottom: -1px;
+  }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── Controls ── */
+  .controls { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
+  .btn {
+    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface2); color: var(--text);
+    cursor: pointer; font-size: 12px; font-weight: 500;
+    transition: background 0.15s;
+  }
+  .btn:hover { background: var(--accent); border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); }
+  select, input[type=text], input[type=number] {
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 10px; border-radius: 6px;
+    font-size: 12px;
+  }
+  .stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-v { font-size: 20px; font-weight: 700; }
+  .stat-l { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+  /* ── Scatter plot tooltip ── */
+  .tooltip {
+    position: fixed; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 14px; font-size: 12px; pointer-events: none;
+    z-index: 100; display: none; min-width: 160px;
+  }
+  .tooltip-title { font-weight: 700; color: var(--blue); margin-bottom: 4px; }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="header-logo">⚡ SD Engine V6 — Optimizer</div>
+    <div class="header-sub">Parameter Optimization Dashboard · NIFTY Futures</div>
+  </div>
+  <div class="header-badge" id="strategyBadge">Loading…</div>
+</div>
+
+<div class="main">
+
+  <!-- Load error / instruction banner -->
+  <div id="loadBanner" style="display:none;background:#1c2230;border:1px solid #d29922;
+    border-radius:8px;padding:14px 18px;margin-bottom:16px;font-size:13px;
+    color:#e6edf3;line-height:1.7"></div>
+
+  <!-- Summary KPIs -->
+  <div class="grid-4">
+    <div class="card green">
+      <div class="card-label">Best Net P&amp;L</div>
+      <div class="card-value pos" id="kpiPnl">—</div>
+      <div class="card-sub" id="kpiPnlSub">—</div>
+    </div>
+    <div class="card blue">
+      <div class="card-label">Best Win Rate</div>
+      <div class="card-value neutral" id="kpiWr">—</div>
+      <div class="card-sub" id="kpiWrSub">—</div>
+    </div>
+    <div class="card amber">
+      <div class="card-label">Best Profit Factor</div>
+      <div class="card-value" style="color:var(--amber)" id="kpiPf">—</div>
+      <div class="card-sub" id="kpiPfSub">—</div>
+    </div>
+    <div class="card red">
+      <div class="card-label">Min Max Drawdown</div>
+      <div class="card-value neg" id="kpiDd">—</div>
+      <div class="card-sub" id="kpiDdSub">—</div>
+    </div>
+  </div>
+
+  <!-- Progress + Run stats -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="section-title"><span class="dot blue"></span>Optimization Progress</div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-v neutral" id="statCompleted">0</div><div class="stat-l">Completed</div></div>
+      <div class="stat"><div class="stat-v" id="statTotal">0</div><div class="stat-l">Total Trials</div></div>
+      <div class="stat"><div class="stat-v pos" id="statSuccess">0</div><div class="stat-l">Successful</div></div>
+      <div class="stat"><div class="stat-v neg" id="statFailed">0</div><div class="stat-l">Failed</div></div>
+      <div class="stat"><div class="stat-v" id="statBestScore">—</div><div class="stat-l">Best Score</div></div>
+      <div class="stat"><div class="stat-v" id="statETA">—</div><div class="stat-l">ETA</div></div>
+    </div>
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
+  </div>
+
+  <!-- Charts row -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="section-title"><span class="dot green"></span>Score Convergence</div>
+      <canvas id="chartConvergence" height="180"></canvas>
+    </div>
+    <div class="card">
+      <div class="section-title"><span class="dot blue"></span>P&amp;L vs Win Rate (all runs)</div>
+      <canvas id="chartScatter" height="180"></canvas>
+    </div>
+  </div>
+
+  <!-- Tabs: Results | Params | Config -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('tabResults', this)">Top Runs</div>
+    <div class="tab" onclick="switchTab('tabParams', this)">Best Parameters</div>
+    <div class="tab" onclick="switchTab('tabConfig', this)">Best Config</div>
+    <div class="tab" onclick="switchTab('tabAnalysis', this)">Sensitivity</div>
+  </div>
+
+  <!-- Tab: Top Runs -->
+  <div class="tab-content active" id="tabResults">
+    <div class="controls">
+      <input type="text" id="filterInput" placeholder="Filter by param / score…" oninput="filterTable()" style="width:220px">
+      <select id="sortCol" onchange="renderTable()">
+        <option value="score">Sort: Score</option>
+        <option value="net_pnl">Sort: Net P&L</option>
+        <option value="win_rate">Sort: Win Rate</option>
+        <option value="profit_factor">Sort: Profit Factor</option>
+        <option value="sharpe_ratio">Sort: Sharpe</option>
+        <option value="max_drawdown_pct">Sort: Drawdown (asc)</option>
+      </select>
+      <button class="btn" onclick="exportCSV()">⬇ Export CSV</button>
+      <button class="btn primary" onclick="loadData()">↻ Refresh</button>
+    </div>
+    <div class="table-wrap" id="tableWrap"></div>
+  </div>
+
+  <!-- Tab: Best Params -->
+  <div class="tab-content" id="tabParams">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section-title"><span class="dot amber"></span>Optimized vs Base Values</div>
+        <div class="table-wrap">
+          <table class="diff-table" id="diffTable">
+            <thead><tr><th style="text-align:left">Parameter</th><th>Base</th><th>Optimized</th><th>Δ</th></tr></thead>
+            <tbody id="diffBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="section-title"><span class="dot purple"></span>Parameter Groups (Best Run)</div>
+        <canvas id="chartParamGroups" height="220"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Config -->
+  <div class="tab-content" id="tabConfig">
+    <div class="card">
+      <div class="section-title"><span class="dot green"></span>Best Config File (Changes Highlighted)</div>
+      <div class="controls">
+        <button class="btn" onclick="downloadConfig()">⬇ Download best_config.txt</button>
+        <button class="btn" onclick="copyConfig()">Copy to Clipboard</button>
+      </div>
+      <pre class="config-box" id="configBox">Loading…</pre>
+    </div>
+  </div>
+
+  <!-- Tab: Sensitivity -->
+  <div class="tab-content" id="tabAnalysis">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section-title"><span class="dot blue"></span>Parameter Sensitivity (Score Δ)</div>
+        <canvas id="chartSensitivity" height="260"></canvas>
+      </div>
+      <div class="card">
+        <div class="section-title"><span class="dot green"></span>Score Distribution</div>
+        <canvas id="chartHistogram" height="260"></canvas>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// DATA STORE
+// Reads from optimization_runs/all_results.csv (real optimizer output).
+// Place dashboard.html in the same folder as run_optimizer.bat (the optimizer folder).
+// Then open via a local server or file:// — see instructions below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let allData = [];
+let bestRun = null;
+let baseConfig = {};
+let currentFilter = '';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV PARSER — reads optimization_runs/all_results.csv
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseCSV(text) {
+  const lines = text.trim().split('\n').filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    // Handle quoted fields with commas inside (params_json)
+    const fields = [];
+    let cur = '', inQuote = false;
+    for (const ch of lines[i]) {
+      if (ch === '"') { inQuote = !inQuote; }
+      else if (ch === ',' && !inQuote) { fields.push(cur); cur = ''; }
+      else { cur += ch; }
+    }
+    fields.push(cur);
+    if (fields.length < headers.length) continue;
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = fields[idx] ? fields[idx].trim() : ''; });
+    // Parse numerics
+    const numFields = ['score','net_pnl','win_rate','total_trades','profit_factor',
+                       'sharpe_ratio','max_drawdown_pct','avg_win','avg_loss','duration_sec'];
+    numFields.forEach(f => { if (row[f] !== undefined) row[f] = parseFloat(row[f]) || 0; });
+    // Parse params JSON
+    try { row.params = JSON.parse(row.params_json || '{}'); } catch { row.params = {}; }
+    rows.push(row);
+  }
+  return rows;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN DATA LOADER — fetches real all_results.csv
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadData() {
+  const csvPath = 'optimization_runs/all_results.csv';
+  let rows = [];
+  let loadError = '';
+
+  try {
+    const resp = await fetch(csvPath, { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    rows = parseCSV(text);
+  } catch (err) {
+    loadError = err.message;
+  }
+
+  // Show error banner if fetch failed (e.g. opened as file://)
+  const banner = document.getElementById('loadBanner');
+  if (loadError || rows.length === 0) {
+    if (banner) {
+      banner.style.display = 'block';
+      banner.innerHTML = rows.length === 0 && !loadError
+        ? '<b>No data yet</b> — run the optimizer first, then refresh.'
+        : `<b>Cannot load CSV:</b> ${loadError}<br>
+           <small>Open this file via a local server, not file://.<br>
+           Run in your optimizer folder: <code>python -m http.server 8080</code><br>
+           Then open: <a href="http://localhost:8080/dashboard.html" style="color:#58a6ff">
+           http://localhost:8080/dashboard.html</a></small>`;
+    }
+    // Still try to show partial data if any loaded
+    if (rows.length === 0) return;
+  } else {
+    if (banner) banner.style.display = 'none';
+  }
+
+  // Sort by score descending, extract base config from best run params
+  rows.sort((a, b) => b.score - a.score);
+  allData = rows;
+  const successful = rows.filter(r => r.status === 'success');
+  bestRun = successful[0] || null;
+  if (bestRun && bestRun.params) baseConfig = bestRun.params;
+
+  // Update strategy badge from actual data
+  const total = rows.length;
+  const badge = document.getElementById('strategyBadge');
+  if (badge) badge.textContent = `${total} Trials · Genetic · Composite`;
+
+  updateKPIs(successful);
+  updateProgress(rows);
+  renderTable();
+  drawConvergenceChart(rows);
+  drawScatterChart(successful);
+  renderDiffTable(bestRun);
+  drawSensitivityChart(successful);
+  drawHistogram(successful);
+  renderConfig(bestRun);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KPIs
+// ─────────────────────────────────────────────────────────────────────────────
+function updateKPIs(rows) {
+  if (!rows.length) return;
+  const best = rows[0];
+  const byWr = [...rows].sort((a,b) => b.win_rate - a.win_rate)[0];
+  const byPf = [...rows].sort((a,b) => b.profit_factor - a.profit_factor)[0];
+  const byDd = [...rows].sort((a,b) => a.max_drawdown_pct - b.max_drawdown_pct)[0];
+
+  document.getElementById('kpiPnl').textContent = '₹' + fmt(best.net_pnl);
+  document.getElementById('kpiPnlSub').textContent = `Run ${best.run_id} · Score ${best.score.toFixed(2)}`;
+  document.getElementById('kpiWr').textContent = byWr.win_rate.toFixed(1) + '%';
+  document.getElementById('kpiWrSub').textContent = `${byWr.total_trades} trades · Run ${byWr.run_id}`;
+  document.getElementById('kpiPf').textContent = byPf.profit_factor.toFixed(3);
+  document.getElementById('kpiPfSub').textContent = `Sharpe ${byPf.sharpe_ratio.toFixed(2)} · Run ${byPf.run_id}`;
+  document.getElementById('kpiDd').textContent = byDd.max_drawdown_pct.toFixed(1) + '%';
+  document.getElementById('kpiDdSub').textContent = `Run ${byDd.run_id}`;
+}
+
+function updateProgress(rows) {
+  const ok   = rows.filter(r => r.status === 'success').length;
+  const fail = rows.filter(r => r.status === 'failed' || r.status === 'timeout').length;
+  const total = rows.length;  // actual count from CSV
+  document.getElementById('statCompleted').textContent = total;
+  document.getElementById('statTotal').textContent     = total;
+  document.getElementById('statSuccess').textContent   = ok;
+  document.getElementById('statFailed').textContent    = fail;
+  document.getElementById('statBestScore').textContent = bestRun ? bestRun.score.toFixed(2) : '—';
+  document.getElementById('progressBar').style.width   = total > 0 ? '100%' : '0%';
+  document.getElementById('statETA').textContent       = 'Done';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+function filterTable() {
+  currentFilter = document.getElementById('filterInput').value.toLowerCase();
+  renderTable();
+}
+
+function renderTable() {
+  const col = document.getElementById('sortCol').value;
+  let rows = allData.filter(r => r.status === 'success');
+  if (currentFilter) {
+    rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(currentFilter));
+  }
+  const asc = col === 'max_drawdown_pct';
+  rows.sort((a,b) => asc ? a[col]-b[col] : b[col]-a[col]);
+
+  const medals = ['🥇','🥈','🥉'];
+  let html = `<table>
+    <thead><tr>
+      <th>#</th><th style="text-align:left">Run ID</th>
+      <th>Score</th><th>Net P&L</th><th>Win %</th><th>Trades</th>
+      <th>PF</th><th>Sharpe</th><th>DD%</th><th>Avg Win</th><th>Avg Loss</th>
+    </tr></thead><tbody>`;
+
+  rows.slice(0, 50).forEach((r, i) => {
+    const isBest = i === 0 && col === 'score';
+    const cls = isBest ? ' class="best-row"' : '';
+    const medal = medals[i] || '';
+    html += `<tr${cls}>
+      <td>${medal || (i+1)}</td>
+      <td style="text-align:left;font-family:monospace;color:var(--blue)">${r.run_id}</td>
+      <td><span class="${r.score>0?'pos':'neg'}">${r.score.toFixed(2)}</span></td>
+      <td class="${r.net_pnl>=0?'pos':'neg'}">₹${fmt(r.net_pnl)}</td>
+      <td class="${r.win_rate>=50?'pos':'neg'}">${r.win_rate.toFixed(1)}%</td>
+      <td class="neu">${r.total_trades}</td>
+      <td class="${r.profit_factor>=1?'pos':'neg'}">${r.profit_factor.toFixed(3)}</td>
+      <td class="${r.sharpe_ratio>=0?'pos':'neg'}">${r.sharpe_ratio.toFixed(3)}</td>
+      <td class="${r.max_drawdown_pct<15?'pos':'neg'}">${r.max_drawdown_pct.toFixed(1)}%</td>
+      <td class="pos">₹${fmt(r.avg_win)}</td>
+      <td class="neg">₹${fmt(r.avg_loss)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('tableWrap').innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHARTS (hand-rolled canvas — no external lib)
+// ─────────────────────────────────────────────────────────────────────────────
+const C = { bg:'#0d1117', surface:'#161b22', border:'#30363d', text:'#e6edf3',
+            muted:'#8b949e', green:'#3fb950', red:'#f85149', amber:'#d29922',
+            blue:'#58a6ff', purple:'#bc8cff' };
+
+function setHiDPI(canvas, w, h) {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  return ctx;
+}
+
+function drawConvergenceChart(rows) {
+  const canvas = document.getElementById('chartConvergence');
+  const W = canvas.parentElement.clientWidth - 36, H = 180;
+  const ctx = setHiDPI(canvas, W, H);
+  const pad = {top:16, right:16, bottom:32, left:56};
+  const pw = W - pad.left - pad.right, ph = H - pad.top - pad.bottom;
+
+  const successful = rows.filter(r=>r.status==='success');
+  if (!successful.length) return;
+
+  // Running best
+  let runBest = -Infinity;
+  const bestArr = [], scoreArr = [];
+  successful.forEach(r => {
+    if (r.score > runBest) runBest = r.score;
+    bestArr.push(runBest);
+    scoreArr.push(r.score);
+  });
+  const minY = Math.min(...scoreArr), maxY = Math.max(...scoreArr);
+  const yRange = maxY - minY || 1;
+
+  const xScale = i => pad.left + (i / (successful.length-1)) * pw;
+  const yScale = v => pad.top + ph - ((v - minY) / yRange) * ph;
+
+  // Grid
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  for (let i=0; i<=4; i++) {
+    const y = pad.top + (ph/4)*i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left+pw, y); ctx.stroke();
+    const val = maxY - (yRange/4)*i;
+    ctx.fillStyle = C.muted; ctx.font = '10px system-ui'; ctx.textAlign = 'right';
+    ctx.fillText(val.toFixed(1), pad.left-6, y+4);
+  }
+  // X axis
+  ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.left, pad.top+ph); ctx.lineTo(pad.left+pw, pad.top+ph); ctx.stroke();
+  [0, Math.floor(successful.length/2), successful.length-1].forEach(i => {
+    ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.font = '10px system-ui';
+    ctx.fillText('Run ' + (i+1), xScale(i), pad.top+ph+16);
+  });
+
+  // Scatter dots
+  scoreArr.forEach((v, i) => {
+    ctx.beginPath();
+    ctx.arc(xScale(i), yScale(v), 2.5, 0, Math.PI*2);
+    ctx.fillStyle = v >= 0 ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)';
+    ctx.fill();
+  });
+
+  // Best line
+  ctx.beginPath();
+  ctx.strokeStyle = C.blue; ctx.lineWidth = 2;
+  bestArr.forEach((v,i) => {
+    i===0 ? ctx.moveTo(xScale(i), yScale(v)) : ctx.lineTo(xScale(i), yScale(v));
+  });
+  ctx.stroke();
+
+  // Legend
+  ctx.fillStyle = C.blue; ctx.fillRect(pad.left, 4, 14, 3);
+  ctx.fillStyle = C.text; ctx.font = '10px system-ui'; ctx.textAlign = 'left';
+  ctx.fillText('Running best', pad.left+18, 10);
+}
+
+function drawScatterChart(rows) {
+  const canvas = document.getElementById('chartScatter');
+  const W = canvas.parentElement.clientWidth - 36, H = 180;
+  const ctx = setHiDPI(canvas, W, H);
+  const pad = {top:16, right:16, bottom:36, left:56};
+  const pw = W-pad.left-pad.right, ph = H-pad.top-pad.bottom;
+
+  if (!rows.length) return;
+  const pnls = rows.map(r=>r.net_pnl), wrs = rows.map(r=>r.win_rate);
+  const pnlMin = Math.min(...pnls), pnlMax = Math.max(...pnls);
+  const wrMin = Math.min(...wrs), wrMax = Math.max(...wrs);
+  const xS = v => pad.left + (v-pnlMin)/(pnlMax-pnlMin||1)*pw;
+  const yS = v => pad.top + ph - (v-wrMin)/(wrMax-wrMin||1)*ph;
+
+  // Grid
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  [0,0.25,0.5,0.75,1].forEach(t => {
+    const y = pad.top + ph*t;
+    ctx.beginPath(); ctx.moveTo(pad.left,y); ctx.lineTo(pad.left+pw,y); ctx.stroke();
+    ctx.fillStyle=C.muted; ctx.font='10px system-ui'; ctx.textAlign='right';
+    ctx.fillText((wrMax - t*(wrMax-wrMin)).toFixed(0)+'%', pad.left-4, y+4);
+  });
+  // Zero line
+  const zeroX = xS(0);
+  if (zeroX > pad.left && zeroX < pad.left+pw) {
+    ctx.strokeStyle='rgba(248,81,73,0.4)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(zeroX, pad.top); ctx.lineTo(zeroX, pad.top+ph); ctx.stroke();
+  }
+  // Axes labels
+  ctx.fillStyle=C.muted; ctx.font='10px system-ui'; ctx.textAlign='center';
+  ctx.fillText('Net P&L →', pad.left+pw/2, pad.top+ph+26);
+
+  // Points
+  rows.forEach(r => {
+    const isTop = r.score === Math.max(...rows.map(x=>x.score));
+    const alpha = 0.5 + 0.5*(r.score - Math.min(...rows.map(x=>x.score)))/(Math.max(...rows.map(x=>x.score))-Math.min(...rows.map(x=>x.score))+1);
+    ctx.beginPath();
+    ctx.arc(xS(r.net_pnl), yS(r.win_rate), isTop?5:3, 0, Math.PI*2);
+    ctx.fillStyle = r.net_pnl >= 0
+      ? `rgba(63,185,80,${alpha.toFixed(2)})`
+      : `rgba(248,81,73,${alpha.toFixed(2)})`;
+    ctx.fill();
+    if (isTop) { ctx.strokeStyle=C.amber; ctx.lineWidth=1.5; ctx.stroke(); }
+  });
+}
+
+function renderDiffTable(run) {
+  if (!run) return;
+  const tbody = document.getElementById('diffBody');
+  let html = '';
+  const params = run.params;
+  Object.keys(params).sort().forEach(k => {
+    const orig = baseConfig[k];
+    const val = params[k];
+    const changed = orig !== undefined && Math.abs(orig - val) > 0.001;
+    const delta = orig !== undefined ? (val - orig) : 0;
+    html += `<tr>
+      <td class="param-name">${k}</td>
+      <td class="${changed?'param-orig':'neu'}">${orig !== undefined ? orig : '—'}</td>
+      <td class="${changed?'param-new':'neu'}">${val}</td>
+      <td class="${delta>0?'pos':delta<0?'neg':'neu'}">${delta!==0?(delta>0?'+':'')+delta.toFixed(2):''}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+function drawSensitivityChart(rows) {
+  if (rows.length < 10) return;
+  const canvas = document.getElementById('chartSensitivity');
+  const W = canvas.parentElement.clientWidth - 36, H = 260;
+  const ctx = setHiDPI(canvas, W, H);
+
+  // Compute correlation of each param with score
+  const paramNames = Object.keys(rows[0]?.params || {});
+  const correlations = paramNames.map(p => {
+    const xs = rows.map(r => r.params[p] || 0);
+    const ys = rows.map(r => r.score);
+    const cor = pearson(xs, ys);
+    return { name: p, cor: isNaN(cor) ? 0 : cor };
+  }).sort((a,b) => Math.abs(b.cor) - Math.abs(a.cor)).slice(0, 12);
+
+  const pad = {top:16, right:16, bottom:16, left:200};
+  const ph = H - pad.top - pad.bottom;
+  const pw = W - pad.left - pad.right;
+  const barH = ph / correlations.length - 2;
+
+  correlations.forEach((item, i) => {
+    const y = pad.top + i * (barH + 2);
+    const barW = Math.abs(item.cor) * pw / 2;
+    const posX = pad.left + pw / 2;
+
+    ctx.fillStyle = C.muted; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+    ctx.fillText(item.name.replace(/_/g,' '), pad.left - 8, y + barH/2 + 4);
+
+    ctx.fillStyle = item.cor >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)';
+    if (item.cor >= 0) ctx.fillRect(posX, y, barW, barH);
+    else ctx.fillRect(posX - barW, y, barW, barH);
+
+    ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(posX, pad.top); ctx.lineTo(posX, pad.top+ph); ctx.stroke();
+
+    ctx.fillStyle = C.text; ctx.textAlign = 'left'; ctx.font = '10px system-ui';
+    ctx.fillText(item.cor.toFixed(2), item.cor>=0 ? posX+barW+4 : posX-barW-26, y+barH/2+4);
+  });
+}
+
+function drawHistogram(rows) {
+  const canvas = document.getElementById('chartHistogram');
+  const W = canvas.parentElement.clientWidth - 36, H = 260;
+  const ctx = setHiDPI(canvas, W, H);
+  const pad = {top:16, right:16, bottom:36, left:40};
+  const pw = W-pad.left-pad.right, ph = H-pad.top-pad.bottom;
+
+  const scores = rows.map(r=>r.score);
+  const min = Math.min(...scores), max = Math.max(...scores);
+  const buckets = 20;
+  const bw = (max-min)/buckets;
+  const counts = Array(buckets).fill(0);
+  scores.forEach(s => {
+    const bi = Math.min(buckets-1, Math.floor((s-min)/bw));
+    counts[bi]++;
+  });
+  const maxC = Math.max(...counts);
+  const barW = pw/buckets - 2;
+
+  counts.forEach((c, i) => {
+    const x = pad.left + i*(pw/buckets);
+    const h = (c/maxC)*ph;
+    const y = pad.top + ph - h;
+    const mid = min + (i+0.5)*bw;
+    ctx.fillStyle = mid >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)';
+    ctx.fillRect(x, y, barW, h);
+    if (i % 4 === 0) {
+      ctx.fillStyle=C.muted; ctx.font='9px system-ui'; ctx.textAlign='center';
+      ctx.fillText(mid.toFixed(0), x+barW/2, pad.top+ph+14);
+    }
+  });
+
+  ctx.fillStyle=C.muted; ctx.font='10px system-ui'; ctx.textAlign='center';
+  ctx.fillText('Score Distribution', pad.left+pw/2, pad.top+ph+28);
+}
+
+function renderConfig(run) {
+  if (!run) { document.getElementById('configBox').textContent = 'No successful runs yet.'; return; }
+  // Simulate config file rendering
+  const changedParams = new Set(Object.keys(run.params));
+  let lines = [];
+  lines.push('# ============================================================');
+  lines.push('# OPTIMIZED CONFIG — SD Trading Engine V6');
+  lines.push(`# Score: ${run.score.toFixed(4)} | P&L: ₹${fmt(run.net_pnl)} | WR: ${run.win_rate.toFixed(1)}%`);
+  lines.push('# ============================================================');
+  lines.push('');
+  Object.entries({...baseConfig, ...run.params}).sort().forEach(([k,v]) => {
+    const isChanged = changedParams.has(k) && baseConfig[k] !== undefined;
+    if (isChanged) {
+      lines.push(`${k} = ${v}   # ← optimized (was ${baseConfig[k]})`);
+    } else {
+      lines.push(`${k} = ${v}`);
+    }
+  });
+
+  const box = document.getElementById('configBox');
+  box.innerHTML = lines.map(l => {
+    if (l.startsWith('#')) return `<span class="cfg-comment">${esc(l)}</span>`;
+    if (l.includes('← optimized')) {
+      const [kv, comment] = l.split('#');
+      const [k,v] = kv.split('=');
+      return `<span class="cfg-key">${esc(k.trim())}</span> = <span class="cfg-changed">${esc(v.trim())}</span>  <span class="cfg-comment"># ${esc(comment.trim())}</span>`;
+    }
+    if (l.includes('=')) {
+      const [k,v] = l.split('=');
+      return `<span class="cfg-key">${esc(k.trim())}</span> = <span class="cfg-val">${esc(v.trim())}</span>`;
+    }
+    return esc(l);
+  }).join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILITIES
+// ─────────────────────────────────────────────────────────────────────────────
+function pearson(xs, ys) {
+  const n = xs.length;
+  const mx = xs.reduce((a,b)=>a+b,0)/n, my = ys.reduce((a,b)=>a+b,0)/n;
+  let num=0, dx=0, dy=0;
+  for(let i=0;i<n;i++){num+=(xs[i]-mx)*(ys[i]-my);dx+=(xs[i]-mx)**2;dy+=(ys[i]-my)**2;}
+  return num/Math.sqrt(dx*dy||1);
+}
+function fmt(v) {
+  if (v === undefined || v === null) return '—';
+  const n = +v;
+  if (Math.abs(n) >= 100000) return (n/100000).toFixed(2)+'L';
+  return n.toLocaleString('en-IN', {maximumFractionDigits:0});
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function switchTab(id, el) {
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  el.classList.add('active');
+}
+
+function exportCSV() {
+  const rows = allData.filter(r=>r.status==='success');
+  const keys = ['run_id','score','net_pnl','win_rate','total_trades','profit_factor','sharpe_ratio','max_drawdown_pct'];
+  const csv = [keys.join(','), ...rows.map(r=>keys.map(k=>r[k]).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv,' + encodeURIComponent(csv);
+  a.download = 'optimization_results.csv';
+  a.click();
+}
+
+function downloadConfig() {
+  if (!bestRun) return;
+  const content = document.getElementById('configBox').innerText;
+  const a = document.createElement('a');
+  a.href = 'data:text/plain,' + encodeURIComponent(content);
+  a.download = 'best_config.txt';
+  a.click();
+}
+
+function copyConfig() {
+  navigator.clipboard.writeText(document.getElementById('configBox').innerText)
+    .then(()=>alert('Config copied to clipboard!'));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  loadData();
+  // In production: poll every 30s during active optimization
+  setInterval(loadData, 30000);  // auto-refresh every 30s during active run
+});
+window.addEventListener('resize', () => {
+  if (allData.length) {
+    const s = allData.filter(r=>r.status==='success');
+    drawConvergenceChart(allData);
+    drawScatterChart(s);
+    drawSensitivityChart(s);
+    drawHistogram(s);
+  }
+});
+</script>
+</body>
+</html>

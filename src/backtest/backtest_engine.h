@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <map>  // ⭐ D7: for zone_sl_session_
 #include "../ITradingEngine.h"
 #include "../ZonePersistenceAdapter.h"
 #include "common_types.h"
@@ -75,6 +76,13 @@ private:
     std::vector<Core::Zone> active_zones;
     int pause_counter;
     int consecutive_losses;
+
+    // ⭐ D7 FIX: Same-session re-entry guard state (mirrors live engine)
+    // Maps zone_id → session date (YYYY-MM-DD) of last blocking exit.
+    // Cleared at start of each new trading day.
+    std::map<int, std::string> zone_sl_session_;
+    std::string last_guard_date_;  // Tracks current day to detect session boundaries
+    std::string guard_last_exit_date_;  // ⭐ P1: Tracks last trade exit to prevent duplicate guard-SET
 
     // Zone detection summary tracking
     Core::ZoneDetector::ZoneDetectionSummary initial_zone_detection_summary_{};

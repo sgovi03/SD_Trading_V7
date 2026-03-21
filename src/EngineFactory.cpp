@@ -59,7 +59,7 @@ std::unique_ptr<ITradingEngine> EngineFactory::create(
         std::cout << "  starting_capital:     Rs" << config.starting_capital << "\n";
         double max_sl_1lot = config.max_loss_per_trade / config.lot_size;
         std::cout << "  Max SL distance @1lot: " << max_sl_1lot << " pts\n\n";
-    config.live_zone_detection_interval_bars = sys_config.live_zone_detection_interval_bars;  // ADD THIS
+    //config.live_zone_detection_interval_bars = sys_config.live_zone_detection_interval_bars;  // ADD THIS
     
     // Apply dryrun bootstrap parameters if provided
     if (mode == "dryrun") {

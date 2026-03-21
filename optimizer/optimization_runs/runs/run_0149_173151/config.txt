@@ -1,0 +1,411 @@
+# ==================================================================
+# COMPLETE WORKING CONFIG - WITH ALL 3 FIXES APPLIED
+# Based on your working config + Fix #1 and Fix #3
+# ==================================================================
+
+# ===== FIX #1: DISABLE VOL_CLIMAX TO LET WINNERS RUN =====
+enable_volume_exit_signals = NO
+
+# ===== FIX #3: VOLUME EXHAUSTION EXIT (NEW) =====
+enable_volume_exhaustion_exit = NO
+vol_exhaustion_spike_min_ratio = 1.5
+vol_exhaustion_spike_min_body_atr = 0.5
+vol_exhaustion_absorption_min_ratio = 2.0
+vol_exhaustion_absorption_max_body_atr = 0.25
+vol_exhaustion_flow_min_ratio = 1.2
+vol_exhaustion_flow_min_bars = 3
+vol_exhaustion_drift_max_ratio = 0.6
+vol_exhaustion_drift_min_loss_atr = 0.5
+vol_exhaustion_max_loss_pct = 0.85
+
+# ===== REST OF YOUR WORKING CONFIG =====
+
+# FOR LIVE ENGINE :
+
+use_relaxed_live_detection = YES
+live_min_zone_strength = 30
+live_zone_detection_interval_bars = 3
+live_min_zone_width_atr = 0.6
+live_zone_detection_lookback_bars = 200
+
+
+
+# FOR BACKTEST :
+consolidation_min_bars = 4
+min_impulse_atr = 1.9
+min_zone_width_atr = 0.4
+min_zone_strength = 50
+use_trailing_stop = YES
+trail_activation_rr = 0.9
+trailing_stop_activation_r = 0.9
+# high_score_position_mult = 1.0
+require_ema_alignment_for_longs = YES
+require_ema_alignment_for_shorts = YES
+zone_detection_interval_bars = 6
+
+
+stop_loss_atr_multiplier = 2  # ????????????
+target_rr_ratio = 2.5  # ????????????
+
+starting_capital = 300000
+base_height_max_atr = 2.8
+
+consolidation_max_bars = 35
+
+atr_period = 14
+
+# duplicate_prevention_enabled = YES
+duplicate_prevention_enabled = YES
+# zone_existence_tolerance_atr = 0.35
+zone_existence_tolerance_atr = 1.0
+atr_buffer_multiplier = 1.0
+check_existing_before_create = YES
+merge_strategy = update_if_stronger
+# merge_strategy = expand_boundaries
+# strength_improvement_threshold = 15.0
+strength_improvement_threshold = 10.0
+only_fresh_zones = NO
+freshness_bars_threshold = 30
+# Block entries in last hour
+enable_entry_time_block = YES
+entry_block_start_time = 09:15  # No new entries after 2:30 PM
+entry_block_end_time = 09:30  # Market closes 3:30 PM
+
+
+# RECLAIM OPTION A
+# gap_over_invalidation = YES
+# invalidate_on_body_close = YES
+
+# RECLAIM: we use code change and keep the parameters as follows:
+gap_over_invalidation = NO
+invalidate_on_body_close = NO
+
+
+skip_retest_after_gap_over = NO
+
+exclude_zone_age_range = NO
+exclude_zone_age_start = 30
+exclude_zone_age_end = 60
+
+enable_live_zone_filtering = NO
+live_entry_require_new_bar = YES
+live_zone_entry_cooldown_seconds = 0
+max_zone_distance_atr = 100
+enable_state_history = true
+
+enable_candle_confirmation = NO
+candle_confirmation_body_pct = 35
+enable_structure_confirmation = NO
+
+enable_sweep_reclaim = YES
+reclaim_acceptance_bars = 2
+reclaim_acceptance_pct = 0.5
+
+enable_zone_flip = YES
+flip_min_impulse_atr = 1.5
+flip_lookback_bars = 10
+
+max_zone_touch_count = 5500
+
+enable_two_stage_scoring = YES
+zone_quality_minimum_score = 0.0
+zone_quality_age_very_fresh = 2
+zone_quality_age_fresh = 5
+zone_quality_age_recent = 10
+zone_quality_age_aging = 20
+zone_quality_age_old = 30
+zone_quality_height_optimal_min = 0.48
+zone_quality_height_optimal_max = 0.87
+zone_quality_height_acceptable_min = 0.2
+zone_quality_height_acceptable_max = 1.0
+
+enable_revamped_scoring = YES
+rejection_analysis_lookback_days = 30
+breakthrough_analysis_lookback_days = 30
+rejection_excellent_threshold = 45
+rejection_good_threshold = 40.0
+rejection_acceptable_threshold = 20.0
+breakthrough_disqualify_threshold = 50
+breakthrough_high_penalty_threshold = 30.0
+breakthrough_low_penalty_threshold = 20.0
+touch_count_exhausted_threshold = 100
+touch_count_high_threshold = 70
+touch_count_moderate_threshold = 50
+touch_count_untested_threshold = 5
+elite_full_bonus_age_days = 90
+elite_half_bonus_age_days = 180
+age_fresh_threshold_days = 30
+age_moderate_threshold_days = 90
+age_old_threshold_days = 180
+
+entry_validation_minimum_score = 15
+entry_validation_ema_fast_period = 20
+entry_validation_ema_slow_period = 50
+entry_validation_strong_trend_sep = 1.63
+entry_validation_moderate_trend_sep = 0.5
+entry_validation_weak_trend_sep = 0.2
+entry_validation_ranging_threshold = 0.25
+entry_validation_rsi_deeply_oversold = 30.0
+entry_validation_rsi_oversold = 38.88
+entry_validation_rsi_slightly_oversold = 40.0
+entry_validation_rsi_pullback = 51.16
+entry_validation_rsi_neutral = 50.0
+entry_validation_macd_strong_threshold = 2.0
+entry_validation_macd_moderate_threshold = 1.93
+entry_validation_adx_very_strong = 50.0
+entry_validation_adx_strong = 40.0
+entry_validation_adx_moderate = 30.0
+entry_validation_adx_weak = 25.0
+entry_validation_adx_minimum = 15
+entry_validation_optimal_stop_atr_min = 1.62
+entry_validation_optimal_stop_atr_max = 2.91
+entry_validation_acceptable_stop_atr_min = 1.2
+entry_validation_acceptable_stop_atr_max = 3.0
+
+rsi_period = 14
+bb_period = 20
+bb_stddev = 2.0
+adx_period = 14
+macd_fast_period = 12
+macd_slow_period = 26
+macd_signal_period = 9
+
+enable_ema_exit = NO
+exit_ema_fast_period = 9
+exit_ema_slow_period = 20
+
+rejection_strong_threshold = 0.6
+rejection_moderate_threshold = 0.4
+rejection_weak_threshold = 0.2
+max_consolidation_range = 3.0
+
+use_htf_regime_filter = NO
+htf_lookback_bars = 700
+htf_trending_threshold = 5.0
+
+min_departure_imbalance = 1.8
+max_retest_speed_atr = 1.5
+min_bars_to_retest = 10
+
+swing_detection_bars = 20
+
+use_bos_trend_filter = YES
+trade_with_trend_only = NO
+allow_ranging_trades = YES
+
+use_ema_trend_filter = NO
+ema_fast_period = 20
+ema_slow_period = 50
+ema_ranging_threshold_pct = 0.5
+ema_min_separation_pct_long = 0.1
+ema_min_separation_pct_short = 0.05
+
+rejection_wick_ratio = 0.4
+entry_buffer_pct = 0.1
+
+max_concurrent_trades = 10
+close_before_session_end_minutes = 15
+
+lookback_for_zones = 400
+close_eod = YES
+session_end_time = 15:30:00
+
+lot_size = 65
+commission_per_trade = 100.0
+enable_debug_logging = NO
+enable_score_logging = YES
+
+v6_fully_enabled = YES
+enable_volume_entry_filters = NO
+enable_volume_divergence_exit = YES
+min_entry_volume_ratio = 0.8
+institutional_volume_threshold = 2.0
+extreme_volume_threshold = 3.0
+volume_lookback_period = 20
+volume_normalization_method = time_of_day
+volume_baseline_file = data/baselines/volume_baseline_5min.json
+
+enable_oi_entry_filters = YES
+enable_oi_exit_signals = YES
+enable_market_phase_detection = YES
+min_oi_change_threshold = 0.01
+high_oi_buildup_threshold = 0.05
+oi_lookback_period = 10
+price_oi_correlation_window = 10
+
+base_score_weight = 0.4
+volume_score_weight = 0.6
+oi_score_weight = 0.10
+institutional_volume_bonus = 45
+oi_alignment_bonus = 25.0
+low_volume_retest_bonus = 30
+
+trade_on_expiry_day = YES
+expiry_day_disable_oi_filters = YES
+expiry_day_position_multiplier = 0.5
+expiry_day_min_zone_score = 75.0
+
+low_volume_size_multiplier = 0.5
+max_lot_size = 650
+
+volume_climax_exit_threshold = 3.0
+volume_drying_up_threshold = 0.5
+volume_drying_up_bar_count = 3
+
+oi_unwinding_threshold = -0.5
+oi_reversal_threshold = 0.02
+oi_stagnation_threshold = 0.005
+oi_stagnation_bar_count = 10
+
+v6_log_volume_filters = YES
+v6_log_oi_filters = YES
+v6_log_institutional_index = YES
+v6_validate_baseline_on_startup = YES
+
+min_volume_entry_score = 10
+entry_score_zone_quality_max = 100
+entry_score_volume_entry_max = 60
+entry_score_market_context_max = 40
+entry_score_total_max = 200
+entry_score_zone_quality_min = 60
+entry_score_volume_entry_min = 35
+entry_score_market_context_min = 25
+entry_score_total_min = 90
+
+departure_volume_extreme_ratio = 3.0
+departure_volume_strong_ratio = 2.0
+departure_volume_moderate_ratio = 1.5
+departure_volume_normal_ratio = 1.2
+departure_volume_weak_penalty = -25
+initiative_bonus = 15
+absorption_penalty = 0
+multi_touch_rising_penalty = -30
+pullback_volume_very_low = 0.5
+pullback_volume_low = 0.5
+pullback_volume_moderate = 1.2
+pullback_volume_elevated = 1.6
+pullback_volume_high = 1.8
+pullback_volume_very_high_penalty = 0
+entry_bar_strong_body_pct = 0.6
+entry_bar_moderate_body_pct = 0.4
+entry_bar_weak_penalty = -5
+recent_volume_declining_bonus = 10
+recent_volume_stable_bonus = 5
+recent_volume_rising_penalty = -10
+volume_pattern_sweet_spot_min = 1.0
+volume_pattern_sweet_spot_max = 2.5
+volume_pattern_inst_min = 50
+volume_pattern_high_trap_penalty = -20
+
+max_entry_volume_ratio = 3.0
+max_volume_without_elite = 2.0
+min_inst_for_high_volume = 50.0
+optimal_volume_min = 1.5
+optimal_volume_max = 2.3
+optimal_institutional_min = 45
+allow_low_volume_if_score_above = 60.0
+elite_institutional_threshold = 55.0
+high_score_position_mult = 1.25
+high_score_threshold = 70
+
+risk_per_trade_pct = 1.25
+max_consecutive_losses = 2
+pause_bars_after_losses = 15
+
+rr_base_ratio = 1.20
+rr_scale_with_score = YES
+
+trail_atr_multiplier = 1
+trail_ema_period = 9
+trail_use_hybrid = YES
+
+
+
+# ============================================================================
+# ZONE AGE AND STATE FILTERING - CRITICAL FIX FOR RUN 2 ISSUE
+# ============================================================================
+# Run 2 analysis showed:
+# - 16 trades on VIOLATED zones in Nov-Feb → Lost ₹30,773
+# - 25 trades on zones >60 days old → Massive losses
+# These filters prevent trading stale/violated zones
+
+min_zone_age_days = 0  # Minimum zone age (0 = can trade fresh zones)
+max_zone_age_days = 90  # ⭐ CRITICAL: Maximum 60 days (changed from 980!)
+                                # Prevents trading stale zones that lost money in Run 2
+
+exclude_zone_age_range = NO  # Disable complex age range exclusion (not needed)
+exclude_zone_age_start = 30  # (ignored when exclude_zone_age_range = NO)
+
+# ⭐ CRITICAL: Zone State Filtering (NEW - fixes Run 2 issue)
+skip_violated_zones = YES  # Don't trade VIOLATED zones (MANDATORY!)
+skip_tested_zones = NO  # Can trade TESTED zones (they perform OK)
+prefer_fresh_zones = YES  # Prefer FRESH but don't reject TESTED
+# ============================================================================
+
+use_adaptive_entry = YES
+entry_minimum_score = 32.5
+entry_optimal_score = 80
+max_retries_per_zone = 3000
+rr_max_ratio = 1.750
+trail_fallback_tp_rr = 2
+max_loss_per_trade = 25000.0
+sl_buffer_zone_pct = 2.0
+sl_buffer_atr = 0.5
+min_stop_distance_points = 65
+trail_ema_buffer_pct = 0.2
+
+max_fill_slippage_pts = 3.0
+zone_max_age_days = 290
+#zone_max_touch_count = 500
+
+
+#ChatGPT changes:
+
+# ===== VOLUME / INSTITUTIONAL QUALITY FILTER =====
+optimal_institutional_min = 45
+elite_institutional_threshold = 55.0
+
+# ===== ENTRY QUALITY =====
+entry_score_total_min = 90
+entry_score_zone_quality_min = 60
+
+# ===== WEAK DEPARTURE PENALTY =====
+departure_volume_weak_penalty = -25
+departure_volume_normal_ratio = 1.2
+
+# ===== ZONE TOUCH LIMIT =====
+#zone_max_touch_count = 2
+#prefer_fresh_zones = YES
+
+# ============================================================================
+# ⭐ NEW FILTERS — from live trade analysis (March 2026)
+# ============================================================================
+
+# Priority 1: Zone consecutive-loss exhaustion
+# After zone_consecutive_loss_max SL losses from the same zone, mark it EXHAUSTED.
+# Prevents re-entering a "burnt" zone until a TP win resets it.
+# Evidence: Zone 25 = -₹29,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
+enable_zone_exhaustion = YES
+zone_consecutive_loss_max = 3  # Block after 2nd consecutive SL loss
+zone_sl_suspend_threshold = 2  # SL hits per direction before suspension (0=disabled)
+
+# Priority 2: ADX transition-zone position size reduction
+# ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
+# Default: trade at half size. Set adx_transition_skip_entry=YES to skip entirely.
+enable_adx_transition_filter = YES
+adx_transition_min = 50
+adx_transition_max = 75
+adx_transition_size_factor = 0.75  # Half position in danger band
+adx_transition_skip_entry = NO  # NO=half-size; YES=skip entry entirely
+
+# Priority 3: Late-session entry cutoff
+# No new entries at or after this time. Trade #1719 (15:05) lost -₹9,274 in 1 bar.
+# Start conservative then tune based on live results.
+enable_late_entry_cutoff = YES
+late_entry_cutoff_time = 14:30  # HH:MM — no new entries at/after this time
+
+# Priority 4: Hard cap on position lots
+# 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
+# Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
+max_position_lots = 2
+max_touch_count = 500;

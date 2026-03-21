@@ -317,7 +317,10 @@ struct Zone {
     // is suspended for the remainder of the run. Resets to 0 on engine restart.
     int sl_count_long  = 0;  // LONG  SL hits from this zone with no intervening LONG  win
     int sl_count_short = 0;  // SHORT SL hits from this zone with no intervening SHORT win
-
+    // ⭐ FIX BUG-TOUCH: Distinct-visit episode tracking.
+    // Fires touch_count++ only on outside→inside transition, not on every
+    // bar spent inside. Runtime only — not persisted to JSON.
+    bool was_in_zone_prev = false;
     // State change history
     std::vector<ZoneStateEvent> state_history;
     
@@ -342,6 +345,7 @@ struct Zone {
           reclaim_eligible(false), is_flipped_zone(false), parent_zone_id(-1),
           entry_retry_count(0), consecutive_losses(0), exhausted_at_datetime(""),
           sl_count_long(0), sl_count_short(0),
+          was_in_zone_prev(false),
           is_active(true), institutional_index(0) {}
 };
 
@@ -1242,6 +1246,23 @@ public:
           v6_log_institutional_index(true),
           v6_validate_baseline_on_startup(true) {}
     
+    // =========================================================================
+    // OVERNIGHT CONTINUATION TRADE (Issue 3 fix)
+    // =========================================================================
+    // When a profitable SESSION_END trade closes, the engine optionally saves
+    // a snapshot and re-evaluates entry at the next session open.
+    // All conditions must pass — entry is fully re-validated, not carried over.
+    //
+    // enable_overnight_continuation  : master switch (default OFF — safe)
+    // continuation_min_profit_pts    : min prior profit in price points (default 50)
+    // continuation_min_score_pct     : score >= entry_minimum_score × this (default 0.80)
+    // continuation_max_gap_pct       : skip if adverse overnight gap > prior_risk
+    //                                  × this fraction (default 0.50)
+    bool   enable_overnight_continuation = false;
+    double continuation_min_profit_pts   = 50.0;
+    double continuation_min_score_pct    = 0.80;
+    double continuation_max_gap_pct      = 0.50;
+
     // Validation method
     bool validate() const {
         if (starting_capital <= 0) {
@@ -1532,6 +1553,31 @@ struct VolumeOIConfig {
           oi_reversal_threshold(0.02),
           oi_stagnation_threshold(0.005),
           oi_stagnation_bar_count(10) {}
+};
+
+// =========================================================================
+// PendingContinuation
+// =========================================================================
+// Stored as a member variable of LiveEngine.
+// active==false → nothing pending.
+// active==true  → evaluate re-entry at next session open.
+// =========================================================================
+struct PendingContinuation {
+    bool        active            = false;  // Is a continuation pending?
+    int         zone_id           = -1;     // Zone to re-enter
+    std::string direction;                  // "LONG" or "SHORT"
+    double      prior_pnl         = 0.0;   // P&L of the SESSION_END trade (> 0)
+    double      prior_entry       = 0.0;   // Entry price of the closed trade
+    double      prior_risk        = 0.0;   // Risk in price points (for gap check)
+    double      prior_tp_distance = 0.0;   // TP distance in price points
+    std::string exit_session;              // YYYY-MM-DD of the SESSION_END close
+    double      exit_price        = 0.0;   // SESSION_END exit price
+
+    void clear() {
+        active = false;  zone_id = -1;
+        direction.clear();  exit_session.clear();
+        prior_pnl = prior_entry = prior_risk = prior_tp_distance = exit_price = 0.0;
+    }
 };
 
 } // namespace Core

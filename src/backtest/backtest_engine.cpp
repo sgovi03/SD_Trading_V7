@@ -8,6 +8,7 @@
 #include "../ZoneInitializer.h"
 #include "../analysis/market_analyzer.h"
 #include "../sd_engine_core.h"  // For calculate_trailing_stop
+#include "../utils/institutional_index.h"  // ⭐ U1: For calculate_institutional_index on zone touch
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <numeric>  // For std::accumulate
 #include <algorithm>
+#include <map>  // ⭐ D7: for zone_sl_session_
 // In BacktestEngine files
 #include "../ITradingEngine.h"
 #include "../ZonePersistenceAdapter.h"
@@ -100,7 +102,10 @@ BacktestEngine::BacktestEngine(
       data_file_path_(data_file),
       output_dir_(output_directory),
       pause_counter(0),
-      consecutive_losses(0) {
+      consecutive_losses(0),
+      zone_sl_session_(),    // ⭐ D7: empty on construction
+      last_guard_date_(""),  // ⭐ D7: empty = first bar will initialise silently
+      guard_last_exit_date_("") { // ⭐ P1: empty = no prior trade exit seen
     
     // Pre-allocate vectors for performance
     bars.reserve(50000);  // Reserve for ~50K bars (1-min: ~1 month)
@@ -335,6 +340,24 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
                         }
                     }
                 }
+                // ⭐ U1 FIX: Refresh V6 volume/OI profiles on first touch — matches live engine.
+                // Live recalculates volume_profile, oi_profile and institutional_index
+                // on every zone touch so entry scoring uses fresh institutional data.
+                // Backtest was missing this, causing different zone scores vs live.
+                if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
+                    int profile_bar_idx = zone.formation_bar;
+                    if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bars.size())) {
+                        zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                            zone, bars, profile_bar_idx);
+                        zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                            zone, bars, profile_bar_idx);
+                        zone.institutional_index = Utils::calculate_institutional_index(
+                            zone.volume_profile, zone.oi_profile);
+                        LOG_DEBUG("Zone " << zone.zone_id << " V6 profiles refreshed on FIRST_TOUCH"
+                                 << " | inst_idx=" << std::fixed << std::setprecision(2)
+                                 << zone.institutional_index);
+                    }
+                }
                 zones_changed = true;
                 
                 // Record FIRST_TOUCH event
@@ -352,42 +375,68 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
                 record_event(zone, event, config.record_first_touch);
                 
             } else if (zone.state == Core::ZoneState::TESTED) {
-                zone.touch_count++;
-                // V6.0: Record normalised touch volume
-                if (volume_baseline_.is_loaded()) {
-                    std::string slot = volume_baseline_.extract_time_slot(bar.datetime);
-                    double ratio = volume_baseline_.get_normalized_ratio(slot, bar.volume);
-                    zone.volume_profile.touch_volumes.push_back(ratio);
+                // ⭐ D2 FIX: Only count a NEW visit episode (outside→inside transition).
+                // Live engine has this guard. Without it every consecutive bar inside a zone
+                // increments touch_count, causing counts in the hundreds and premature
+                // max_touch_count retirement — far fewer tradeable zones than live.
+                if (!zone.was_in_zone_prev) {
+                    zone.touch_count++;
+                    // V6.0: Record normalised touch volume
+                    if (volume_baseline_.is_loaded()) {
+                        std::string slot = volume_baseline_.extract_time_slot(bar.datetime);
+                        double ratio = volume_baseline_.get_normalized_ratio(slot, bar.volume);
+                        zone.volume_profile.touch_volumes.push_back(ratio);
 
-                    if (zone.volume_profile.touch_volumes.size() >= 3) {
-                        const auto& tv = zone.volume_profile.touch_volumes;
-                        int n = static_cast<int>(tv.size());
-                        int rc = 0;
-                        for (int i = n - 2; i >= std::max(0, n - 3); --i)
-                            if (tv[i + 1] > tv[i]) rc++;
-                        zone.volume_profile.volume_rising_on_retests = (rc >= 2);
-                        if (zone.volume_profile.volume_rising_on_retests) {
-                            LOG_WARN("Zone " + std::to_string(zone.zone_id) +
-                                     " rising volume on retests — Component 5 penalty active");
+                        if (zone.volume_profile.touch_volumes.size() >= 3) {
+                            const auto& tv = zone.volume_profile.touch_volumes;
+                            int n = static_cast<int>(tv.size());
+                            int rc = 0;
+                            for (int i = n - 2; i >= std::max(0, n - 3); --i)
+                                if (tv[i + 1] > tv[i]) rc++;
+                            zone.volume_profile.volume_rising_on_retests = (rc >= 2);
+                            if (zone.volume_profile.volume_rising_on_retests) {
+                                LOG_WARN("Zone " + std::to_string(zone.zone_id) +
+                                         " rising volume on retests — Component 5 penalty active");
+                            }
                         }
                     }
+                    // ⭐ U1 FIX: Refresh V6 volume/OI profiles on each new RETEST — matches live engine.
+                    // Live recalculates profiles on every new touch episode so entry scoring
+                    // always uses the most current institutional data. Without this, backtest
+                    // uses stale profiles from zone formation, causing different zone scores.
+                    if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
+                        int profile_bar_idx = zone.formation_bar;
+                        if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bars.size())) {
+                            zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                                zone, bars, profile_bar_idx);
+                            zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                                zone, bars, profile_bar_idx);
+                            zone.institutional_index = Utils::calculate_institutional_index(
+                                zone.volume_profile, zone.oi_profile);
+                            LOG_DEBUG("Zone " << zone.zone_id << " V6 profiles refreshed on RETEST"
+                                     << " | inst_idx=" << std::fixed << std::setprecision(2)
+                                     << zone.institutional_index);
+                        }
+                    }
+                    zones_changed = true;
+
+                    // Record RETEST event
+                    Core::ZoneStateEvent event(
+                        bar.datetime,
+                        static_cast<int>(bars.size() - 1),
+                        "RETEST",
+                        old_state_str,
+                        "TESTED",
+                        (bar.high + bar.low) / 2.0,
+                        bar.high,
+                        bar.low,
+                        zone.touch_count
+                    );
+                    record_event(zone, event, config.record_retests);
                 }
-                zones_changed = true;
-                
-                // Record RETEST event
-                Core::ZoneStateEvent event(
-                    bar.datetime,
-                    static_cast<int>(bars.size() - 1),
-                    "RETEST",
-                    old_state_str,
-                    "TESTED",
-                    (bar.high + bar.low) / 2.0,
-                    bar.high,
-                    bar.low,
-                    zone.touch_count
-                );
-                record_event(zone, event, config.record_retests);
             }
+            // ⭐ D2 FIX: Update episode-tracking flag
+            zone.was_in_zone_prev = price_in_zone;
         }
         
         // Check for violation
@@ -661,10 +710,12 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
         }
     }
     
-    // Get current market regime using medium-term lookback for trade filtering
-    // Note: Using 100 bars (~1 week for 15min bars) instead of HTF's 700 bars
-    // to better capture actionable trends vs very long-term bias
-    const int REGIME_LOOKBACK = 100;  // ~1 week of 15-min bars
+    // ⭐ E4 FIX: Use config.htf_lookback_bars for regime detection, matching live engine.
+    // Old: REGIME_LOOKBACK hardcoded to 100, ignoring any config value.
+    // Live: uses config.htf_lookback_bars if > 0, falls back to 100.
+    // If htf_lookback_bars is set (e.g. 200), backtest and live detected different
+    // regimes on the same bar, causing divergent entry decisions.
+    const int REGIME_LOOKBACK = (config.htf_lookback_bars > 0) ? config.htf_lookback_bars : 100;
     Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, REGIME_LOOKBACK, config.htf_trending_threshold);
     
     // Debug: Log regime detection (reduced frequency for performance)
@@ -677,6 +728,46 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
                  << ", trend_only=" << (config.trade_with_trend_only ? "YES" : "NO") << ")");
     }
     
+    // ⭐ D7 FIX: Same-session re-entry guard — mirrors live engine exactly.
+    // Live engine maintains zone_sl_session_: zones that hit STOP_LOSS or a losing
+    // SESSION_END are blocked from re-entry for the rest of that trading day.
+    // Without this, backtest re-enters the same zone multiple times per day after
+    // losses, producing different trade sequences and inflated loss counts vs live.
+    {
+        const std::string today = bars[bar_index].datetime.substr(0, 10);
+        if (last_guard_date_.empty()) {
+            last_guard_date_ = today;
+        } else if (today != last_guard_date_) {
+            if (!zone_sl_session_.empty()) {
+                LOG_DEBUG("[RE-ENTRY GUARD] New session " << today
+                         << " — clearing " << zone_sl_session_.size() << " blocked zone(s)");
+                zone_sl_session_.clear();
+            }
+            last_guard_date_ = today;
+        }
+    }
+
+    // ⭐ D4 FIX: Sort zones by state quality then recency before entry loop.
+    // Live engine runs stable_sort here; backtest previously iterated in insertion
+    // order (oldest first). When multiple zones qualify on the same bar, both engines
+    // must select the same zone — FRESH > RECLAIMED > TESTED, then newer formation first.
+    std::stable_sort(active_zones.begin(), active_zones.end(),
+        [](const Core::Zone& a, const Core::Zone& b) {
+            auto state_priority = [](const Core::Zone& z) -> int {
+                switch (z.state) {
+                    case Core::ZoneState::FRESH:     return 0;
+                    case Core::ZoneState::RECLAIMED: return 1;
+                    case Core::ZoneState::TESTED:    return 2;
+                    case Core::ZoneState::VIOLATED:  return 3;
+                    default:                         return 4;
+                }
+            };
+            int pa = state_priority(a), pb = state_priority(b);
+            if (pa != pb) return pa < pb;
+            if (a.formation_bar != b.formation_bar) return a.formation_bar > b.formation_bar;
+            return a.zone_id > b.zone_id;
+        });
+
     // Check each active zone for entry opportunity
     for (auto& zone : active_zones) {
         // ⭐ ZONE SANITY GUARD: Skip corrupt zones with zero or invalid boundaries.
@@ -695,14 +786,45 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             continue;
         }
 
-        // Skip violated zones
-        if (zone.state == Core::ZoneState::VIOLATED) continue;
+        // ⭐ D7 FIX: Same-session re-entry guard check
+        if (!zone_sl_session_.empty()) {
+            const std::string today = bar.datetime.substr(0, 10);
+            auto it = zone_sl_session_.find(zone.zone_id);
+            if (it != zone_sl_session_.end() && it->second == today) {
+                LOG_DEBUG("[RE-ENTRY GUARD] Zone " << zone.zone_id
+                         << " SKIPPED: already exited in session " << today);
+                continue;
+            }
+        }
+
+        // ⭐ E1 FIX: Config-driven violated zone skip — matches live engine.
+        // Old: always skip VIOLATED zones unconditionally.
+        // Live: only skip if config.skip_retest_after_gap_over = YES.
+        // With skip_retest_after_gap_over=NO, both engines evaluate VIOLATED
+        // zones as entry candidates (e.g. for sweep-reclaim setups).
+        if (zone.state == Core::ZoneState::VIOLATED && config.skip_retest_after_gap_over) continue;
 
         // ⭐ P1: Skip EXHAUSTED zones (consecutive-loss limit reached)
         if (config.enable_zone_exhaustion && zone.state == Core::ZoneState::EXHAUSTED) {
             LOG_DEBUG("Zone " << zone.zone_id << " SKIPPED: EXHAUSTED ("
                       << zone.consecutive_losses << " consecutive losses)");
             continue;
+        }
+
+        // ⭐ D8 FIX: Per-direction SL suspension check — mirrors live engine.
+        // If this zone has hit zone_sl_suspend_threshold STOP_LOSS exits in the
+        // direction it would trade (DEMAND→LONG, SUPPLY→SHORT) with no intervening
+        // winner, skip it permanently for this run. Live engine does this — without
+        // it backtest keeps re-entering zones that live has already suspended.
+        if (config.zone_sl_suspend_threshold > 0) {
+            const std::string direction = (zone.type == Core::ZoneType::DEMAND) ? "LONG" : "SHORT";
+            const int sl_count = (direction == "LONG") ? zone.sl_count_long : zone.sl_count_short;
+            if (sl_count >= config.zone_sl_suspend_threshold) {
+                LOG_DEBUG("Zone #" << zone.zone_id << " SKIPPED: "
+                         << direction << " suspended ("
+                         << sl_count << " SL hits, no winner)");
+                continue;
+            }
         }
 
         // ⭐ Zone retry limit (existing mechanism — parity with live engine)
@@ -713,8 +835,29 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             continue;
         }
 
-        // Skip if only trading fresh zones
-        if (config.only_fresh_zones && zone.state != Core::ZoneState::FRESH) continue;
+        // ⭐ E3 FIX: max_touch_count zone retirement — matches live engine.
+        // Live engine retires high-touch zones by setting state=VIOLATED and skipping.
+        // Without this, backtest keeps trading zones that live has already retired,
+        // producing different trade sets on the same dataset.
+        // Default 200 matches the live engine's fallback (0 = unlimited in config).
+        {
+            const int touch_limit = (config.max_touch_count > 0) ? config.max_touch_count : 200;
+            if (zone.touch_count > touch_limit) {
+                LOG_DEBUG("Zone #" << zone.zone_id << " RETIRED: " << zone.touch_count
+                         << " touches (max=" << touch_limit << ")");
+                zone.state = Core::ZoneState::VIOLATED;
+                continue;
+            }
+        }
+
+        // ⭐ D3 FIX: Match live engine — only_fresh_zones blocks VIOLATED/EXHAUSTED only.
+        // Live allows FRESH, RECLAIMED, and TESTED zones when only_fresh_zones=YES.
+        // Old backtest only allowed FRESH, silently rejecting all RECLAIMED/TESTED zones
+        // and causing far fewer trades than live on the same dataset.
+        if (config.only_fresh_zones &&
+            zone.state != Core::ZoneState::FRESH &&
+            zone.state != Core::ZoneState::RECLAIMED &&
+            zone.state != Core::ZoneState::TESTED) continue;
 
         // ⭐ P3: Late-session entry cutoff — no new entries at or after cutoff time
         if (config.enable_late_entry_cutoff && bar.datetime.length() >= 16) {
@@ -743,12 +886,32 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             continue;
         }
         
-        // price_in_zone: bar overlaps zone body (type-aware — see update_zone_states for rationale)
+        // ⭐ E2 FIX: Max zone distance filter — matches live engine check_for_entries.
+        // Live rejects zones whose midpoint is farther than atr*max_zone_distance_atr
+        // from the current bar close. Without this, backtest evaluates zones that are
+        // hundreds of points away — trades that live would never take.
+        if (config.max_zone_distance_atr > 0.0) {
+            double zone_mid = (zone.proximal_line + zone.distal_line) / 2.0;
+            double atr_dist = Core::MarketAnalyzer::calculate_atr(bars, config.atr_period, bar_index);
+            double max_dist = atr_dist * config.max_zone_distance_atr;
+            if (std::abs(zone_mid - bar.close) > max_dist) {
+                LOG_DEBUG("Zone " << zone.zone_id << " SKIPPED: too far from price ("
+                         << std::fixed << std::setprecision(1)
+                         << std::abs(zone_mid - bar.close) << " pts > max " << max_dist << " pts)");
+                continue;
+            }
+        }
+
+        // price_in_zone: bar overlaps zone AND close does not break through distal.
         bool price_in_zone;
         if (zone.type == Core::ZoneType::DEMAND) {
-            price_in_zone = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+            price_in_zone = (bar.high >= zone.distal_line &&
+                             bar.low  <= zone.proximal_line &&
+                             bar.close >= zone.distal_line);  // close guard
         } else {
-            price_in_zone = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+            price_in_zone = (bar.low  <= zone.distal_line &&
+                             bar.high >= zone.proximal_line &&
+                             bar.close <= zone.distal_line);  // close guard
         }
         if (!price_in_zone) continue;
 
@@ -801,16 +964,30 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
         }
 
         // ⭐ EMA ALIGNMENT FILTER (moved from entry_decision_engine.cpp due to linker issues)
-        // Check EMA trend alignment before scoring to save computation
+        // Check EMA trend alignment before scoring to save computation.
+        //
+        // ⭐ FIX A: Upgraded LOG_DEBUG → LOG_INFO + std::cout to match live engine.
+        // Old: LOG_DEBUG only — silent at INFO log level, giving the false impression
+        //      that the EMA filter was not running in backtest (0 visible rejections).
+        // Live engine: LOG_INFO + std::cout with "[NO] Zone N: EMA filter - ..." prefix.
+        // Fix: identical output format so both consoles show the same rejection lines,
+        // making it straightforward to verify the filter fires on the same bars.
         double ema_20 = Core::MarketAnalyzer::calculate_ema(bars, 20, bar_index);
         double ema_50 = Core::MarketAnalyzer::calculate_ema(bars, 50, bar_index);
         
         if (direction == "LONG" && config.require_ema_alignment_for_longs) {
             double ema_sep_pct = (ema_50 > 0) ? (100.0 * (ema_20 - ema_50) / ema_50) : 0.0;
             if (ema_20 <= ema_50 || ema_sep_pct < config.ema_min_separation_pct_long) {
-                LOG_DEBUG("EMA filter rejected LONG zone " << zone.zone_id 
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": EMA filter - LONG rejected (EMA20 "
+                          << std::fixed << std::setprecision(2) << ema_20
+                          << " <= EMA50 " << ema_50
+                          << ", sep=" << ema_sep_pct
+                          << "% < min=" << config.ema_min_separation_pct_long << "%)\n";
+                LOG_INFO("EMA filter rejected LONG zone " << zone.zone_id
                          << ": EMA20=" << ema_20 << " EMA50=" << ema_50
-                         << " sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_long << "%");
+                         << " sep=" << ema_sep_pct
+                         << "% < min=" << config.ema_min_separation_pct_long << "%");
                 continue;
             }
         }
@@ -818,9 +995,16 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
         if (direction == "SHORT" && config.require_ema_alignment_for_shorts) {
             double ema_sep_pct = (ema_20 > 0) ? (100.0 * (ema_50 - ema_20) / ema_20) : 0.0;
             if (ema_20 >= ema_50 || ema_sep_pct < config.ema_min_separation_pct_short) {
-                LOG_DEBUG("EMA filter rejected SHORT zone " << zone.zone_id 
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": EMA filter - SHORT rejected (EMA20 "
+                          << std::fixed << std::setprecision(2) << ema_20
+                          << " >= EMA50 " << ema_50
+                          << ", sep=" << ema_sep_pct
+                          << "% < min=" << config.ema_min_separation_pct_short << "%)\n";
+                LOG_INFO("EMA filter rejected SHORT zone " << zone.zone_id
                          << ": EMA20=" << ema_20 << " EMA50=" << ema_50
-                         << " sep=" << ema_sep_pct << "% < min=" << config.ema_min_separation_pct_short << "%");
+                         << " sep=" << ema_sep_pct
+                         << "% < min=" << config.ema_min_separation_pct_short << "%");
                 continue;
             }
         }
@@ -846,20 +1030,54 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
         }
 
         // Score the zone
+        // ⭐ E5 FIX: Apply expiry day overrides before scoring — matches live engine.
+        // On monthly expiry day (last Thursday of month): disable OI filters and
+        // scale lot_size by expiry_day_position_multiplier. Without this, backtest
+        // trades full size with OI filters on expiry days while live does not.
+        Core::Config entry_config = config;  // Copy per-zone to allow expiry override
+        {
+            // Inline expiry day detection (last Thursday of month)
+            bool is_expiry = false;
+            if (bar.datetime.length() >= 10) {
+                int year = 0, month = 0, day = 0; char d1, d2;
+                std::istringstream dts(bar.datetime.substr(0, 10));
+                dts >> year >> d1 >> month >> d2 >> day;
+                if (!dts.fail() && d1=='-' && d2=='-') {
+                    std::tm tm_exp = {};
+                    tm_exp.tm_year = year - 1900;
+                    tm_exp.tm_mon  = month - 1;
+                    tm_exp.tm_mday = day;
+                    tm_exp.tm_isdst = -1;
+                    std::mktime(&tm_exp);
+                    if (tm_exp.tm_wday == 4) {  // Thursday
+                        tm_exp.tm_mday += 7;
+                        std::mktime(&tm_exp);
+                        is_expiry = (tm_exp.tm_mon != month - 1);
+                    }
+                }
+            }
+            if (is_expiry) {
+                if (entry_config.expiry_day_disable_oi_filters) {
+                    entry_config.enable_oi_entry_filters  = false;
+                    entry_config.enable_oi_exit_signals   = false;
+                }
+                entry_config.lot_size = static_cast<int>(
+                    entry_config.lot_size * entry_config.expiry_day_position_multiplier);
+                LOG_DEBUG("Expiry day: lot_size=" << entry_config.lot_size
+                         << " OI_filters=" << (entry_config.enable_oi_entry_filters ? "ON":"OFF"));
+            }
+        }
         Core::ZoneScore zone_score = scorer.evaluate_zone(zone, regime, bar);
         
         // Calculate entry decision
         double atr = Core::MarketAnalyzer::calculate_atr(bars, config.atr_period, bar_index);
         Core::EntryDecision decision;
 
-        // Prepare bar_history for entry metrics (last 10 bars including current)
-        std::vector<Core::Bar> bar_history;
-        int history_len = 10;
-        int start_idx = std::max(0, bar_index - history_len + 1);
-        for (int i = start_idx; i <= bar_index; ++i) {
-            bar_history.push_back(bars[i]);
-        }
-
+        // ⭐ D5 FIX: Pass full bars vector to calculate_entry, not a 10-bar slice.
+        // Live engine passes &bar_history (full history). calculate_entry_volume_metrics
+        // uses the full vector for volume baseline normalisation — a 10-bar window
+        // produces different pullback volume ratios and scores vs the full dataset,
+        // causing different entry decisions on the same bars.
         if (config.enable_two_stage_scoring) {
             Core::ZoneQualityScore zone_quality_score;
             Core::EntryValidationScore entry_validation_score;
@@ -867,8 +1085,8 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
                 zone,
                 bars,
                 bar_index,
-                zone.proximal_line,  // Preliminary entry for validation
-                0.0,                 // Preliminary stop for validation
+                zone.proximal_line,
+                0.0,
                 &zone_quality_score,
                 &entry_validation_score
             );
@@ -876,18 +1094,10 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
                 LOG_DEBUG("Zone rejected by two-stage scoring");
                 continue;
             }
-            // Pass zone quality score to calculate_entry for aggressiveness calculation
             decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
-                config.enable_revamped_scoring ? &zone_quality_score : nullptr, &bar, &bar_history);
-            // FIX: do NOT override decision.should_enter here.
-            // should_enter_trade_two_stage() validated zone quality (Stage 1 — scoring/regime/age).
-            // calculate_entry() runs Stage 2 internal filters: V6 volume, candle confirmation,
-            // structure confirmation. If calculate_entry() rejects (should_enter=false, sl=0),
-            // overriding to true bypasses all those filters and calls enter_trade() with sl=0,
-            // causing 23,000+ wasted enter_trade() calls and "REJECTED: stop_loss <= 0" noise.
-            // decision.should_enter = true;  // REMOVED — was masking volume filter rejections
+                config.enable_revamped_scoring ? &zone_quality_score : nullptr, &bar, &bars);
         } else {
-            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, &bar, &bar_history);
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, &bar, &bars);
         }
         
         if (!decision.should_enter) {
@@ -992,6 +1202,35 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
             std::cout << "SESSION_END: Trade #" << closed.trade_num
                       << " closed @ " << std::fixed << std::setprecision(2) << bar.close
                       << "  P&L " << closed.pnl << std::endl;
+
+            // ⭐ D7 FIX: Block re-entry on losing SESSION_END — mirrors live engine rule.
+            // Live blocks same-session re-entry when SESSION_END P&L < 0 (zone was weak).
+            // Profitable SESSION_END does NOT block — zone still valid for continuation.
+            if (closed.pnl < 0 && closed.zone_id >= 0) {
+                std::string session_date = bar.datetime.substr(0, 10);
+                zone_sl_session_[closed.zone_id] = session_date;
+                LOG_DEBUG("[RE-ENTRY GUARD] Zone " << closed.zone_id
+                         << " blocked for rest of session " << session_date
+                         << " after SESSION_END loss (P&L=" << closed.pnl << ")");
+            }
+
+            // ⭐ D8 FIX: Profitable SESSION_END resets sl_count — zone proved itself today.
+            if (closed.pnl >= 0 && config.zone_sl_suspend_threshold > 0
+                && closed.zone_id >= 0) {
+                for (auto& zone : active_zones) {
+                    if (zone.zone_id != closed.zone_id) continue;
+                    if (closed.direction == "LONG" && zone.sl_count_long > 0) {
+                        zone.sl_count_long = 0;
+                        LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                                 << " LONG sl_count reset (SESSION_END win)");
+                    } else if (closed.direction == "SHORT" && zone.sl_count_short > 0) {
+                        zone.sl_count_short = 0;
+                        LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                                 << " SHORT sl_count reset (SESSION_END win)");
+                    }
+                    break;
+                }
+            }
             return;
         }
     }
@@ -1093,7 +1332,19 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
     //   Stage 2 fixed at 1.0R
     //   Stage 3 fixed at 2.0R
     //   Stage 4 fixed at 3.0R
+
+    // ⭐ M1 FIX: Snapshot SL BEFORE trail ratchet runs.
+    // If the trail ratchets the stop on the same bar that also breaches it,
+    // the SL check below would use the NEW (tighter) stop — triggering an
+    // exit that shouldn't happen until the NEXT bar. This mirrors live engine
+    // BUG-11 fix: capture the pre-trail stop, use it for the SL exit check,
+    // and only let the ratcheted level take effect from the next bar onward.
+    double sl_before_trail_update = trade.stop_loss;
+
     if (config.use_trailing_stop) {
+        // ⭐ M1 FIX: Re-capture here for clarity (already set above).
+        sl_before_trail_update = trade.stop_loss;
+
         // Risk = distance from entry to ORIGINAL stop loss (never changes)
         double risk = std::abs(trade.entry_price - trade.original_stop_loss);
         if (risk <= 0) risk = std::abs(trade.entry_price - trade.stop_loss);
@@ -1150,8 +1401,20 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         //   LONG : highest_price - 0.5×ATR
         //   SHORT: lowest_price  + 0.5×ATR
 
-        // Pre-compute fixed stage levels used as floors in ATR stages
-        double stage1_level = trade.entry_price;  // breakeven
+        // ⭐ M2 FIX: Stage 1 breakeven uses commission_pts offset, matching live engine.
+        // Old: stage1_level = entry_price → TRAIL_SL exit at entry fills at
+        //   entry_price - 2×commission, recording a small loss and incrementing
+        //   consecutive_losses incorrectly.
+        // Fix: stage1_level = entry ± commission_pts so the exit nets exactly ₹0.
+        double commission_pts = 0.0;
+        {
+            int qty = trade.position_size * config.lot_size;
+            if (qty > 0 && config.commission_per_trade > 0.0)
+                commission_pts = (2.0 * config.commission_per_trade) / static_cast<double>(qty);
+        }
+        double stage1_level = (trade.direction == "LONG")
+            ? trade.entry_price + commission_pts
+            : trade.entry_price - commission_pts;
         double stage2_level = (trade.direction == "LONG")
             ? trade.entry_price + (risk * 0.5)
             : trade.entry_price - (risk * 0.5);
@@ -1270,25 +1533,34 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         }
     }
 
-    // Check stop loss (may have been updated by trailing logic)
-    if (trade_manager.check_stop_loss(bar)) {
-        std::string exit_reason = trade.trailing_activated ? "TRAIL_SL" : "SL";
-        // ⭐ REALISTIC SL FILL:
-        //   Normal case:  bar ticked through SL intraday → fill at SL (best realistic)
-        //   Gap case:     bar.open already past SL (news/overnight gap) → fill at open
-        //   bar.close used as backstop: never fill worse than close (conservative)
-        double sl_fill;
-        if (trade.direction == "LONG") {
-            // Gap-past-SL: open already below SL → fill at open
-            double gap_fill = (bar.open <= trade.stop_loss) ? bar.open : trade.stop_loss;
-            sl_fill = std::max(gap_fill, bar.close);  // never worse than close
-            sl_fill = std::min(sl_fill, trade.stop_loss);  // never better than SL
-        } else {
-            // SHORT: gap-past-SL: open already above SL → fill at open
-            double gap_fill = (bar.open >= trade.stop_loss) ? bar.open : trade.stop_loss;
-            sl_fill = std::min(gap_fill, bar.close);  // never worse than close
-            sl_fill = std::max(sl_fill, trade.stop_loss);  // never better than SL
-        }
+    // ⭐ M1+M3 FIX: Compute SL/TP hits with bar extremes + pre-trail snapshot.
+    // M1: Use sl_before_trail_update (not trade.stop_loss) so a trail ratchet on
+    //     this bar cannot immediately self-trigger an exit on the same bar.
+    // M3: Compute both flags together and resolve same-bar SL/TP conflict (SL wins)
+    //     before calling close_trade — mirrors live engine manage_position() exactly.
+    bool sl_hit = false;
+    bool tp_hit = false;
+    double exit_price_resolved = 0.0;
+    if (trade.direction == "LONG") {
+        sl_hit = (bar.low  <= sl_before_trail_update);
+        tp_hit = (bar.high >= trade.take_profit && trade.take_profit > 0.0);
+        if (sl_hit && tp_hit) { sl_hit = true; tp_hit = false; }
+        exit_price_resolved = sl_hit
+            ? std::min(sl_before_trail_update, bar.close)
+            : trade.take_profit;
+    } else {
+        sl_hit = (bar.high >= sl_before_trail_update);
+        tp_hit = (bar.low  <= trade.take_profit && trade.take_profit > 0.0);
+        if (sl_hit && tp_hit) { sl_hit = true; tp_hit = false; }
+        exit_price_resolved = sl_hit
+            ? std::max(sl_before_trail_update, bar.close)
+            : trade.take_profit;
+    }
+
+    // Check stop loss
+    if (sl_hit) {
+        std::string exit_reason = trade.trailing_activated ? "TRAIL_SL" : "STOP_LOSS";
+        double sl_fill = exit_price_resolved;
         Trade closed_trade = trade_manager.close_trade(
             bar, exit_reason, sl_fill);
         performance.add_trade(closed_trade);
@@ -1346,7 +1618,64 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         std::cout << "Trade #" << closed_trade.trade_num << " stopped out (" << exit_reason << "): "
                  << "P&L $" << std::fixed << std::setprecision(2) << closed_trade.pnl
                  << std::endl;
-        
+
+        // ⭐ D7 FIX: Set same-session re-entry guard after STOP_LOSS.
+        // Live engine blocks re-entry into a zone that hit STOP_LOSS in the same session.
+        // Without this, backtest re-enters toxic zones repeatedly on the same day.
+        if (exit_reason == "STOP_LOSS" && closed_trade.zone_id >= 0) {
+            std::string session_date = bar.datetime.substr(0, 10);
+            zone_sl_session_[closed_trade.zone_id] = session_date;
+            LOG_DEBUG("[RE-ENTRY GUARD] Zone " << closed_trade.zone_id
+                     << " blocked for rest of session " << session_date
+                     << " after STOP_LOSS exit (P&L=" << closed_trade.pnl << ")");
+        }
+
+        // ⭐ D8 FIX: Per-direction SL suspension — track sl_count_long/sl_count_short.
+        // Live engine suspends a zone direction after zone_sl_suspend_threshold STOP_LOSS
+        // exits with no intervening winner. Backtest must mirror or it keeps re-entering
+        // zones the live engine has already suspended, producing opposite results.
+        if (config.zone_sl_suspend_threshold > 0
+            && closed_trade.zone_id >= 0
+            && exit_reason == "STOP_LOSS") {
+            for (auto& zone : active_zones) {
+                if (zone.zone_id != closed_trade.zone_id) continue;
+                if (closed_trade.direction == "LONG")
+                    zone.sl_count_long++;
+                else
+                    zone.sl_count_short++;
+                const int sl_count = (closed_trade.direction == "LONG")
+                                     ? zone.sl_count_long : zone.sl_count_short;
+                LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                         << " " << closed_trade.direction
+                         << " sl_count=" << sl_count
+                         << " / threshold=" << config.zone_sl_suspend_threshold);
+                if (sl_count >= config.zone_sl_suspend_threshold) {
+                    LOG_WARN("🚫 Zone #" << zone.zone_id
+                             << " " << closed_trade.direction
+                             << " entries SUSPENDED: " << sl_count
+                             << " SL hits with no winner");
+                }
+                break;
+            }
+        } else if (config.zone_sl_suspend_threshold > 0
+                   && closed_trade.zone_id >= 0
+                   && exit_reason == "TRAIL_SL") {
+            // TRAIL_SL winner: reset sl_count so zone can trade again
+            for (auto& zone : active_zones) {
+                if (zone.zone_id != closed_trade.zone_id) continue;
+                if (closed_trade.direction == "LONG" && zone.sl_count_long > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " LONG sl_count reset (TRAIL_SL winner)");
+                    zone.sl_count_long = 0;
+                } else if (closed_trade.direction == "SHORT" && zone.sl_count_short > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " SHORT sl_count reset (TRAIL_SL winner)");
+                    zone.sl_count_short = 0;
+                }
+                break;
+            }
+        }
+
         // Check if need to pause (only for regular SL, not trailing)
         if (!trade.trailing_activated && consecutive_losses >= config.max_consecutive_losses) {
             pause_counter = config.pause_bars_after_losses;
@@ -1356,10 +1685,10 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         return;
     }
     
-    // Check take profit
-    if (trade_manager.check_take_profit(bar)) {
+    // Check take profit (uses tp_hit flag — see M1/M3 fix above)
+    if (tp_hit) {
         Trade closed_trade = trade_manager.close_trade(
-            bar, "TP", trade.take_profit);
+            bar, "TAKE_PROFIT", exit_price_resolved);
         
         performance.add_trade(closed_trade);
         performance.update_capital(trade_manager.get_capital());
@@ -1385,6 +1714,25 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
             }
         }
 
+        // ⭐ D8 FIX: TP win resets per-direction sl_count — zone proved itself.
+        // Live engine resets sl_count_long/short on TAKE_PROFIT so the zone
+        // can trade again even if it previously hit the suspension threshold.
+        if (config.zone_sl_suspend_threshold > 0 && closed_trade.zone_id >= 0) {
+            for (auto& zone : active_zones) {
+                if (zone.zone_id != closed_trade.zone_id) continue;
+                if (closed_trade.direction == "LONG" && zone.sl_count_long > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " LONG sl_count reset (TAKE_PROFIT win)");
+                    zone.sl_count_long = 0;
+                } else if (closed_trade.direction == "SHORT" && zone.sl_count_short > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " SHORT sl_count reset (TAKE_PROFIT win)");
+                    zone.sl_count_short = 0;
+                }
+                break;
+            }
+        }
+
         std::cout << "Trade #" << closed_trade.trade_num << " hit target: "
                  << "P&L $" << std::fixed << std::setprecision(2) << closed_trade.pnl
                  << std::endl;
@@ -1401,6 +1749,47 @@ void BacktestEngine::process_bar(const Core::Bar& bar, int bar_index) {
     if (trade_manager.is_in_position()) {
         manage_open_position(bar, bar_index);
         return;
+    }
+
+    // ⭐ P1 FIX: RE-ENTRY GUARD SET — runs unconditionally every bar.
+    //
+    // BUG (old): The guard was only SET inside manage_open_position() exit blocks
+    // (STOP_LOSS, SESSION_END). But manage_open_position() has an early return at
+    // the top: "if (!is_in_position()) return". On the bar AFTER a trade closes,
+    // is_in_position() is already FALSE, so manage_open_position() returns before
+    // reaching any guard-set code. The guard was therefore NEVER set in backtest —
+    // a zone that lost could be re-entered immediately on the very next bar.
+    //
+    // FIX: Mirror live engine process_tick() which runs the guard-SET block
+    // unconditionally after manage_position(), before check_for_entries().
+    // This guarantees the guard fires on the SAME bar the trade closes
+    // (manage_open_position sets is_in_position=false then returns), so
+    // check_for_entries() on the SAME bar already sees the guard.
+    {
+        const auto& trades = performance.get_trades();
+        if (!trades.empty()) {
+            const auto& last_trade = trades.back();
+            if (last_trade.exit_date != guard_last_exit_date_ && !last_trade.exit_date.empty()) {
+                guard_last_exit_date_ = last_trade.exit_date;
+                std::string session_date = last_trade.exit_date.substr(0, 10);
+
+                bool block_reentry = false;
+                if (last_trade.exit_reason == "STOP_LOSS") {
+                    block_reentry = true;   // Structural failure — always block
+                } else if (last_trade.exit_reason == "SESSION_END" && last_trade.pnl < 0.0) {
+                    block_reentry = true;   // Losing SESSION_END — zone was weak today
+                }
+                // TRAIL_SL win, TAKE_PROFIT, positive SESSION_END → allow re-entry
+
+                if (block_reentry) {
+                    zone_sl_session_[last_trade.zone_id] = session_date;
+                    LOG_DEBUG("[RE-ENTRY GUARD] Zone " << last_trade.zone_id
+                             << " blocked for rest of session " << session_date
+                             << " after " << last_trade.exit_reason
+                             << " exit (P&L=" << last_trade.pnl << ")");
+                }
+            }
+        }
     }
 
     // Handle pause after consecutive losses
@@ -1431,19 +1820,32 @@ void BacktestEngine::run(int duration_minutes) {
     
     LOG_INFO("Found " << active_zones.size() << " zones across full dataset");
     
-    // Score all initially detected zones (same as live engine)
-    LOG_INFO("Scoring " << active_zones.size() << " zones...");
-    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+    // ⭐ FIX 2: Score each zone against bars[zone.formation_bar], not bars.back().
+    // bars.back() = final bar of entire dataset — all zones scored against Mar-2026
+    // regardless of when they formed. Live scores each zone when it is detected
+    // (scorer.evaluate_zone(zone, regime, bar_history.back()) where back() = detection bar).
+    // Fix: use bars[zone.formation_bar] so zone age, ATR, and distance components
+    // are computed with the same market context the live engine would have used.
+    LOG_INFO("Scoring " << active_zones.size() << " zones at formation bar context...");
     int zones_scored = 0;
     for (auto& zone : active_zones) {
-        // Score the zone with current market context (using last bar)
-        zone.zone_score = scorer.evaluate_zone(zone, regime, bars.back());
+        int score_bar_idx = zone.formation_bar;
+        if (score_bar_idx < 0 || score_bar_idx >= static_cast<int>(bars.size())) {
+            LOG_WARN("Zone " << zone.zone_id << " has invalid formation_bar=" << zone.formation_bar
+                     << " (bars.size()=" << bars.size() << ") — clamping to last bar");
+            score_bar_idx = static_cast<int>(bars.size()) - 1;
+        }
+        const Core::Bar& scoring_bar = bars[score_bar_idx];
+        Core::MarketRegime zone_regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        zone.zone_score = scorer.evaluate_zone(zone, zone_regime, scoring_bar);
         zones_scored++;
-        
-        LOG_DEBUG("Zone " << zone.zone_id << " scored: total=" << zone.zone_score.total_score
+        LOG_DEBUG("Zone " << zone.zone_id
+                 << " scored at bar " << score_bar_idx
+                 << " (" << scoring_bar.datetime << ")"
+                 << ": total=" << zone.zone_score.total_score
                  << " (" << zone.zone_score.entry_rationale << ")");
     }
-    LOG_INFO("Scored " << zones_scored << " zones (avg: " 
+    LOG_INFO("Scored " << zones_scored << " zones (avg: "
              << (zones_scored > 0 ? (std::accumulate(active_zones.begin(), active_zones.end(), 0.0,
                 [](double sum, const Core::Zone& z) { return sum + z.zone_score.total_score; }) / zones_scored) : 0.0)
              << ")");
@@ -1494,6 +1896,41 @@ void BacktestEngine::export_results() {
     LOG_INFO("Exporting results to CSV...");
     
     try {
+        // ⭐ FIX: Delete output files before writing.
+        //
+        // ROOT CAUSE OF DUPLICATE TRADES:
+        // CSVReporter::export_trades() opens its file with ios::app (append mode).
+        // If a trades.csv from a prior run exists in the output directory,
+        // the new run's trades are appended after the old ones — producing
+        // duplicates where the old run's trades appear first, followed by the
+        // current run's trades starting from bar 1 again.
+        //
+        // The symptom: trades #1-5 are identical to trades #6-10 (the first 5
+        // trades of the current run duplicated from the prior run's file).
+        // Reported P&L was inflated by exactly the prior run's P&L.
+        //
+        // FIX: Explicitly delete all three output files before calling CSVReporter.
+        // This is safe because CSVReporter writes all trades from the in-memory
+        // performance tracker in a single pass — no incremental appending is needed.
+        // write_zone_detection_summary() already uses ios::trunc correctly.
+        //
+        // Note: if csv_reporter.cpp is ever fixed to use ios::trunc, this
+        // pre-delete becomes a harmless no-op (deleting a non-existent file
+        // is silently ignored by std::filesystem::remove).
+        for (const std::string& filename : {"trades.csv", "metrics.csv", "equity_curve.csv"}) {
+            fs::path filepath = fs::path(output_dir_) / filename;
+            if (fs::exists(filepath)) {
+                std::error_code ec;
+                fs::remove(filepath, ec);
+                if (ec) {
+                    LOG_WARN("Could not delete stale output file: " << filepath.string()
+                             << " (" << ec.message() << ") — results may contain duplicates");
+                } else {
+                    LOG_DEBUG("Deleted stale output file: " << filepath.string());
+                }
+            }
+        }
+
         CSVReporter reporter(output_dir_);
         const auto& trades = get_trades();
         PerformanceMetrics metrics = performance.calculate_metrics();

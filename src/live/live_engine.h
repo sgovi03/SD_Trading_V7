@@ -271,6 +271,11 @@ protected:
 std::string last_exit_date_ ="";        // replaces static local in manage_position()
 std::string last_guard_date_ = "";       // replaces static local in check_for_entries()
 std::string guard_last_exit_date_ = "";  // replaces static local in process_tick()
+
+    // ⭐ ISSUE-3: Overnight continuation trade snapshot
+    // Populated when a profitable SESSION_END trade closes.
+    // Consumed (and cleared) at the first bar of the next session.
+    Core::PendingContinuation pending_continuation_;
     /**
      * 📝 LOG ORDER TO CSV FOR SIMULATION
      * Writes order details to simulated_orders.csv for DRY-run simulation

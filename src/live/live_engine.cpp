@@ -156,7 +156,8 @@ LiveEngine::LiveEngine(
     dryrun_bootstrap_end_bar_(0),  // ⭐ NEW: Initialize to 0 (no bootstrap)
     skip_trading_until_bar_(false),  // ⭐ NEW: Initialize to false (trading enabled)
     trading_symbol(symbol),
-    bar_interval(interval) {    
+    bar_interval(interval),
+    pending_continuation_() {    // ⭐ ISSUE-3: default-constructed (inactive)    
 		LOG_INFO("=========================================");
 		LOG_INFO("SD TRADING LIVE ENGINE V6.0");
 		LOG_INFO("=========================================");
@@ -694,24 +695,31 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
                 record_event(zone, event, config.record_first_touch);
                 
             } else if (zone.state == ZoneState::TESTED) {
-                zone.touch_count++;
-                zones_changed = true;
-                
-                // Record RETEST event
-                ZoneStateEvent event(
-                    current_bar.datetime,
-                    static_cast<int>(bar_history.size()) - 1,  // ⭐ FIX BUG-08: size()-1 is correct 0-based index
-                    "RETEST",
-                    old_state_str,
-                    "TESTED",
-                    (current_bar.high + current_bar.low) / 2.0,
-                    current_bar.high,
-                    current_bar.low,
-                    zone.touch_count
-                );
-                record_event(zone, event, config.record_retests);
+                // ⭐ FIX BUG-TOUCH: Only count a NEW visit episode (outside→inside
+                // transition). Without this guard, every bar spent inside the zone
+                // incremented touch_count, causing counts like 549,125 and 655,122.
+                if (!zone.was_in_zone_prev) {
+                    zone.touch_count++;
+                    zones_changed = true;
+
+                    // Record RETEST event
+                    ZoneStateEvent event(
+                        current_bar.datetime,
+                        static_cast<int>(bar_history.size()) - 1,  // ⭐ FIX BUG-08: size()-1 is correct 0-based index
+                        "RETEST",
+                        old_state_str,
+                        "TESTED",
+                        (current_bar.high + current_bar.low) / 2.0,
+                        current_bar.high,
+                        current_bar.low,
+                        zone.touch_count
+                    );
+                    record_event(zone, event, config.record_retests);
+                }
             }
-            
+            // ⭐ FIX BUG-TOUCH: price is inside zone this bar
+            zone.was_in_zone_prev = true;
+
             // ✅ BUG #144 FIX: Update volume/OI profiles with FRESH data on zone touch
             // CRITICAL: Only if V6 metrics were properly loaded (have valid baselines)
             if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline > 0.0) {
@@ -750,6 +758,9 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
             } else if (volume_scorer_ && oi_scorer_ && zone.volume_profile.avg_volume_baseline == 0.0) {
                 LOG_WARN("⚠️ Zone " << zone.zone_id << " has corrupted V6 baseline (avg_volume=0), skipping profile update");
             }
+        } else {
+            // Price outside zone — reset so next entry counts as a new episode
+            zone.was_in_zone_prev = false;
         }
         
         // Check for violation
@@ -1094,6 +1105,10 @@ void LiveEngine::replay_historical_zone_states() {
         }
         
         // Process bars for this zone
+        // ⭐ FIX BUG-TOUCH: Reset episode-tracking flag before replaying this zone.
+        // Each zone's bar history is processed independently; flag must start
+        // false so the first bar inside is always counted as a new episode.
+        zone.was_in_zone_prev = false;
         for (size_t i = start_bar; i < bar_history.size(); ++i) {
             total_bar_iterations++;
             
@@ -1131,17 +1146,24 @@ void LiveEngine::replay_historical_zone_states() {
                     record_event(zone, event, config.record_first_touch);
                     
                 } else if (zone.state == ZoneState::TESTED) {
-                    zone.touch_count++;
-                    zones_changed = true;
-                    
-                    ZoneStateEvent event(
-                        bar.datetime, static_cast<int>(i), "RETEST",
-                        get_state_str(old_state), "TESTED",
-                        (bar.high + bar.low) / 2.0, bar.high, bar.low, zone.touch_count
-                    );
-                    record_event(zone, event, config.record_retests);
+                    // ⭐ FIX BUG-TOUCH: Only count a NEW visit episode.
+                    // was_in_zone_prev is updated at the bottom of every bar
+                    // iteration so consecutive inside-bars are suppressed.
+                    if (!zone.was_in_zone_prev) {
+                        zone.touch_count++;
+                        zones_changed = true;
+
+                        ZoneStateEvent event(
+                            bar.datetime, static_cast<int>(i), "RETEST",
+                            get_state_str(old_state), "TESTED",
+                            (bar.high + bar.low) / 2.0, bar.high, bar.low, zone.touch_count
+                        );
+                        record_event(zone, event, config.record_retests);
+                    }
                 }
             }
+            // ⭐ FIX BUG-TOUCH: Update episode-tracking flag for next bar
+            zone.was_in_zone_prev = price_in_zone;
             
             // --- Violation Detection ---
             bool violated = false;
@@ -1989,6 +2011,12 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             sscanf(config.late_entry_cutoff_time.c_str(), "%d:%d", &cut_h, &cut_m);
             cut_hhmm = cut_h * 60 + cut_m;
             if (bar_hhmm >= cut_hhmm) {
+                // ⭐ FIX BUG-1: Increment zones_rejected so the Trade Check Summary
+                // correctly shows "Zones Rejected: N" instead of "Zones Rejected: 0"
+                // when the late-session gate is the reason no trade was generated.
+                // The cutoff fires as a global break before any per-zone rejection
+                // logic runs, so without this the summary was misleading.
+                zones_rejected++;
                 LOG_INFO("Late-session cutoff: no new entries after "
                           << config.late_entry_cutoff_time
                           << " (bar=" << current_bar.datetime << ")");
@@ -2257,16 +2285,24 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
                 continue;
             }
             
-            // Pass zone quality score to calculate_entry for aggressiveness calculation
-            // Pass current_bar pointer for V6 logic
+            // ⭐ FIX BUG-2 (two-stage path): Pass &bar_history as 7th argument.
+            // Previously nullptr was passed, so calculate_entry()'s volume metrics
+            // block (entry_decision_engine.cpp line ~478) was never entered:
+            //   if (current_bar != nullptr && bar_history != nullptr)
+            // This left entry_pullback_vol_ratio / entry_volume_score /
+            // entry_volume_pattern at zero for every live trade.
             const Bar* current_bar_ptr = bar_history.empty() ? nullptr : &bar_history.back();
             decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
-                                                     config.enable_revamped_scoring ? &zone_quality_score : nullptr, current_bar_ptr);
-            // decision.should_enter = true;  // Already validated
+                                                     config.enable_revamped_scoring ? &zone_quality_score : nullptr,
+                                                     current_bar_ptr,
+                                                     &bar_history);  // ⭐ BUG-2 FIX
         } else {
-            // Pass current_bar pointer for V6 logic
+            // ⭐ FIX BUG-2 (non-two-stage path): same fix — pass &bar_history.
             const Bar* current_bar_ptr = bar_history.empty() ? nullptr : &bar_history.back();
-            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime, nullptr, current_bar_ptr);
+            decision = entry_engine.calculate_entry(zone, zone_score, atr, regime,
+                                                     nullptr,
+                                                     current_bar_ptr,
+                                                     &bar_history);  // ⭐ BUG-2 FIX
         }
         
         if (!decision.should_enter) {
@@ -2361,6 +2397,8 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             trading_symbol,  // Live mode needs symbol
             &bar_history     // Pass bars for indicator calculation
         );
+
+
 		if (entered && order_submitter_ && order_submitter_->is_enabled()) {
 			const Trade& trade = trade_mgr.get_current_trade();
 			auto result = order_submitter_->submit_order(
@@ -2375,6 +2413,18 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
 		}
 
         if (entered) {
+            // ⭐ BUG 4 FIX: Assign sequential trade_num immediately after entry.
+            // trade_mgr.enter_trade() does not set trade_num — it is left at 0
+            // (or whatever TradeManager's internal default is). The previous code
+            // never assigned it, so trade_num picked up bar_history.size()-1
+            // (the indicator_bar_index passed to enter_trade) which made trade
+            // numbers like #162, #1061, #9917 — the bar count at entry time,
+            // not a sequential counter. This made log comparison with backtest
+            // impossible and looked like the engine was being restarted.
+            // Fix: set trade_num = completed_trades + 1, identical to backtest.
+            Trade& trade_ref = const_cast<Trade&>(trade_mgr.get_current_trade());
+            trade_ref.trade_num = static_cast<int>(performance.get_trade_count()) + 1;
+
             const Trade& trade = trade_mgr.get_current_trade();
             
             std::cout << "\n+====================================================+\n";
@@ -2607,6 +2657,72 @@ void LiveEngine::manage_position() {
             performance.add_trade(closed_trade);
             performance.update_capital(trade_mgr.get_capital());
             export_trade_journal();
+
+            // ⭐ ISSUE-3: Save overnight continuation snapshot when trade was profitable
+            if (config.enable_overnight_continuation && closed_trade.pnl > 0.0) {
+                double pts_gained = std::abs(closed_trade.exit_price - closed_trade.entry_price);
+                if (!pending_continuation_.active && pts_gained >= config.continuation_min_profit_pts) {
+                    // ⭐ FIX P3: Risk in price points for next-morning gap check.
+                    //
+                    // BUG (old): risk_amount was used as the primary source.
+                    // For TRAIL_SL breakeven exits, risk_amount = 2×commission = ₹200
+                    // (commission-only P&L). Dividing ₹200 by (lots × lot_size) gives
+                    // risk_pts ≈ 1.3 pts, making the gap limit only ~2.3 pts at 1.75×.
+                    // Any overnight gap at all then triggered a skip, making the
+                    // continuation feature useless for all TRAIL_SL-originated snapshots.
+                    //
+                    // FIX: Always derive risk_pts from the structural stop distance
+                    // (entry_price – original_stop_loss). This is the real zone risk
+                    // regardless of what the trade P&L was. risk_amount is only used
+                    // as a cross-check when the stop distance is unavailable.
+                    // A hard floor of 10 pts prevents the gap limit from becoming
+                    // trivially small due to commission-only or near-zero stop distances.
+                    double risk_pts = std::abs(closed_trade.entry_price - closed_trade.original_stop_loss);
+                    if (risk_pts < 10.0) {
+                        // Fallback: derive from risk_amount if stop distance is missing/tiny
+                        if (closed_trade.risk_amount > 0
+                            && closed_trade.position_size > 0
+                            && config.lot_size > 0) {
+                            double risk_from_amount = closed_trade.risk_amount
+                                / (static_cast<double>(closed_trade.position_size)
+                                   * static_cast<double>(config.lot_size));
+                            if (risk_from_amount > risk_pts)
+                                risk_pts = risk_from_amount;
+                        }
+                        // Enforce absolute floor so gap limit is never trivially small
+                        if (risk_pts < 10.0) risk_pts = 10.0;
+                    }
+                    LOG_INFO("[CONTINUATION] risk_pts=" << std::fixed << std::setprecision(1)
+                             << risk_pts << " (entry=" << closed_trade.entry_price
+                             << " orig_sl=" << closed_trade.original_stop_loss
+                             << " risk_amt=" << closed_trade.risk_amount << ")");
+
+                    pending_continuation_.active            = true;
+                    pending_continuation_.zone_id           = closed_trade.zone_id;
+                    pending_continuation_.direction         = closed_trade.direction;
+                    pending_continuation_.prior_pnl         = closed_trade.pnl;
+                    pending_continuation_.prior_entry       = closed_trade.entry_price;
+                    pending_continuation_.prior_risk        = risk_pts;
+                    pending_continuation_.prior_tp_distance =
+                        std::abs(closed_trade.take_profit - closed_trade.entry_price);
+                    pending_continuation_.exit_session      = current_bar.datetime.substr(0, 10);
+                    pending_continuation_.exit_price        = closed_trade.exit_price;
+
+                    LOG_INFO("[CONTINUATION] Snapshot saved -- Zone " << closed_trade.zone_id
+                             << " " << closed_trade.direction
+                             << " | pnl=" << closed_trade.pnl
+                             << " | pts=" << std::fixed << std::setprecision(1) << pts_gained
+                             << " | exit=" << closed_trade.exit_price);
+                    std::cout << "\n[CONTINUATION] Snapshot saved for Zone "
+                              << closed_trade.zone_id << " " << closed_trade.direction
+                              << " | P&L=" << closed_trade.pnl
+                              << " -- will re-evaluate at next session open\n";
+                } else {
+                    LOG_INFO("[CONTINUATION] Snapshot skipped -- pts_gained=" << pts_gained
+                             << " < min=" << config.continuation_min_profit_pts);
+                }
+            }
+
             return;
         }
     }
@@ -2716,7 +2832,32 @@ void LiveEngine::manage_position() {
         }
 
         // Pre-compute fixed stage levels used as floors in ATR stages
-        double stage1_level = trade.entry_price;  // breakeven
+        //
+        // ⭐ FIX ISSUE-2: Stage 1 "breakeven" was set to exactly trade.entry_price.
+        // When the trail activated at Stage 1 and price reversed back to entry,
+        // the exit filled at entry_price with P&L = 0 - 2×commission = -₹200.
+        // This commission-only loss was recorded as a TRAIL_SL loss, incorrectly
+        // counted in consecutive_losses and degrading reported metrics.
+        //
+        // Fix: Stage 1 locks in entry_price PLUS enough points to cover both
+        // commissions (entry + exit), so the net P&L is always >= 0 on a
+        // breakeven trail exit. The commission offset is:
+        //   2 × commission_per_trade / (position_size × lot_size)
+        // This converts the fixed ₹ commission into the equivalent price points
+        // for this trade's size, ensuring the trail stop sits above true breakeven.
+        double commission_pts = 0.0;
+        {
+            int qty = trade.position_size * config.lot_size;
+            if (qty > 0 && config.commission_per_trade > 0.0) {
+                // 2 commissions (entry + exit), converted to per-point value
+                commission_pts = (2.0 * config.commission_per_trade)
+                                 / static_cast<double>(qty);
+            }
+        }
+        // Stage 1: entry + commission offset (long) or entry - offset (short)
+        double stage1_level = (trade.direction == "LONG")
+            ? trade.entry_price + commission_pts
+            : trade.entry_price - commission_pts;
         double stage2_level = (trade.direction == "LONG")
             ? trade.entry_price + (risk * 0.5)
             : trade.entry_price - (risk * 0.5);
@@ -2970,10 +3111,16 @@ void LiveEngine::manage_position() {
             }
         }
 
-        // ⭐ P1: Per-zone consecutive-loss tracking → EXHAUSTED state
+        // ⭐ FIX BUG-3: Per-zone consecutive-loss tracking → EXHAUSTED state
+        // TRAIL_SL is a winner (trailing stop activated = price moved in our favour).
+        // Only STOP_LOSS exits should increment consecutive_losses.
+        // TRAIL_SL and TAKE_PROFIT wins reset the counter instead.
         if (config.enable_zone_exhaustion && closed_trade.zone_id >= 0) {
             for (auto& zone : active_zones) {
-                if (zone.zone_id == closed_trade.zone_id) {
+                if (zone.zone_id != closed_trade.zone_id) continue;
+
+                if (exit_reason == "STOP_LOSS") {
+                    // Genuine loss — increment counter
                     zone.consecutive_losses++;
                     LOG_INFO("Zone " << zone.zone_id << " consecutive_losses="
                              << zone.consecutive_losses << " / max=" << config.zone_consecutive_loss_max);
@@ -2989,16 +3136,35 @@ void LiveEngine::manage_position() {
                                   << zone.consecutive_losses << " consecutive SL losses)"
                                   << std::endl;
                     }
-                    break;
+                } else {
+                    // TRAIL_SL = winner (trail activated before SL hit).
+                    // SESSION_END may be win or loss — in either case it is not a
+                    // structural zone failure, so we do not penalise the zone.
+                    // Reset consecutive_losses so the zone stays tradeable.
+                    if (zone.consecutive_losses > 0) {
+                        LOG_INFO("Zone " << zone.zone_id
+                                 << " consecutive_losses reset ("
+                                 << exit_reason << " exit — not a zone failure)");
+                        zone.consecutive_losses = 0;
+                        // Un-exhaust if the zone was exhausted by prior SL run
+                        if (zone.state == ZoneState::EXHAUSTED) {
+                            zone.state = ZoneState::TESTED;
+                            zone.exhausted_at_datetime = "";
+                            LOG_INFO("Zone " << zone.zone_id
+                                     << " un-EXHAUSTED → TESTED (" << exit_reason << " win)");
+                        }
+                    }
                 }
+                break;
             }
         }
 
-        // ⭐ ISSUE-2: Per-direction SL suspension
-        // When a zone accumulates zone_sl_suspend_threshold SL hits in one direction
-        // with no intervening winner, that direction is blocked for the remainder of
-        // the run. sl_count_long/short are runtime-only (reset to 0 on engine restart).
-        if (config.zone_sl_suspend_threshold > 0 && closed_trade.zone_id >= 0) {
+        // ⭐ FIX BUG-3b: Per-direction SL suspension — only real STOP_LOSS exits count.
+        // TRAIL_SL exits (winners) must NOT increment sl_count_long/short.
+        // Previously all exits through sl_hit path incremented the counter,
+        // causing Zone 10 to be suspended after a TRAIL_SL winner (+₹17,025).
+        if (config.zone_sl_suspend_threshold > 0 && closed_trade.zone_id >= 0
+            && exit_reason == "STOP_LOSS") {
             for (auto& zone : active_zones) {
                 if (zone.zone_id != closed_trade.zone_id) continue;
                 if (closed_trade.direction == "LONG")
@@ -3019,6 +3185,23 @@ void LiveEngine::manage_position() {
                     std::cout << "🚫 Zone #" << zone.zone_id
                               << " SUSPENDED for " << closed_trade.direction
                               << " entries (" << sl_count << " SL hits, no winner)\n";
+                }
+                break;
+            }
+        } else if (config.zone_sl_suspend_threshold > 0 && closed_trade.zone_id >= 0
+                   && exit_reason == "TRAIL_SL") {
+            // TRAIL_SL winner: reset sl_count for this direction so the zone
+            // can trade again even if it previously hit the SL threshold.
+            for (auto& zone : active_zones) {
+                if (zone.zone_id != closed_trade.zone_id) continue;
+                if (closed_trade.direction == "LONG" && zone.sl_count_long > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " LONG sl_count reset (TRAIL_SL winner)");
+                    zone.sl_count_long = 0;
+                } else if (closed_trade.direction == "SHORT" && zone.sl_count_short > 0) {
+                    LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                             << " SHORT sl_count reset (TRAIL_SL winner)");
+                    zone.sl_count_short = 0;
                 }
                 break;
             }
@@ -3072,7 +3255,9 @@ void LiveEngine::manage_position() {
 
         LOG_INFO("Position closed: TAKE_PROFIT, P&L: $" << closed_trade.pnl);
 
-        // ⭐ P1: TP win resets zone consecutive-loss counter
+        // ⭐ FIX BUG-3c: TP win — reset consecutive_losses and sl_count for this zone.
+        // Also handles TRAIL_SL winners that reach the TP block (take_profit hit
+        // before trailing stop triggers) — same reset logic applies.
         if (config.enable_zone_exhaustion && closed_trade.zone_id >= 0) {
             for (auto& zone : active_zones) {
                 if (zone.zone_id == closed_trade.zone_id) {
@@ -3083,6 +3268,18 @@ void LiveEngine::manage_position() {
                             zone.state = ZoneState::TESTED;
                             zone.exhausted_at_datetime = "";
                             LOG_INFO("Zone " << zone.zone_id << " un-EXHAUSTED → TESTED (TP win)");
+                        }
+                    }
+                    // TP win also resets per-direction SL suspension counter
+                    if (config.zone_sl_suspend_threshold > 0) {
+                        if (closed_trade.direction == "LONG" && zone.sl_count_long > 0) {
+                            LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                                     << " LONG sl_count reset (TAKE_PROFIT win)");
+                            zone.sl_count_long = 0;
+                        } else if (closed_trade.direction == "SHORT" && zone.sl_count_short > 0) {
+                            LOG_INFO("[SL-SUSPEND] Zone #" << zone.zone_id
+                                     << " SHORT sl_count reset (TAKE_PROFIT win)");
+                            zone.sl_count_short = 0;
                         }
                     }
                     break;
@@ -3115,6 +3312,161 @@ void LiveEngine::process_tick() {
     // Update bar history (bar_index is now incremented inside update_bar_history only when new bar is added)
     update_bar_history();
     
+    // =========================================================================
+    // ⭐ ISSUE-3: OVERNIGHT CONTINUATION -- evaluate at next-session open
+    // =========================================================================
+    // Conditions checked every bar but only fires when:
+    //   (a) continuation is pending  (b) new session date  (c) no open position
+    //   (d) zone still valid         (e) price in zone     (f) EMA aligned
+    //   (g) entry score >= threshold
+    // On pass  -> fresh trade entered (new SL/TP/size from today's ATR)
+    // On fail  -> snapshot cleared, reason logged
+    // =========================================================================
+    if (config.enable_overnight_continuation
+        && pending_continuation_.active
+        && !trade_mgr.is_in_position()
+        && !bar_history.empty()) {
+
+        const Bar& cur      = bar_history.back();
+        std::string cur_date = cur.datetime.substr(0, 10);
+
+        // Only act on a NEW session (not the same day the trade closed)
+        if (cur_date != pending_continuation_.exit_session) {
+
+            bool fired = false;
+            std::string skip_reason;
+
+            // -- Locate the zone -------------------------------------------
+            Zone* tgt = nullptr;
+            for (auto& z : active_zones) {
+                if (z.zone_id == pending_continuation_.zone_id) { tgt = &z; break; }
+            }
+
+            if (!tgt) {
+                skip_reason = "Zone " + std::to_string(pending_continuation_.zone_id)
+                              + " no longer in active_zones";
+            } else if (tgt->state == ZoneState::VIOLATED
+                    || tgt->state == ZoneState::EXHAUSTED) {
+                skip_reason = "Zone " + std::to_string(tgt->zone_id)
+                              + " is VIOLATED or EXHAUSTED";
+            } else {
+                // -- Adverse gap check -------------------------------------
+                // Gap = how far open moved AGAINST the trade direction overnight
+                double gap_adverse = (pending_continuation_.direction == "LONG")
+                    ? (pending_continuation_.exit_price - cur.open)   // positive = gap down = bad for long
+                    : (cur.open - pending_continuation_.exit_price);  // positive = gap up   = bad for short
+                double max_gap = pending_continuation_.prior_risk * config.continuation_max_gap_pct;
+
+                if (gap_adverse > max_gap) {
+                    skip_reason = "Adverse gap " + std::to_string(gap_adverse)
+                                  + " pts > limit " + std::to_string(max_gap) + " pts";
+                } else {
+                    // -- Price must overlap the zone on this bar -----------
+                    double z_lo = std::min(tgt->proximal_line, tgt->distal_line);
+                    double z_hi = std::max(tgt->proximal_line, tgt->distal_line);
+                    bool in_zone = (cur.high >= z_lo && cur.low <= z_hi);
+
+                    if (!in_zone) {
+                        skip_reason = "Price not in zone (bar " + std::to_string(cur.low)
+                                      + "-" + std::to_string(cur.high)
+                                      + ", zone " + std::to_string(z_lo)
+                                      + "-" + std::to_string(z_hi) + ")";
+                    } else {
+                        // -- EMA alignment --------------------------------
+                        int cur_idx  = static_cast<int>(bar_history.size()) - 1;
+                        double ema20 = MarketAnalyzer::calculate_ema(bar_history, 20, cur_idx);
+                        double ema50 = MarketAnalyzer::calculate_ema(bar_history, 50, cur_idx);
+                        bool ema_ok  = (pending_continuation_.direction == "LONG")
+                            ? (ema20 > ema50) : (ema20 < ema50);
+
+                        if (!ema_ok) {
+                            skip_reason = "EMA misaligned (EMA20="
+                                          + std::to_string(static_cast<int>(ema20))
+                                          + " EMA50=" + std::to_string(static_cast<int>(ema50)) + ")";
+                        } else {
+                            // -- Entry score -------------------------------
+                            double atr       = MarketAnalyzer::calculate_atr(bar_history, config.atr_period);
+                            MarketRegime reg = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+                            ZoneScore zscore = scorer.evaluate_zone(*tgt, reg, cur);
+                            double min_score = config.scoring.entry_minimum_score
+                                               * config.continuation_min_score_pct;
+
+                            if (zscore.total_score < min_score) {
+                                skip_reason = "Score " + std::to_string(zscore.total_score)
+                                              + " < min " + std::to_string(min_score);
+                            } else {
+                                // -- All checks passed -- calculate entry ---
+                                // ⭐ FIX P7: Pass is_continuation=true to bypass
+                                // the pullback-vol gate (see entry_decision_engine.cpp).
+                                EntryDecision dec = entry_engine.calculate_entry(
+                                    *tgt, zscore, atr, reg, nullptr, &cur, &bar_history,
+                                    true);  // is_continuation=true
+
+                                if (!dec.should_enter) {
+                                    skip_reason = "calculate_entry rejected: "
+                                                  + dec.rejection_reason;
+                                } else {
+                                    // Apply position cap
+                                    if (config.max_position_lots > 0
+                                        && dec.lot_size > config.max_position_lots)
+                                        dec.lot_size = config.max_position_lots;
+
+                                    bool entered = trade_mgr.enter_trade(
+                                        dec, *tgt, cur, cur_idx, reg,
+                                        trading_symbol, &bar_history);
+
+                                    if (entered) {
+                                        fired = true;
+                                        const Trade& t = trade_mgr.get_current_trade();
+                                        pending_continuation_.clear();
+
+                                        LOG_INFO("[CONTINUATION] Re-entered Zone "
+                                                 << tgt->zone_id << " " << t.direction
+                                                 << " @ " << std::fixed << std::setprecision(2)
+                                                 << t.entry_price
+                                                 << " SL=" << t.stop_loss
+                                                 << " TP=" << t.take_profit
+                                                 << " Lots=" << t.position_size);
+                                        std::cout
+                                            << "\n+====================================================+\n"
+                                            << "| [CONTINUATION] Next-session re-entry!             |\n"
+                                            << "+====================================================+\n"
+                                            << "  Zone:        " << tgt->zone_id << "\n"
+                                            << "  Direction:   " << t.direction << "\n"
+                                            << "  Entry:       " << std::fixed << std::setprecision(2)
+                                                                 << t.entry_price << "\n"
+                                            << "  Stop Loss:   " << t.stop_loss << "\n"
+                                            << "  Take Profit: " << t.take_profit << "\n"
+                                            << "  Lots:        " << t.position_size << "\n"
+                                            << std::endl;
+                                        std::cout.flush();
+
+                                        if (order_submitter_ && order_submitter_->is_enabled()) {
+                                            order_submitter_->submit_order(
+                                                t.direction, t.position_size,
+                                                tgt->zone_id, t.zone_score,
+                                                t.entry_price, t.stop_loss, t.take_profit);
+                                        }
+                                    } else {
+                                        skip_reason = "enter_trade() rejected (SL/size validation)";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!fired) {
+                LOG_INFO("[CONTINUATION] SKIP: Continuation skipped -- " << skip_reason);
+                std::cout << "\n[CONTINUATION] Skipped: " << skip_reason << "\n";
+                pending_continuation_.clear();
+            }
+        }
+        // else: same session as exit -- wait for tomorrow's first bar
+    }
+    // =========================================================================
+
     // ⭐ NEW: Periodic zone refresh (LTP ±5%, every 30 min)
     if (config.enable_live_zone_filtering && bar_history.size() > 0) {
         double current_ltp = bar_history.back().close;
@@ -3143,6 +3495,18 @@ void LiveEngine::process_tick() {
     // is FALSE so manage_position() returns immediately — the guard would never be set.
     // By running here unconditionally we guarantee the guard is set on the SAME bar
     // the trade closes (or at worst the very next bar), before check_for_entries() runs.
+    //
+    // ⭐ FIX BUG-7: Only block re-entry after genuinely bad exits.
+    // Previous behaviour blocked the zone for the rest of the session after ANY exit
+    // including TRAIL_SL winners (+₹17,025 in Zone 10). This prevented re-entry on
+    // the same zone even when price returned with a fresh, valid setup.
+    //
+    // Rules:
+    //   STOP_LOSS              → always block (structural zone failure)
+    //   SESSION_END, P&L < 0  → block (losing hold, zone showed weakness today)
+    //   SESSION_END, P&L >= 0 → do NOT block (exited profitably, zone is still valid)
+    //   TRAIL_SL               → do NOT block (winner — zone proved itself)
+    //   TAKE_PROFIT            → do NOT block (full winner)
     {
         const auto& trades = performance.get_trades();
         if (!trades.empty()) {
@@ -3152,10 +3516,28 @@ void LiveEngine::process_tick() {
             if (last_trade.exit_date != guard_last_exit_date_ && !last_trade.exit_date.empty()) {
                 guard_last_exit_date_ = last_trade.exit_date;
                 std::string session_date = last_trade.exit_date.substr(0, 10);
-                zone_sl_session_[last_trade.zone_id] = session_date;
-                LOG_INFO("[RE-ENTRY GUARD] Zone " << last_trade.zone_id
-                         << " blocked for rest of session " << session_date
-                         << " after " << last_trade.exit_reason << " exit");
+
+                // Determine whether this exit warrants blocking re-entry
+                bool block_reentry = false;
+                if (last_trade.exit_reason == "STOP_LOSS") {
+                    block_reentry = true;   // Structural failure — always block
+                } else if (last_trade.exit_reason == "SESSION_END" && last_trade.pnl < 0.0) {
+                    block_reentry = true;   // Losing SESSION_END — zone was weak today
+                }
+                // TRAIL_SL win, TAKE_PROFIT, positive SESSION_END → allow re-entry
+
+                if (block_reentry) {
+                    zone_sl_session_[last_trade.zone_id] = session_date;
+                    LOG_INFO("[RE-ENTRY GUARD] Zone " << last_trade.zone_id
+                             << " blocked for rest of session " << session_date
+                             << " after " << last_trade.exit_reason << " exit"
+                             << " (P&L=" << last_trade.pnl << ")");
+                } else {
+                    LOG_INFO("[RE-ENTRY GUARD] Zone " << last_trade.zone_id
+                             << " NOT blocked after " << last_trade.exit_reason
+                             << " exit (P&L=" << last_trade.pnl
+                             << ") — zone remains tradeable this session");
+                }
             }
         }
     }
@@ -3620,6 +4002,30 @@ void LiveEngine::run(int duration_minutes) {
                         int added_count = 0;
 
                         for (auto& zone : new_zones) {
+                            // ⭐ BUG 3 FIX: Secondary dedup check against active_zones.
+                            // detect_zones_no_duplicates() only deduplicates within the
+                            // detector's own output — it does NOT check whether a zone
+                            // with the same boundaries was already added by process_zones()
+                            // in a previous call. When live_zone_detection_lookback_bars > 0
+                            // the scan window overlaps prior scans, so the same zone can be
+                            // returned by the detector multiple times across consecutive
+                            // periodic detection cycles → 4-18 copies of the same zone.
+                            // Fix: mirror the same boundary+formation_bar check that
+                            // process_zones() uses before accepting a zone.
+                            bool already_active = false;
+                            for (const auto& active : active_zones) {
+                                if (zone.formation_bar == active.formation_bar &&
+                                    std::abs(zone.proximal_line - active.proximal_line) < 1.0 &&
+                                    std::abs(zone.distal_line   - active.distal_line)   < 1.0) {
+                                    already_active = true;
+                                    LOG_DEBUG("Periodic detect: zone at bar " << zone.formation_bar
+                                             << " [" << zone.distal_line << "-" << zone.proximal_line
+                                             << "] already in active_zones — skipping duplicate");
+                                    break;
+                                }
+                            }
+                            if (already_active) continue;
+
                             zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
                             zone.zone_id = next_zone_id_++;
                             active_zones.push_back(zone);

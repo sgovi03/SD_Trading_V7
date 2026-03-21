@@ -118,7 +118,10 @@ public:
      * @param current_bar Current bar for V6.0 volume/OI validation
      * @return Complete entry decision with prices and ratios
      */
-    EntryDecision calculate_entry(const Zone& zone, const ZoneScore& score, double atr, MarketRegime regime = MarketRegime::RANGING, const ZoneQualityScore* zone_quality_score = nullptr, const Bar* current_bar = nullptr, const std::vector<Bar>* bar_history = nullptr) const;
+    // ⭐ FIX P7: is_continuation=true bypasses the pullback-vol gate.
+    // Continuation re-entries have already proven the zone in the prior session;
+    // the next-morning bar's pullback volume is unrelated to zone quality.
+    EntryDecision calculate_entry(const Zone& zone, const ZoneScore& score, double atr, MarketRegime regime = MarketRegime::RANGING, const ZoneQualityScore* zone_quality_score = nullptr, const Bar* current_bar = nullptr, const std::vector<Bar>* bar_history = nullptr, bool is_continuation = false) const;
 
     /**
      * Two-stage scoring gate (optional)
