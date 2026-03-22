@@ -18,7 +18,7 @@
   },
   
   "files": {
-    "strategy_config": "conf/phase_6_config_v0_7_NEW_v0.0.txt",
+    "strategy_config": "conf/phase_6_config_v0_7_NEW_v0.2_TUNED_79pct_PROFIT.txt",
     "fyers_token": "scripts/fyers_token.txt",
     "fyers_config": "scripts/fyers_config.json",
     "live_data_csv": "data/LiveTest/Live_Data_5Mins_Sep05_Mar26.csv",
