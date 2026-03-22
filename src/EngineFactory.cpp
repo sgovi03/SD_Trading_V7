@@ -45,6 +45,23 @@ std::unique_ptr<ITradingEngine> EngineFactory::create(
         LOG_WARN("sys_config.trading_lot_size=0 — keeping phase_6 config value: " << config.lot_size);
     }
 
+    // ⭐ GAP-2 FIX: Propagate system_config zone bootstrap and detection settings to Config.
+    // Previously these fields were loaded into SystemConfig from system_config.json but
+    // never copied into the Config object used by the engines.
+    // Config.zone_bootstrap_force_regenerate defaulted to false → stale cache always reused.
+    // Config.live_zone_detection_interval_bars was commented out → never propagated.
+    // Result: ZoneInitializer dedup fix never ran (cache bypassed it), and new zones
+    // formed during simulation were never detected.
+    config.zone_bootstrap_force_regenerate   = sys_config.zone_bootstrap_force_regenerate;
+    config.zone_bootstrap_enabled            = sys_config.zone_bootstrap_enabled;
+    config.zone_bootstrap_ttl_hours          = sys_config.zone_bootstrap_ttl_hours;
+    config.zone_bootstrap_refresh_time       = sys_config.zone_bootstrap_refresh_time;
+    config.live_zone_detection_interval_bars = sys_config.live_zone_detection_interval_bars;
+    LOG_INFO("System config overrides applied: "
+             << "force_regenerate=" << config.zone_bootstrap_force_regenerate
+             << " zone_detection_interval=" << config.live_zone_detection_interval_bars
+             << " bootstrap_enabled=" << config.zone_bootstrap_enabled);
+
     // Add runtime guard immediately after all overrides
     if (config.lot_size <= 0) {
         throw std::runtime_error(
@@ -59,7 +76,7 @@ std::unique_ptr<ITradingEngine> EngineFactory::create(
         std::cout << "  starting_capital:     Rs" << config.starting_capital << "\n";
         double max_sl_1lot = config.max_loss_per_trade / config.lot_size;
         std::cout << "  Max SL distance @1lot: " << max_sl_1lot << " pts\n\n";
-    //config.live_zone_detection_interval_bars = sys_config.live_zone_detection_interval_bars;  // ADD THIS
+    // (live_zone_detection_interval_bars is now propagated above via GAP-2 fix)
     
     // Apply dryrun bootstrap parameters if provided
     if (mode == "dryrun") {

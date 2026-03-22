@@ -129,7 +129,7 @@ private:
      * MODIFIED: Now saves zones after state changes
      * @param bar Current bar
      */
-    void update_zone_states(const Core::Bar& bar);
+    void update_zone_states(const Core::Bar& bar, int bar_index);
     
     /**
      * NEW: Detect zone flip after breakdown (opposite zone creation)

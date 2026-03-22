@@ -46,9 +46,14 @@ public:
      * @param threshold Percentage threshold for regime detection
      * @return Market regime
      */
-    static MarketRegime detect_regime(const std::vector<Bar>& bars, 
-                                      int lookback = 50, 
-                                      double threshold = 5.0);
+    // ⭐ LOOKAHEAD FIX: end_index pins the "current" bar so BT callers can pass
+    // bar_index instead of bars.size()-1 (which is a future bar in BT's full dataset).
+    // Default -1 preserves the old behaviour for LT callers that already use bar_history
+    // up to the current bar, so bars.size()-1 IS the current bar there.
+    static MarketRegime detect_regime(const std::vector<Bar>& bars,
+                                      int lookback = 50,
+                                      double threshold = 5.0,
+                                      int end_index = -1);
 
     /**
      * Analyze Higher Time Frame trend

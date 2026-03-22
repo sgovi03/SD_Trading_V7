@@ -330,9 +330,96 @@ OrderResponse CsvSimulatorBroker::place_limit_order(const std::string& symbol,
                                                     const std::string& direction,
                                                     int quantity,
                                                     double price) {
-    // For simplicity, treat limit orders as market orders
-    LOG_INFO("Converting limit order to market order (simulation)");
-    return place_market_order(symbol, direction, quantity);
+    // ⭐ GAP-1 FIX: Simulate a proper limit order fill, matching backtest behaviour.
+    //
+    // BACKTEST execute_entry clamps fills to the bar's actual range:
+    //   SELL (SHORT): fill = price IF bar.high >= price, else fill = bar.high
+    //   BUY  (LONG):  fill = price IF bar.low  <= price, else fill = bar.low
+    // If the bar never reached the limit price on the protective side:
+    //   SELL: bar.high < price  → reject (bar never reached our sell level)
+    //   BUY:  bar.low  > price  → reject (bar never fell to our buy level)
+    //
+    // Previously CsvSimulatorBroker ignored the limit price entirely and filled
+    // at get_ltp() = bar.close, which could be 5–70 pts past the intended entry.
+    // This caused SL rescue paths to fire, degrading RR on virtually every trade.
+    //
+    // With this fix, both engines fill using the same limit-order semantics:
+    //   - Entry at or better than the intended proximal-line price
+    //   - Never filled deep inside the zone at bar.close
+    
+    const Bar* current_bar = nullptr;
+    Bar bar_snapshot;
+    if (current_bar_index_ < all_bars_.size()) {
+        bar_snapshot = all_bars_[current_bar_index_];
+        current_bar = &bar_snapshot;
+    }
+
+    double fill_price = price;  // start with the intended limit price
+
+    if (current_bar != nullptr) {
+        if (direction == "SELL") {
+            // SHORT: limit sell at 'price'. Bar must reach that level.
+            if (current_bar->high < price) {
+                // Bar never reached our sell price — reject the order.
+                OrderResponse rejected;
+                rejected.status = OrderStatus::REJECTED;
+                rejected.message = "Limit SELL not fillable: bar.high=" +
+                                   std::to_string(current_bar->high) +
+                                   " < limit=" + std::to_string(price);
+                LOG_INFO("📵 LIMIT SELL rejected: bar.high=" << current_bar->high
+                         << " < limit=" << price);
+                return rejected;
+            }
+            // Bar reached our level — fill at limit price (or bar.high if that's worse)
+            fill_price = std::min(price, current_bar->high);
+        } else {
+            // BUY / LONG: limit buy at 'price'. Bar must fall to that level.
+            if (current_bar->low > price) {
+                // Bar never fell to our buy price — reject the order.
+                OrderResponse rejected;
+                rejected.status = OrderStatus::REJECTED;
+                rejected.message = "Limit BUY not fillable: bar.low=" +
+                                   std::to_string(current_bar->low) +
+                                   " > limit=" + std::to_string(price);
+                LOG_INFO("📵 LIMIT BUY rejected: bar.low=" << current_bar->low
+                         << " > limit=" << price);
+                return rejected;
+            }
+            // Bar fell to our level — fill at limit price (or bar.low if that's worse)
+            fill_price = std::max(price, current_bar->low);
+        }
+    }
+
+    // Accepted — record position and return fill
+    current_position_.symbol      = symbol;
+    current_position_.direction   = direction;
+    current_position_.entry_price = fill_price;
+    current_position_.quantity    = quantity;
+    current_position_.is_open     = true;
+    if (current_bar_index_ < all_bars_.size()) {
+        current_position_.entry_time = all_bars_[current_bar_index_].datetime;
+    }
+
+    OrderResponse response;
+    response.order_id        = "SIM_LMT_" + std::to_string(order_history_.size() + 1);
+    response.status          = OrderStatus::FILLED;
+    response.filled_price    = fill_price;
+    response.filled_quantity = quantity;
+    response.message         = "Limit order filled at " + std::to_string(fill_price);
+
+    OrderLog log;
+    log.timestamp   = current_position_.entry_time;
+    log.symbol      = symbol;
+    log.order_type  = "ENTRY_LIMIT";
+    log.direction   = direction;
+    log.price       = fill_price;
+    log.quantity    = quantity;
+    log.exit_reason = "";
+    order_history_.push_back(log);
+
+    LOG_INFO("📝 LIMIT ORDER FILLED: " << direction << " " << quantity
+             << " @ " << fill_price << " (limit=" << price << ")");
+    return response;
 }
 
 bool CsvSimulatorBroker::check_position_exit(const Bar& current_bar) {

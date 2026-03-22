@@ -181,8 +181,8 @@ rejection_moderate_threshold = 0.4
 rejection_weak_threshold = 0.2
 max_consolidation_range = 3.0
 
-use_htf_regime_filter = NO
-htf_lookback_bars = 700
+use_htf_regime_filter = YES
+htf_lookback_bars = 1000
 htf_trending_threshold = 5.0
 
 min_departure_imbalance = 2.0
@@ -395,10 +395,10 @@ zone_sl_suspend_threshold       =   3      # SL hits per direction before suspen
 # ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
 # Default: trade at half size. Set adx_transition_skip_entry=YES to skip entirely.
 enable_adx_transition_filter = YES
-adx_transition_min           = 40.0
-adx_transition_max           = 60.0
+adx_transition_min           = 60.0
+adx_transition_max           = 999.0
 adx_transition_size_factor   = 0.5   # Half position in danger band
-adx_transition_skip_entry    = NO    # NO=half-size; YES=skip entry entirely
+adx_transition_skip_entry    = YES    # NO=half-size; YES=skip entry entirely
 
 # Priority 3: Late-session entry cutoff
 # No new entries at or after this time. Trade #1719 (15:05) lost -₹9,274 in 1 bar.

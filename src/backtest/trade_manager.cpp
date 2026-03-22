@@ -236,14 +236,27 @@ double TradeManager::execute_entry(const std::string& symbol,
         return 0.0;
     }
 
-    OrderResponse response = broker->place_market_order(symbol, direction, quantity);
+    // ⭐ GAP-1 FIX: Use place_limit_order() instead of place_market_order().
+    // place_market_order() ignored the intended entry price entirely, filling at
+    // bar.close (CsvSimulatorBroker) or market price (real broker). This caused
+    // fills 5–70 pts past the proximal line, triggering SL rescue and degrading RR.
+    //
+    // place_limit_order() passes the intended entry price (decision.entry_price =
+    // proximal ± aggressiveness × zone_height) to the broker:
+    //   CsvSimulatorBroker: clamps fill to bar range, rejects if bar never reached price
+    //   FyersAdapter:       submits actual limit order at the specified price
+    //
+    // This makes LT entry fills identical to BT: at the limit price or better,
+    // never deep inside the zone at bar.close.
+    OrderResponse response = broker->place_limit_order(symbol, direction, quantity, price);
 
     if (response.status != OrderStatus::FILLED) {
-        LOG_ERROR("Order failed: " + response.message);
+        LOG_INFO("LIVE: Limit order not filled (rejected or bar did not reach price): "
+                 + response.message);
         return 0.0;
     }
 
-    LOG_INFO("LIVE: Order filled @ " + std::to_string(response.filled_price));
+    LOG_INFO("LIVE: Limit order filled @ " + std::to_string(response.filled_price));
     return response.filled_price;
 }
 

@@ -278,7 +278,7 @@ bool BacktestEngine::initialize() {
     return true;
 }
 
-void BacktestEngine::update_zone_states(const Core::Bar& bar) {
+void BacktestEngine::update_zone_states(const Core::Bar& bar, int bar_index) {
     bool zones_changed = false;
 
     auto record_event = [&](Core::Zone& target_zone, const Core::ZoneStateEvent& evt, bool enabled) {
@@ -297,6 +297,27 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
     
     // Update states of active zones based on price action
     for (auto& zone : active_zones) {
+        // ⭐ RC1 FIX: Skip bars that occurred AT OR BEFORE this zone's formation bar.
+        //
+        // ROOT CAUSE of touch_count divergence between BT and LT:
+        // ZoneInitializer adds ALL zones to active_zones before bar 0.
+        // Without this guard, update_zone_states processes every zone on every bar,
+        // including bars 0..formation_bar that predate or coincide with zone creation.
+        //
+        // The formation bar (bar_index == formation_bar) is special: by definition the
+        // zone's price range overlaps this bar (that's how the zone was detected).
+        // Processing it fires FIRST_TOUCH immediately → was_in_zone_prev=true.
+        // If NIFTY stays near the zone level on the next several bars, they are all
+        // suppressed as consecutive (was_in_zone_prev=true), and the genuine retest
+        // episodes that LT replay counts from formation_bar+1 are never seen by BT.
+        // Result: BT touch_count=1 (formation bar only), LT touch_count=57+ (real episodes).
+        //
+        // FIX: Skip bar_index <= zone.formation_bar (formation bar AND all prior bars).
+        // BT now starts counting at formation_bar+1, exactly matching LT replay's
+        // start_bar = formation_bar + 1. Both engines count from the same baseline.
+        if (bar_index <= zone.formation_bar) {
+            continue;
+        }
         Core::ZoneState old_state = zone.state;
         std::string old_state_str = (old_state == Core::ZoneState::FRESH ? "FRESH" :
                                       old_state == Core::ZoneState::TESTED ? "TESTED" : "VIOLATED");
@@ -435,9 +456,15 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
                     record_event(zone, event, config.record_retests);
                 }
             }
-            // ⭐ D2 FIX: Update episode-tracking flag
-            zone.was_in_zone_prev = price_in_zone;
         }
+        
+        // ⭐ D2 FIX: Update episode-tracking flag — MUST be outside if(price_in_zone).
+        // When price is NOT in zone, this sets was_in_zone_prev=false, allowing the
+        // next in-zone bar to be counted as a new episode (RETEST).
+        // Previously this line was inside if(price_in_zone): when price left the zone
+        // was_in_zone_prev was never reset to false, permanently suppressing all future
+        // RETEST events. BT got touch_count=1 (only FIRST_TOUCH) for every zone.
+        zone.was_in_zone_prev = price_in_zone;
         
         // Check for violation
         bool violated = false;
@@ -555,7 +582,10 @@ void BacktestEngine::update_zone_states(const Core::Bar& bar) {
                     flipped_zone->zone_id = next_zone_id_++;
                     
                     // Score the flipped zone
-                    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+                    // ⭐ LOOKAHEAD FIX: pass bar_index so regime is computed at the
+                    // current bar, not at bars.back() (which is a future bar in BT).
+                    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(
+                        bars, 50, 5.0, bar_index);
                     flipped_zone->zone_score = scorer.evaluate_zone(flipped_zone.value(), regime, bar);
                     
                     LOG_DEBUG("Flipped zone scored: ID=" << flipped_zone->zone_id 
@@ -608,7 +638,10 @@ void BacktestEngine::detect_and_add_zones(const Core::Bar& bar, int bar_index) {
     for (auto& zone : new_zones) {
         zone.zone_id = next_zone_id_++;
 
-        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        // ⭐ LOOKAHEAD FIX: pass bar_index so regime is computed at the
+        // current bar, not at bars.back() (future bar in BT's full dataset).
+        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(
+            bars, 50, 5.0, bar_index);
         zone.zone_score = scorer.evaluate_zone(zone, regime, bar);
 
         LOG_DEBUG("Zone scored: ID=" << zone.zone_id
@@ -638,7 +671,10 @@ void BacktestEngine::detect_and_add_zones(const Core::Bar& bar, int bar_index) {
 
     // Re-score merged zones if any were updated
     if (!detector.get_last_merged_zone_ids().empty()) {
-        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        // ⭐ LOOKAHEAD FIX: pass bar_index so regime is computed at the
+        // current bar, not at bars.back() (future bar in BT's full dataset).
+        Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(
+            bars, 50, 5.0, bar_index);
         for (auto& zone : active_zones) {
             if (std::find(detector.get_last_merged_zone_ids().begin(),
                           detector.get_last_merged_zone_ids().end(),
@@ -716,7 +752,12 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
     // If htf_lookback_bars is set (e.g. 200), backtest and live detected different
     // regimes on the same bar, causing divergent entry decisions.
     const int REGIME_LOOKBACK = (config.htf_lookback_bars > 0) ? config.htf_lookback_bars : 100;
-    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bars, REGIME_LOOKBACK, config.htf_trending_threshold);
+    // ⭐ LOOKAHEAD FIX: pass bar_index so regime is computed at the current bar,
+    // not at bars.back() (which is a future Mar-2026 bar when processing a Feb-02 bar).
+    // Without this, BT used future price action to determine regime at entry time,
+    // causing BT=TRENDING vs LT=RANGING for the same entry bar.
+    Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(
+        bars, REGIME_LOOKBACK, config.htf_trending_threshold, bar_index);
     
     // Debug: Log regime detection (reduced frequency for performance)
     static int regime_log_counter = 0;
@@ -1422,11 +1463,19 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         double new_trail_stop = 0.0;
         int    activated_stage = 0;
 
+        // ⭐ TRAIL_ATR_MULTIPLIER FIX: Apply config.trail_atr_multiplier to stages 3 and 4,
+        // matching the live engine exactly.
+        // Old: hardcoded 0.5 and 1.0 — ignoring trail_atr_multiplier (config = 0.70).
+        // Live: uses multiplier * 0.5 and multiplier * 1.0.
+        // With multiplier=0.70: stage4 = 0.35×ATR, stage3 = 0.70×ATR (tighter stops).
+        double stage4_factor = config.trail_atr_multiplier * 0.5;
+        double stage3_factor = config.trail_atr_multiplier * 1.0;
+
         if (current_r >= 3.0) {
             // Stage 4: Tight ATR trail, floored at Stage 2 level
             double raw = (trade.direction == "LONG")
-                ? trade.highest_price - (atr_trail * 0.5)
-                : trade.lowest_price  + (atr_trail * 0.5);
+                ? trade.highest_price - (atr_trail * stage4_factor)
+                : trade.lowest_price  + (atr_trail * stage4_factor);
             // Floor: never worse than Stage 2 lock
             new_trail_stop = (trade.direction == "LONG")
                 ? std::max(raw, stage2_level)
@@ -1435,8 +1484,8 @@ void BacktestEngine::manage_open_position(const Core::Bar& bar, int bar_index) {
         } else if (current_r >= 2.0) {
             // Stage 3: Moderate ATR trail, floored at Stage 2 level
             double raw = (trade.direction == "LONG")
-                ? trade.highest_price - (atr_trail * 1.0)
-                : trade.lowest_price  + (atr_trail * 1.0);
+                ? trade.highest_price - (atr_trail * stage3_factor)
+                : trade.lowest_price  + (atr_trail * stage3_factor);
             new_trail_stop = (trade.direction == "LONG")
                 ? std::max(raw, stage2_level)
                 : std::min(raw, stage2_level);
@@ -1743,7 +1792,7 @@ void BacktestEngine::process_bar(const Core::Bar& bar, int bar_index) {
     // ⭐ FIX: Always update zone states on every bar, even while in position.
     // Live engine does this — zones accumulate touches, detect violations, and
     // flip during open trades. Backtest must mirror this or zone state diverges.
-    update_zone_states(bar);
+    update_zone_states(bar, bar_index);
 
     // Manage existing position (returns early — no new entry while in position)
     if (trade_manager.is_in_position()) {
@@ -1836,7 +1885,10 @@ void BacktestEngine::run(int duration_minutes) {
             score_bar_idx = static_cast<int>(bars.size()) - 1;
         }
         const Core::Bar& scoring_bar = bars[score_bar_idx];
-        Core::MarketRegime zone_regime = Core::MarketAnalyzer::detect_regime(bars, 50, 5.0);
+        // ⭐ LOOKAHEAD FIX: pass score_bar_idx (= zone.formation_bar) so regime is
+        // computed at the bar the zone formed on, not at bars.back() (future data).
+        Core::MarketRegime zone_regime = Core::MarketAnalyzer::detect_regime(
+            bars, 50, 5.0, score_bar_idx);
         zone.zone_score = scorer.evaluate_zone(zone, zone_regime, scoring_bar);
         zones_scored++;
         LOG_DEBUG("Zone " << zone.zone_id
@@ -1854,6 +1906,34 @@ void BacktestEngine::run(int duration_minutes) {
     // the forward processing loop (process_bar) will update all zone states anyway
     // as it simulates trading through each bar
     
+    // ⭐ RC1 FIX (BT complement): Reset touch_count and state before the bar loop.
+    //
+    // ZoneDetector::calculate_initial_touch_count() pre-populates zone.touch_count
+    // using a LOOSER formula (50% zone-height extension past distal). For Z33 (SUPPLY
+    // 26010-26019), this preset was 2859 — the detector counted 2859 near-zone touches
+    // using its extended formula across bars 4285..9157.
+    //
+    // Without this reset, update_zone_states starts with touch_count=2859 (FRESH state).
+    // The first bar that overlaps the zone via the STRICT formula fires FIRST_TOUCH
+    // → touch_count becomes 2860. The final BT count (2860) is dominated by the
+    // detector's looser pre-count, not by the strict-formula episode tracking.
+    //
+    // LT replay already resets to 0/FRESH (RC1 fix applied earlier) and correctly
+    // counts 57 strict-formula episodes for Z33. BT must do the same to match.
+    //
+    // Reset here (after scoring, before bar loop) so:
+    //   - zone_score is already computed (scoring is unaffected)
+    //   - update_zone_states starts each zone from 0/FRESH at bar formation_bar
+    //   - was_in_zone_prev is false (default struct value) — no extra reset needed
+    //     since no bars have been processed yet at this point
+    for (auto& zone : active_zones) {
+        zone.touch_count = 0;
+        zone.state       = Core::ZoneState::FRESH;
+        // was_in_zone_prev stays false (struct default) — correct starting state
+    }
+    LOG_INFO("Reset touch_count=0 and state=FRESH for " << active_zones.size()
+             << " zones before bar loop (detector preset discarded)");
+
     std::cout << "\nProcessing bars..." << std::endl;
     
     // Process each bar

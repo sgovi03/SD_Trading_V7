@@ -388,7 +388,8 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
         Bar bar;
         int col = 0;
         
-        // CSV format: Timestamp,DateTime,Symbol,Open,High,Low,Close,Volume,OpenInterest
+        // CSV format: Timestamp,DateTime,Symbol,Open,High,Low,Close,Volume,OpenInterest[,OI_Fresh,OI_Age_Seconds]
+        std::string oi_fresh_field;   // captured from column 9 when present
         while (std::getline(ss, field, ',')) {
             try {
                 switch (col) {
@@ -401,8 +402,14 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
                     case 6: bar.close = std::stod(field); break;
                     case 7: bar.volume = static_cast<double>(std::stoll(field)); break;
                     case 8: bar.oi = static_cast<double>(std::stoll(field)); break;
-                    case 9: break;
-                    case 10: break;
+                    // ⭐ RC-II-A FIX: Read OI_Fresh from column 9 instead of hardcoding true.
+                    // Previously this case did nothing (break), so bar.oi_fresh was always set
+                    // to true unconditionally after the loop regardless of the CSV value.
+                    // BT reads column 9 properly; LT ignored it, making oi_data_quality=True
+                    // in LT and False in BT for all 58 zones — a constant +15 pt gap in
+                    // institutional_index. Now both engines use the same column value.
+                    case 9: oi_fresh_field = field; break;
+                    case 10: break;  // OI_Age_Seconds — not used for parity
                 }
             } catch (const std::exception& e) {
                 LOG_WARN("Failed to parse field at line " << line_num << ", col " << col << ": " << e.what());
@@ -411,7 +418,17 @@ std::vector<Bar> LiveEngine::load_csv_data(const std::string& csv_path) {
         }
         
         if (col >= 9) {  // Valid bar with all required fields (through OI column)
-            bar.oi_fresh = true;
+            // ⭐ RC-II-A FIX: Set oi_fresh from the parsed column value, exactly matching BT.
+            // 11-column CSV: column 9 = OI_Fresh ("1"/"true"/"True" → true, else false).
+            // 9-column CSV (legacy, no OI_Fresh column): oi_fresh_field is empty → false.
+            // Previously: hardcoded true regardless of CSV content or column count.
+            if (!oi_fresh_field.empty()) {
+                bar.oi_fresh = (oi_fresh_field == "1" ||
+                                oi_fresh_field == "true" ||
+                                oi_fresh_field == "True");
+            } else {
+                bar.oi_fresh = false;
+            }
             bar.oi_age_seconds = 0;
             bars.push_back(bar);
         } else if (col > 0) {
@@ -1090,12 +1107,22 @@ void LiveEngine::replay_historical_zone_states() {
     
     // ⭐ ZONE-CENTRIC PROCESSING: Process each zone independently
     for (auto& zone : active_zones) {
-        // Skip zones outside price range (they won't be traded anyway)
-        if (!is_zone_in_range(zone, lower, upper)) {
-            zones_skipped_range++;
-            continue;  // Zone stays FRESH - will be updated if price moves there
-        }
-        
+        // ⭐ RANGE-FILTER REMOVED from replay (was causing state corruption on large datasets).
+        //
+        // ROOT CAUSE: The range filter skipped zones outside the current LTP window BEFORE
+        // the RC1 reset ran. Skipped zones kept:
+        //   - touch_count = calculate_initial_touch_count preset (loose formula, e.g. 1254)
+        //   - state = FRESH (initial value from detect_initial_zones)
+        // These were then saved to zones_live_master.json, producing impossible combinations
+        // (state=FRESH with touch_count=1254) that made LT diverge wildly from BT on large
+        // datasets (48 FRESH zones in LT vs 2 in BT on the Aug-2025–Mar-2026 run).
+        //
+        // The range filter is correct for live process_tick() (efficiency — no need to evaluate
+        // zones far from current price on every tick). But bootstrap replay is a one-time
+        // initialization step that MUST process every zone to produce correct touch counts
+        // and states. BT's update_zone_states has no range filter and processes all zones
+        // unconditionally. This must match.
+
         zones_processed++;
         
         // Start from the bar AFTER formation
@@ -1104,10 +1131,25 @@ void LiveEngine::replay_historical_zone_states() {
             continue;  // Zone just formed, nothing to replay
         }
         
-        // Process bars for this zone
-        // ⭐ FIX BUG-TOUCH: Reset episode-tracking flag before replaying this zone.
-        // Each zone's bar history is processed independently; flag must start
-        // false so the first bar inside is always counted as a new episode.
+        // ⭐ RC1 FIX: Reset touch_count and state before replay.
+        //
+        // ROOT CAUSE: ZoneDetector::calculate_initial_touch_count() pre-populates
+        // zone.touch_count using a LOOSER formula (extended 50% past distal) during
+        // zone formation detection. This preset value (e.g. 69 for Z45) is stored in
+        // the zone struct. The replay then ADDS to this preset using the STRICTER
+        // update_zone_states formula, double-counting — producing inflated LT counts.
+        //
+        // BT's update_zone_states also starts with the preset and adds strict-formula
+        // touches, but processes pre-formation bars 0..(formation_bar-1) which set
+        // was_in_zone_prev=true early, suppressing later episode detection.
+        // The two effects partially cancel in BT but compound in LT replay.
+        //
+        // FIX: Reset to 0/FRESH before replay. The replay becomes the SINGLE
+        // authoritative touch counter using the strict update_zone_states formula
+        // from formation_bar+1 onwards. This matches BT's fix (RC1b) which now
+        // skips pre-formation bars, making both engines count from the same baseline.
+        zone.touch_count  = 0;
+        zone.state        = ZoneState::FRESH;
         zone.was_in_zone_prev = false;
         for (size_t i = start_bar; i < bar_history.size(); ++i) {
             total_bar_iterations++;
@@ -1137,7 +1179,25 @@ void LiveEngine::replay_historical_zone_states() {
                     zone.state = ZoneState::TESTED;
                     zone.touch_count++;
                     zones_changed = true;
-                    
+
+                    // ⭐ PROFILE FIX: Update volume/OI profiles on FIRST_TOUCH in replay.
+                    // BT update_zone_states calls calculate_volume_profile on FIRST_TOUCH
+                    // (U1 FIX). LT replay was missing this, leaving the profile at the
+                    // detection-time value (computed by ZoneDetector's own VolumeScorer
+                    // which may use a different baseline snapshot). Adding it here ensures
+                    // the final profile uses the same volume_scorer_ and bar_history as BT.
+                    if (volume_scorer_ && oi_scorer_) {
+                        int profile_bar_idx = zone.formation_bar;
+                        if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bar_history.size())) {
+                            zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                                zone, bar_history, profile_bar_idx);
+                            zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                                zone, bar_history, profile_bar_idx);
+                            zone.institutional_index = Utils::calculate_institutional_index(
+                                zone.volume_profile, zone.oi_profile);
+                        }
+                    }
+
                     ZoneStateEvent event(
                         bar.datetime, static_cast<int>(i), "FIRST_TOUCH",
                         get_state_str(old_state), "TESTED",
@@ -1152,6 +1212,23 @@ void LiveEngine::replay_historical_zone_states() {
                     if (!zone.was_in_zone_prev) {
                         zone.touch_count++;
                         zones_changed = true;
+
+                        // ⭐ PROFILE FIX: Update volume/OI profiles on RETEST in replay.
+                        // BT update_zone_states calls calculate_volume_profile on every new
+                        // RETEST episode (U1 FIX). LT replay was missing this, leaving the
+                        // profile at an intermediate state. Adding it here makes the final
+                        // institutional_index identical to BT for the same touch sequence.
+                        if (volume_scorer_ && oi_scorer_) {
+                            int profile_bar_idx = zone.formation_bar;
+                            if (profile_bar_idx >= 0 && profile_bar_idx < static_cast<int>(bar_history.size())) {
+                                zone.volume_profile = volume_scorer_->calculate_volume_profile(
+                                    zone, bar_history, profile_bar_idx);
+                                zone.oi_profile = oi_scorer_->calculate_oi_profile(
+                                    zone, bar_history, profile_bar_idx);
+                                zone.institutional_index = Utils::calculate_institutional_index(
+                                    zone.volume_profile, zone.oi_profile);
+                            }
+                        }
 
                         ZoneStateEvent event(
                             bar.datetime, static_cast<int>(i), "RETEST",
@@ -1537,25 +1614,13 @@ void LiveEngine::process_zones() {
     LOG_DEBUG("Scanning for new zones from bar " << last_zone_scan_bar_ + 1 
               << " to " << last_scannable_bar);
     
-    // ⭐ DEBUG: Log bar details for debugging runtime zone detection
-    std::cout << "\n[ZONE_DETECT_DEBUG] process_zones() called\n";
-    std::cout << "  last_zone_scan_bar_: " << last_zone_scan_bar_ << "\n";
-    std::cout << "  current_bar_count: " << current_bar_count << "\n";
-    std::cout << "  last_scannable_bar: " << last_scannable_bar << "\n";
-    std::cout << "  Bars to check: " << (last_scannable_bar - last_zone_scan_bar_) << "\n";
-    if (current_bar_count > 0) {
-        std::cout << "  Last bar datetime: " << bar_history.back().datetime << "\n";
-    }
-    std::cout << std::endl;
-    
     // Detect new zones with duplicate prevention against active zones
     std::vector<Zone> new_zones = detector.detect_zones_no_duplicates(
         active_zones,
         last_zone_scan_bar_ + 1
     );
     
-    std::cout << "[ZONE_DETECT_DEBUG] detector.detect_zones() returned: " << new_zones.size() << " zones\n";
-    std::cout.flush();
+    LOG_DEBUG("process_zones(): " << new_zones.size() << " candidate zones returned");
     
     bool zones_added = false;
     
@@ -1579,9 +1644,8 @@ void LiveEngine::process_zones() {
         }
         else {
             // Skip zones from stale data
-            std::cout << "[ZONE_DETECT_DEBUG] Skipping zone formed at bar " << zone.formation_bar 
-                     << " (last_zone_scan_bar_=" << last_zone_scan_bar_ << ")\n";
-            std::cout.flush();
+            LOG_DEBUG("process_zones: skipping zone at bar " << zone.formation_bar
+                     << " (last_zone_scan_bar_=" << last_zone_scan_bar_ << ")");
             continue;  // Skip zones from already-scanned bars
         }
         
@@ -1592,9 +1656,8 @@ void LiveEngine::process_zones() {
                 std::abs(zone.proximal_line - active.proximal_line) < 1.0 &&
                 std::abs(zone.distal_line - active.distal_line) < 1.0) {
                 already_active = true;
-                std::cout << "[ZONE_DETECT_DEBUG] Zone at bar " << zone.formation_bar 
-                         << " already exists (duplicate)\n";
-                std::cout.flush();
+                LOG_DEBUG("process_zones: zone at bar " << zone.formation_bar
+                         << " already in active_zones — skipping duplicate");
                 break;
             }
         }
@@ -1603,11 +1666,17 @@ void LiveEngine::process_zones() {
             // NEW: Assign zone ID
             zone.zone_id = next_zone_id_++;
             
-            // Score the newly detected zone
-            MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
-            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
-            
-            LOG_DEBUG("Zone scored: ID=" << zone.zone_id 
+            // ⭐ GAP-6 FIX: Score at formation bar context, not bar_history.back().
+            // Matches BT and bootstrap_zones_on_startup() fix above.
+            {
+                MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
+                int score_bar_idx = zone.formation_bar;
+                if (score_bar_idx < 0 || score_bar_idx >= static_cast<int>(bar_history.size()))
+                    score_bar_idx = static_cast<int>(bar_history.size()) - 1;
+                zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history[score_bar_idx]);
+            }
+
+            LOG_DEBUG("Zone scored: ID=" << zone.zone_id
                      << " Total=" << zone.zone_score.total_score
                      << " (" << zone.zone_score.entry_rationale << ")");
             
@@ -1628,17 +1697,6 @@ void LiveEngine::process_zones() {
             active_zones.push_back(zone);
             zones_added = true;
             
-            std::cout << "\n[ZONE_DETECT_DEBUG] ✅ NEW ZONE ADDED\n";
-            std::cout << "  Zone ID: " << zone.zone_id << "\n";
-            std::cout << "  Type: " << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY") << "\n";
-            std::cout << "  Formation Bar: " << zone.formation_bar << "\n";
-            std::cout << "  Formation DateTime: " << bar_history.back().datetime << "\n";
-            std::cout << "  Price Range: " << zone.distal_line << " - " << zone.proximal_line << "\n";
-            std::cout << "  Score: " << zone.zone_score.total_score << "/120\n";
-            std::cout << std::endl;
-            std::cout.flush();
-            
-            // ⭐ FIX DES-04: Was LOG_ERROR — new zone detection is not an error.
             LOG_INFO("🔷 New zone detected: " 
                     << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
                     << " @ " << zone.distal_line << "-" << zone.proximal_line
@@ -1646,8 +1704,30 @@ void LiveEngine::process_zones() {
         }
     }
     
-    // Update last scan position
-    last_zone_scan_bar_ = last_scannable_bar;
+    // ⭐ LIVE ZONE SCAN POINTER FIX:
+    // Update last_zone_scan_bar_ to detect_no_dup_end - 1, NOT last_scannable_bar.
+    //
+    // Why: detect_zones_no_duplicates() can only scan up to:
+    //   detect_no_dup_end = bars.size() - consolidation_max_bars - lookforward_max
+    // If we advance last_zone_scan_bar_ to last_scannable_bar (= bars.size()-6),
+    // then next tick: from_bar = last_scannable_bar + 1 ≈ bars.size()-5
+    // But detect_no_dup_end ≈ bars.size()-25 → from_bar > detect_no_dup_end → empty loop.
+    // The live bars are NEVER scanned because from_bar always overshoots detect_no_dup_end.
+    //
+    // Correct: advance only to detect_no_dup_end - 1, so from_bar on the next tick
+    // equals detect_no_dup_end. As each new live bar arrives, detect_no_dup_end advances
+    // by 1 and from_bar follows it — scanning exactly 1 new bar per tick, always within range.
+    // After 25 live bars, the first live bar enters the scannable window and zones can form.
+    {
+        int lookforward_max_upd = std::max(config.consolidation_min_bars, 3);
+        int detect_no_dup_end_upd = static_cast<int>(bar_history.size())
+                                    - config.consolidation_max_bars
+                                    - lookforward_max_upd;
+        // Clamp: never go backwards, never exceed last_scannable_bar
+        int new_scan_bar = std::max(last_zone_scan_bar_,
+                           std::min(last_scannable_bar, detect_no_dup_end_upd - 1));
+        last_zone_scan_bar_ = new_scan_bar;
+    }
     
     // NEW: Save zones if any were added
     if (zones_added) {
@@ -2508,29 +2588,43 @@ void LiveEngine::manage_position() {
     //   • When broker is on wrong bar: exit_price corrected, P&L recomputed with
     //     the same commission that TradeManager would have applied.
     auto fix_exit_price = [&](Trade& ct, double correct_price) {
-        // Step 1: extract commission embedded by TradeManager using the broker's fill
-        double direction_sign = (ct.direction == "LONG") ? 1.0 : -1.0;
-        double raw_pnl_broker = direction_sign
-                                * (ct.exit_price - ct.entry_price)
-                                * static_cast<double>(ct.position_size)
-                                * static_cast<double>(config.lot_size);
-        double commission_embedded = ct.pnl - raw_pnl_broker;  // e.g. -200 fixed charge
+        // ⭐ FIX P&L-ZERO BUG: In CSV simulation mode the broker IS the data source —
+        // its fill price is already the bar close and is the ground-truth fill.
+        // Overriding it with the theoretical SL level corrupts P&L in two ways:
+        //
+        //   1. For breakeven (stage1) exits: broker fills at bar.close which is
+        //      slightly better than stage1 for the winning direction. Overriding to
+        //      stage1 converts a small profit (₹199.75) into gross = commission → net 0.
+        //
+        //   2. For general exits: CsvSimulatorBroker fills at bar.close which is the
+        //      realistic intraday fill. The manage_position exit_price may be the
+        //      theoretical SL level which is inside the bar's range — overriding to
+        //      it changes the P&L from what the simulation actually achieved.
+        //
+        // fix_exit_price is ONLY needed in real-broker live mode where the broker's
+        // actual fill can diverge from the bar-data SL level we intended.
+        // In CSV simulation, skip the override entirely — TradeManager P&L is correct.
+        CsvSimulatorBroker* csv_sim = dynamic_cast<CsvSimulatorBroker*>(broker.get());
+        if (csv_sim != nullptr) {
+            return;  // CSV sim: broker fill is ground truth, no override needed
+        }
 
-        // Step 2: override exit price only if broker returned a materially different value
+        // Step 1: override exit price only if broker returned a materially different value
         if (std::abs(ct.exit_price - correct_price) > 0.01) {
             LOG_WARN("⭐ EXIT PRICE OVERRIDE: broker=" << std::fixed << std::setprecision(2)
-                     << ct.exit_price << " → bar_history=" << correct_price
-                     << "  (commission_preserved=" << commission_embedded << ")");
+                     << ct.exit_price << " → correct=" << correct_price);
             ct.exit_price = correct_price;
 
-            // Step 3: recompute P&L using correct price + same embedded commission
+            // Step 2: recompute P&L using correct price and fixed commission
+            double direction_sign = (ct.direction == "LONG") ? 1.0 : -1.0;
             double raw_pnl_correct = direction_sign
                                      * (ct.exit_price - ct.entry_price)
                                      * static_cast<double>(ct.position_size)
                                      * static_cast<double>(config.lot_size);
-            ct.pnl = raw_pnl_correct + commission_embedded;
+            double commission_fixed = 2.0 * config.commission_per_trade;
+            ct.pnl = raw_pnl_correct - commission_fixed;
 
-            // Step 4: recompute return_pct consistently
+            // Step 3: recompute return_pct consistently
             double capital = ct.entry_price
                              * static_cast<double>(ct.position_size)
                              * static_cast<double>(config.lot_size);
@@ -3542,11 +3636,23 @@ void LiveEngine::process_tick() {
         }
     }
 
-    // Process zones (even if in position, for monitoring)
-    // if (bar_history.size() >= 100) {  // Need sufficient history
-    //     process_zones();
-    // }
-    
+    // ⭐ GAP-5 FIX: Re-enable process_zones() so new zones formed during the simulation
+    // are detected and added to active_zones within process_tick().
+    //
+    // Previously this was commented out, meaning LT only used zones from bootstrap.
+    // BT detects all zones upfront from the full dataset scan, so it always has the
+    // complete zone map. LT with only bootstrap zones misses zones that form AFTER
+    // the pre-sim history ends (e.g. zones forming in Feb/Mar during the simulation).
+    //
+    // process_zones() has its own guard (last_scannable_bar <= last_zone_scan_bar_)
+    // so it is safe to call every bar — it returns immediately if no new bars to scan.
+    // The dedup check inside process_zones() prevents duplicate zone creation.
+    // The duplicate zone explosion bug from earlier sessions is fixed by ZoneInitializer
+    // dedup (already applied) and the secondary dedup in process_zones() itself.
+    if (bar_history.size() >= 100) {
+        process_zones();
+    }
+
     // Check for entries (will be rejected by TradeManager if already in position)
     if (bar_history.size() >= 100) {
         check_for_entries();
@@ -3639,10 +3745,21 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     LOG_INFO("✅ Detected " << active_zones.size() << " initial zones");
     
     // Score all zones
-    LOG_INFO("Scoring zones...");
+    // ⭐ GAP-3 FIX: Score each zone at bars[zone.formation_bar] context, not bar_history.back().
+    // BT (backtest_engine.cpp) uses this since Fix 2: each zone's total_score is computed
+    // against the bar at which it formed, so age/ATR/distance components reflect the
+    // market context at detection time. LT was using bar_history.back() (the last pre-sim
+    // bar, e.g. Jan-30-2026 for an Aug→Jan history), meaning all zones — including those
+    // formed in Oct-2025 — were scored against Jan-2026 context. This caused score
+    // mismatches that affected which zones passed entry_minimum_score.
+    LOG_INFO("Scoring zones at formation bar context (matching backtest)...");
     Core::MarketRegime regime = Core::MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
     for (auto& zone : active_zones) {
-        zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+        int score_bar_idx = zone.formation_bar;
+        if (score_bar_idx < 0 || score_bar_idx >= static_cast<int>(bar_history.size())) {
+            score_bar_idx = static_cast<int>(bar_history.size()) - 1;
+        }
+        zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history[score_bar_idx]);
     }
     LOG_INFO("✅ Scored " << active_zones.size() << " zones");
 
@@ -3652,6 +3769,58 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     replay_historical_zone_states();
     config.enable_zone_flip = original_flip_setting;
     LOG_INFO("✅ Zone states synchronized with historical data");
+
+    // ⭐ RC3 FIX: Restore consecutive_losses and entry_retry_count from prior zone file.
+    //
+    // ROOT CAUSE: replay_historical_zone_states() only replays price-action state
+    // (FRESH/TESTED/VIOLATED/RECLAIMED, touch_count, was_swept). It does not replay
+    // trade outcomes because LT bootstrap never executes trades. Consequently,
+    // zone.consecutive_losses and zone.entry_retry_count stay at 0 for all zones,
+    // while BT accumulates these from its trade loop. The 10 zones BT marks EXHAUSTED
+    // (3 consecutive losses) remain TESTED in LT — tradeable by LT but blocked by BT.
+    //
+    // FIX: If a prior zones_live_master.json exists from a previous live run,
+    // copy consecutive_losses, entry_retry_count, and EXHAUSTED state from it into
+    // the freshly replayed zones (matched by zone boundary proximity < 1 pt).
+    // This carries forward trade-outcome knowledge from previous sessions.
+    // On the very first bootstrap (no prior file), all values stay at 0 — correct.
+    {
+        fs::path prior_file = fs::path(output_dir_) / "zones_live_master.json";
+        std::vector<Zone> prior_zones;
+        int dummy_id = 0;
+        if (fs::exists(prior_file) && zone_persistence_.load_zones(prior_zones, dummy_id)) {
+            int restored = 0;
+            for (auto& zone : active_zones) {
+                for (const auto& pz : prior_zones) {
+                    if (zone.type == pz.type &&
+                        std::abs(zone.proximal_line - pz.proximal_line) < 1.0 &&
+                        std::abs(zone.distal_line   - pz.distal_line)   < 1.0) {
+                        if (pz.consecutive_losses > 0 || pz.entry_retry_count > 0) {
+                            zone.consecutive_losses  = pz.consecutive_losses;
+                            zone.entry_retry_count   = pz.entry_retry_count;
+                            zone.sl_count_long       = pz.sl_count_long;
+                            zone.sl_count_short      = pz.sl_count_short;
+                            // Restore EXHAUSTED state if consecutive_losses exceeded threshold
+                            if (config.enable_zone_exhaustion &&
+                                pz.state == ZoneState::EXHAUSTED &&
+                                zone.state != ZoneState::VIOLATED) {
+                                zone.state                  = ZoneState::EXHAUSTED;
+                                zone.exhausted_at_datetime  = pz.exhausted_at_datetime;
+                            }
+                            restored++;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (restored > 0) {
+                LOG_INFO("✅ RC3: Restored consecutive_losses/retry_count for "
+                         << restored << " zones from prior session");
+            } else {
+                LOG_INFO("RC3: No prior trade-outcome data to restore (first bootstrap)");
+            }
+        }
+    }
 
     
     // Build metadata
@@ -3937,8 +4106,35 @@ void LiveEngine::run(int duration_minutes) {
         LOG_INFO("  - Zone saving: " << zone_save_ms << "ms");
     }
     
-    // Mark all historical bars as scanned
-    last_zone_scan_bar_ = static_cast<int>(bar_history.size() - 1);
+    // ⭐ LIVE ZONE DETECTION FIX: Set last_zone_scan_bar_ to the actual scan boundary
+    // used by detect_zones_no_duplicates(), NOT to bar_history.size()-1.
+    //
+    // ROOT CAUSE OF ZERO NEW ZONES IN LIVE MODE:
+    // detect_zones_no_duplicates() can only scan up to:
+    //   bars.size() - consolidation_max_bars - max(consolidation_min_bars,3)
+    // (it needs lookahead for impulse-after and departure checks).
+    //
+    // If we set last_zone_scan_bar_ = bar_history.size()-1 (e.g. 1423 with 1424 bars),
+    // then process_zones() computes last_scannable_bar = bar_history.size()-6 = 1418.
+    // Guard: 1418 <= 1423 → returns immediately for the first 5 live bars.
+    // After that, it advances last_zone_scan_bar_ by exactly 1 per tick.
+    // A 1-bar window can never satisfy consolidation_min_bars ≥ 5 → zero zones forever.
+    // The periodic detection in run() is also crippled: bars_since_detection=1 < interval=10.
+    //
+    // FIX: Align last_zone_scan_bar_ with detect_zones_no_duplicates()'s end boundary.
+    // This leaves the final ~25 bars of bootstrap history plus ALL live bars unscanned,
+    // so process_zones() immediately has a meaningful window on the first live tick.
+    {
+        int lookforward_max = std::max(config.consolidation_min_bars, 3);
+        int bootstrap_scan_end = static_cast<int>(bar_history.size())
+                                 - config.consolidation_max_bars
+                                 - lookforward_max
+                                 - 1;  // last bar index the scanner could reach
+        last_zone_scan_bar_ = std::max(-1, bootstrap_scan_end - 1);
+        LOG_INFO("🔄 last_zone_scan_bar_ set to " + std::to_string(last_zone_scan_bar_)
+                 + " (bootstrap scan boundary; bars " + std::to_string(last_zone_scan_bar_ + 1)
+                 + "+" + " remain available for live detection)");
+    }
     
     LOG_INFO("Zone detection complete. Ready to monitor for new zones...");
     
@@ -4026,7 +4222,13 @@ void LiveEngine::run(int duration_minutes) {
                             }
                             if (already_active) continue;
 
-                            zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+                            // ⭐ GAP-6 FIX: Score at formation bar, not bar_history.back()
+                            {
+                                int score_bar_idx = zone.formation_bar;
+                                if (score_bar_idx < 0 || score_bar_idx >= static_cast<int>(bar_history.size()))
+                                    score_bar_idx = static_cast<int>(bar_history.size()) - 1;
+                                zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history[score_bar_idx]);
+                            }
                             zone.zone_id = next_zone_id_++;
                             active_zones.push_back(zone);
                             added_count++;
@@ -4066,7 +4268,10 @@ void LiveEngine::run(int duration_minutes) {
                                 if (std::find(detector.get_last_merged_zone_ids().begin(),
                                               detector.get_last_merged_zone_ids().end(),
                                               zone.zone_id) != detector.get_last_merged_zone_ids().end()) {
-                                    zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history.back());
+                                    int score_bar_idx = zone.formation_bar;
+                                    if (score_bar_idx < 0 || score_bar_idx >= static_cast<int>(bar_history.size()))
+                                        score_bar_idx = static_cast<int>(bar_history.size()) - 1;
+                                    zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history[score_bar_idx]);
                                 }
                             }
                         }

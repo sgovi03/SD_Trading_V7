@@ -31,12 +31,12 @@ live_zone_detection_lookback_bars = 200
 
 
 # FOR BACKTEST :
-consolidation_min_bars = 6
+consolidation_min_bars = 1
 min_impulse_atr =  0.18
 min_zone_width_atr = 0.2
 live_min_zone_width_atr = 0.2
-min_zone_strength = 62.5
-live_min_zone_strength = 62.5
+min_zone_strength = 32.5
+live_min_zone_strength = 32.5
 use_trailing_stop = YES
 trail_activation_rr = 0.550
 trailing_stop_activation_r = 0.9
@@ -94,7 +94,6 @@ live_entry_require_new_bar = YES
 live_zone_entry_cooldown_seconds = 0
 max_zone_distance_atr = 80
 enable_state_history = true
-max_state_history_events = 100
 
 enable_candle_confirmation = NO
 candle_confirmation_body_pct = 35
@@ -182,8 +181,8 @@ rejection_moderate_threshold = 0.4
 rejection_weak_threshold = 0.2
 max_consolidation_range = 3.0
 
-use_htf_regime_filter = YES
-htf_lookback_bars = 1000
+use_htf_regime_filter = NO
+htf_lookback_bars = 700
 htf_trending_threshold = 5.0
 
 min_departure_imbalance = 2.0
@@ -318,7 +317,7 @@ pause_bars_after_losses = 30
 rr_base_ratio = 1.4
 rr_scale_with_score = YES
 
-trail_atr_multiplier = 0.70
+trail_atr_multiplier = 1
 trail_ema_period = 9
 trail_use_hybrid = YES
 
@@ -351,14 +350,14 @@ entry_optimal_score = 78.0
 max_retries_per_zone = 20000
 rr_max_ratio = 1.750
 trail_fallback_tp_rr = 1.750
-max_loss_per_trade = 37600.0
+max_loss_per_trade = 14600.0
 sl_buffer_zone_pct = 1.0
 sl_buffer_atr = 0.5
 min_stop_distance_points = 65
 trail_ema_buffer_pct = 0.1
 
 max_fill_slippage_pts = 2.0
-zone_max_age_days = 290
+zone_max_age_days = 390
 #zone_max_touch_count = 500
 
 
@@ -387,7 +386,7 @@ departure_volume_normal_ratio = 1.2
 # Priority 1: Zone consecutive-loss exhaustion
 # After zone_consecutive_loss_max SL losses from the same zone, mark it EXHAUSTED.
 # Prevents re-entering a "burnt" zone until a TP win resets it.
-# Evidence: Zone 25 = -₹25,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
+# Evidence: Zone 25 = -₹29,455 (2 stops); Zone 9 = -₹10,215 (2 stops).
 enable_zone_exhaustion    = YES
 zone_consecutive_loss_max = 2    # Block after 2nd consecutive SL loss
 zone_sl_suspend_threshold       =   3      # SL hits per direction before suspension (0=disabled)
@@ -396,10 +395,10 @@ zone_sl_suspend_threshold       =   3      # SL hits per direction before suspen
 # ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
 # Default: trade at half size. Set adx_transition_skip_entry=YES to skip entirely.
 enable_adx_transition_filter = YES
-adx_transition_min           = 60.0
-adx_transition_max           = 999.0
+adx_transition_min           = 40.0
+adx_transition_max           = 60.0
 adx_transition_size_factor   = 0.5   # Half position in danger band
-adx_transition_skip_entry    = YES    # NO=half-size; YES=skip entry entirely
+adx_transition_skip_entry    = NO    # NO=half-size; YES=skip entry entirely
 
 # Priority 3: Late-session entry cutoff
 # No new entries at or after this time. Trade #1719 (15:05) lost -₹9,274 in 1 bar.
@@ -410,5 +409,5 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # Priority 4: Hard cap on position lots
 # 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
-max_position_lots = 6
+max_position_lots = 2
 max_touch_count = 50000;

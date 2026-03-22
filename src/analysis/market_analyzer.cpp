@@ -65,22 +65,31 @@ double MarketAnalyzer::calculate_ema(const std::vector<Bar>& bars, int period, i
     return ema;
 }
 
-MarketRegime MarketAnalyzer::detect_regime(const std::vector<Bar>& bars, 
-                                           int lookback, 
-                                           double threshold) {
+MarketRegime MarketAnalyzer::detect_regime(const std::vector<Bar>& bars,
+                                           int lookback,
+                                           double threshold,
+                                           int end_index) {
     if (bars.empty()) return MarketRegime::RANGING;
-    
-    int end_index = bars.size() - 1;
-    int start_index = std::max(0, end_index - lookback + 1);
-    
-    if (start_index >= end_index) return MarketRegime::RANGING;
-    
-    double start_price = bars[start_index].close;
-    double current_price = bars[end_index].close;
-    
+
+    // ⭐ LOOKAHEAD FIX: Use caller-supplied end_index if valid; otherwise default
+    // to bars.size()-1. LT passes -1 (default) because bar_history already ends at
+    // the current bar. BT must pass bar_index explicitly — without this, end_index
+    // would be bars.size()-1 (the last bar of the full Aug→Mar dataset), so regime
+    // on a Feb-02 bar would be computed using Mar-2026 prices: pure lookahead bias.
+    int eidx = (end_index >= 0 && end_index < static_cast<int>(bars.size()))
+                   ? end_index
+                   : static_cast<int>(bars.size()) - 1;
+
+    int start_index = std::max(0, eidx - lookback + 1);
+
+    if (start_index >= eidx) return MarketRegime::RANGING;
+
+    double start_price   = bars[start_index].close;
+    double current_price = bars[eidx].close;
+
     double pct_change = ((current_price - start_price) / start_price) * 100.0;
-    
-    if (pct_change > threshold) return MarketRegime::BULL;
+
+    if (pct_change >  threshold) return MarketRegime::BULL;
     if (pct_change < -threshold) return MarketRegime::BEAR;
     return MarketRegime::RANGING;
 }
