@@ -396,7 +396,7 @@ zone_sl_suspend_threshold       =   3      # SL hits per direction before suspen
 # ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
 # Default: trade at half size. Set adx_transition_skip_entry=YES to skip entirely.
 enable_adx_transition_filter = YES
-adx_transition_min           = 60.0
+adx_transition_min           = 55.0
 adx_transition_max           = 999.0
 adx_transition_size_factor   = 0.5   # Half position in danger band
 adx_transition_skip_entry    = YES    # NO=half-size; YES=skip entry entirely
@@ -412,3 +412,7 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
 max_position_lots = 6
 max_touch_count = 5000;
+
+enable_rsi_hard_block = YES
+rsi_hard_block_high = 65.0    # lower from 72 to 65
+rsi_hard_block_low  = 28.0

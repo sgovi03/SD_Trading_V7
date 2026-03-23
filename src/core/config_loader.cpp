@@ -701,7 +701,15 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
     } else if (key == "zone_sl_suspend_threshold") {
         config.zone_sl_suspend_threshold = std::stoi(value);
     }
-    // Priority 2: ADX transition size filter
+    // Priority 2a: RSI extreme hard block
+    else if (key == "enable_rsi_hard_block") {
+        config.enable_rsi_hard_block = parse_bool(value);
+    } else if (key == "rsi_hard_block_high") {
+        config.rsi_hard_block_high = std::stod(value);
+    } else if (key == "rsi_hard_block_low") {
+        config.rsi_hard_block_low = std::stod(value);
+    }
+    // Priority 2b: ADX transition hard block
     else if (key == "enable_adx_transition_filter") {
         config.enable_adx_transition_filter = parse_bool(value);
     } else if (key == "adx_transition_min") {

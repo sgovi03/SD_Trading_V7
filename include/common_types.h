@@ -990,16 +990,24 @@ public:
     // 0 = disabled. Recommended: 2.
     int zone_sl_suspend_threshold = 2;
 
-    // Priority 2: ADX transition-zone position size reduction
-    // ADX 40-60 = only net-negative ADX band: 9 trades, avg -₹9,236 P&L.
-    // 4 of 7 hard stop-losses fell in this band.
-    // Option A (default): trade at reduced size (adx_transition_size_factor × normal lots).
-    // Option B: set adx_transition_skip_entry=true to skip entirely.
+    // Priority 2a: RSI extreme hard block (regime filter — validated on 168 trades)
+    // RSI > 72: price in overbought climax, steamrolls supply zones.   FP=21%, net +₹85,486.
+    // RSI < 28: price in oversold panic, blows through demand zones.   FP=25%, net +₹53,889.
+    // These are HARD blocks — entry is rejected unconditionally, not just reduced.
+    bool   enable_rsi_hard_block        = true;   // Master toggle
+    double rsi_hard_block_high          = 72.0;   // Block entry if RSI > this (overbought extreme)
+    double rsi_hard_block_low           = 28.0;   // Block entry if RSI < this (oversold extreme)
+
+    // Priority 2b: ADX transition-zone hard block (regime filter — validated on 168 trades)
+    // ADX >= 55: mature running trend, S&D zones get steamrolled.  FP=12%, net +₹97,979.
+    // Threshold calibrated down from 60 (which never triggered) to 55 (empirically validated).
+    // Option A (default): skip entry entirely when ADX >= adx_transition_min.
+    // Option B: set adx_transition_skip_entry=false to reduce size instead.
     bool   enable_adx_transition_filter = true;   // Master toggle
-    double adx_transition_min           = 40.0;   // Lower bound (inclusive)
-    double adx_transition_max           = 60.0;   // Upper bound (inclusive)
-    double adx_transition_size_factor   = 0.5;    // Lot multiplier in danger band (0.5 = half size)
-    bool   adx_transition_skip_entry    = false;  // true = skip; false = reduce size
+    double adx_transition_min           = 55.0;   // Hard block threshold (was 60 — never fired)
+    double adx_transition_max           = 999.0;  // Upper bound (keep high — min alone is sufficient)
+    double adx_transition_size_factor   = 0.5;    // Lot multiplier if skip=false
+    bool   adx_transition_skip_entry    = true;   // true = hard block; false = half size
 
     // Priority 3: Late-session entry cutoff (no new entries at or after this time)
     // Trade #1719 entered at 15:05 → 1-bar trade, -₹9,274. Block late noise.
