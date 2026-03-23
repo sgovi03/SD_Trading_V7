@@ -375,6 +375,8 @@ ZoneDetector::ZoneDecision ZoneDetector::evaluate_zone_candidate(
 }
 
 void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidate) {
+    bool formation_bar_updated = false;
+
     switch (config.merge_strategy) {
         case ZoneMergeStrategy::UPDATE_IF_STRONGER:
             if (candidate.strength > existing.strength) {
@@ -383,6 +385,14 @@ void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidat
                 existing.base_high = candidate.base_high;
                 existing.distal_line = candidate.distal_line;
                 existing.proximal_line = candidate.proximal_line;
+                // ⭐ TOUCH COUNT FIX: Track when formation_bar changes.
+                // If we update to a newer zone's identity, the existing touch_count
+                // belongs to the OLD zone's history from old_formation_bar onward.
+                // Carrying it over to the new formation context inflates the count —
+                // the new zone should start fresh from its own formation bar.
+                if (candidate.formation_bar != existing.formation_bar) {
+                    formation_bar_updated = true;
+                }
                 existing.formation_bar = candidate.formation_bar;
                 existing.formation_datetime = candidate.formation_datetime;
             }
@@ -390,6 +400,7 @@ void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidat
 
         case ZoneMergeStrategy::UPDATE_IF_FRESHER:
             if (candidate.formation_bar > existing.formation_bar) {
+                formation_bar_updated = true;
                 existing.formation_bar = candidate.formation_bar;
                 existing.formation_datetime = candidate.formation_datetime;
                 existing.state = candidate.state;
@@ -423,9 +434,29 @@ void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidat
             break;
     }
 
-    if (candidate.touch_count > 0) {
-        existing.touch_count += candidate.touch_count;
+    // ⭐ TOUCH COUNT FIX: Do NOT add candidate.touch_count to existing.touch_count.
+    //
+    // ROOT CAUSE of LT touch count inflation vs BT:
+    // When a new zone at bar N is detected and matches an existing zone at bar M (M < N),
+    // the existing zone may have accumulated hundreds of touches over its lifetime (bar M
+    // to bar N). The old code added candidate.touch_count on top of that, which double-counts:
+    //   - existing.touch_count: touches accumulated by update_zone_states since bar M
+    //   - candidate.touch_count: calculate_initial_touch_count(bar M+1 .. bar N) — the
+    //     SAME bars already counted by update_zone_states!
+    // This caused LT Z39 (SUPPLY 25999-25987.5) to show touch_count=968 while BT's
+    // equivalent zone showed touch_count=5.
+    //
+    // If formation_bar was updated (identity changed to a newer zone), reset touch_count
+    // so update_zone_states reaccumulates from the new formation context.
+    // If formation_bar was not updated (KEEP_ORIGINAL / no change), leave touch_count
+    // intact — it correctly reflects the existing zone's history.
+    if (formation_bar_updated) {
+        existing.touch_count = 0;
+        existing.was_in_zone_prev = false;
+        LOG_DEBUG("merge_into_existing_zone: formation_bar updated → touch_count reset to 0");
     }
+    // Do NOT add candidate.touch_count in any case — it double-counts bars already
+    // seen by update_zone_states.
 
     existing.is_elite = existing.is_elite || candidate.is_elite;
 }

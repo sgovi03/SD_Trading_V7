@@ -348,7 +348,7 @@ prefer_fresh_zones = YES        # Prefer FRESH but don't reject TESTED
 use_adaptive_entry = YES
 entry_minimum_score = 30.0
 entry_optimal_score = 78.0
-max_retries_per_zone = 20000
+max_retries_per_zone = 20
 rr_max_ratio = 1.750
 trail_fallback_tp_rr = 1.750
 max_loss_per_trade = 29600.0
@@ -358,7 +358,7 @@ min_stop_distance_points = 65
 trail_ema_buffer_pct = 0.1
 
 max_fill_slippage_pts = 2.0
-zone_max_age_days = 290
+zone_max_age_days = 390
 #zone_max_touch_count = 500
 
 
@@ -410,5 +410,5 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # Priority 4: Hard cap on position lots
 # 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
-max_position_lots = 3
-max_touch_count = 50000;
+max_position_lots = 6
+max_touch_count = 5000;
