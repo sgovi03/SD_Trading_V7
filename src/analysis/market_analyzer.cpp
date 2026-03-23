@@ -80,17 +80,43 @@ MarketRegime MarketAnalyzer::detect_regime(const std::vector<Bar>& bars,
                    ? end_index
                    : static_cast<int>(bars.size()) - 1;
 
-    int start_index = std::max(0, eidx - lookback + 1);
+    // ⭐ EMA-CROSSOVER REGIME FIX:
+    // The old pct_change formula (close[eidx] vs close[eidx-lookback]) is useless
+    // for NIFTY 5-min bars because:
+    //   - lookback=100 bars = 500 min ≈ 1 trading session
+    //   - NIFTY rarely moves 5% in one session → always RANGING
+    //   - trade_with_trend_only=YES and allow_ranging_trades=YES combined mean
+    //     the regime filter does NOTHING — every trade passes regardless of trend
+    //
+    // Fix: use EMA crossover on two HTF periods:
+    //   EMA_FAST = lookback bars       (e.g. 50 bars = 250 min ≈ 3-4 sessions)
+    //   EMA_SLOW = lookback * 3 bars   (e.g. 150 bars = 750 min ≈ 10 sessions / 2 weeks)
+    //
+    // This detects multi-day directional bias rather than single-session noise.
+    // For Zone 21 (Feb-17 entries during weekly downtrend):
+    //   EMA(50) at Feb-17 ≈ 25,850  (weighted toward recent falling prices)
+    //   EMA(150) at Feb-17 ≈ 26,050 (anchored to Jan-2026 highs near 26,300)
+    //   EMA_FAST < EMA_SLOW → BEAR → LONG entries blocked → -₹115K loss avoided
+    //
+    // Threshold is reused as the minimum EMA separation % to confirm trend.
+    // e.g. threshold=0.2 means EMA_FAST must be 0.2% above/below EMA_SLOW to qualify.
+    // This prevents false BULL/BEAR signals from tiny EMA separations in flat markets.
 
-    if (start_index >= eidx) return MarketRegime::RANGING;
+    int ema_fast_period = lookback;
+    int ema_slow_period = lookback * 3;
 
-    double start_price   = bars[start_index].close;
-    double current_price = bars[eidx].close;
+    // Need enough bars for the slow EMA
+    if (eidx < ema_slow_period) return MarketRegime::RANGING;
 
-    double pct_change = ((current_price - start_price) / start_price) * 100.0;
+    double ema_fast = calculate_ema(bars, ema_fast_period, eidx);
+    double ema_slow = calculate_ema(bars, ema_slow_period, eidx);
 
-    if (pct_change >  threshold) return MarketRegime::BULL;
-    if (pct_change < -threshold) return MarketRegime::BEAR;
+    if (ema_slow <= 0.0) return MarketRegime::RANGING;
+
+    double separation_pct = ((ema_fast - ema_slow) / ema_slow) * 100.0;
+
+    if (separation_pct >  threshold) return MarketRegime::BULL;
+    if (separation_pct < -threshold) return MarketRegime::BEAR;
     return MarketRegime::RANGING;
 }
 

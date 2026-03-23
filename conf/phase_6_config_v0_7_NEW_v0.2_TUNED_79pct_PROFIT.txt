@@ -31,10 +31,10 @@ live_zone_detection_lookback_bars = 200
 
 
 # FOR BACKTEST :
-consolidation_min_bars = 6
+consolidation_min_bars = 2
 min_impulse_atr =  0.18
-min_zone_width_atr = 0.2
-live_min_zone_width_atr = 0.2
+min_zone_width_atr = 0.70
+live_min_zone_width_atr = 0.7
 min_zone_strength = 62.5
 live_min_zone_strength = 62.5
 use_trailing_stop = YES
@@ -183,8 +183,8 @@ rejection_weak_threshold = 0.2
 max_consolidation_range = 3.0
 
 use_htf_regime_filter = YES
-htf_lookback_bars = 1000
-htf_trending_threshold = 5.0
+htf_lookback_bars = 50
+htf_trending_threshold = 0.2
 
 min_departure_imbalance = 2.0
 max_retest_speed_atr = 1.5
@@ -351,7 +351,7 @@ entry_optimal_score = 78.0
 max_retries_per_zone = 20000
 rr_max_ratio = 1.750
 trail_fallback_tp_rr = 1.750
-max_loss_per_trade = 37600.0
+max_loss_per_trade = 29600.0
 sl_buffer_zone_pct = 1.0
 sl_buffer_atr = 0.5
 min_stop_distance_points = 65
@@ -410,5 +410,5 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # Priority 4: Hard cap on position lots
 # 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
-max_position_lots = 6
+max_position_lots = 3
 max_touch_count = 50000;
