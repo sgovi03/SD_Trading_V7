@@ -709,14 +709,6 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
     } else if (key == "rsi_hard_block_low") {
         config.rsi_hard_block_low = std::stod(value);
     }
-    // Priority 2c: Freshness + BB Bandwidth compound block
-    else if (key == "enable_freshness_bb_block") {
-        config.enable_freshness_bb_block = parse_bool(value);
-    } else if (key == "freshness_bb_min_freshness") {
-        config.freshness_bb_min_freshness = std::stod(value);
-    } else if (key == "freshness_bb_max_bandwidth") {
-        config.freshness_bb_max_bandwidth = std::stod(value);
-    }
     // Priority 2b: ADX transition hard block
     else if (key == "enable_adx_transition_filter") {
         config.enable_adx_transition_filter = parse_bool(value);

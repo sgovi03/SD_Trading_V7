@@ -998,17 +998,6 @@ public:
     double rsi_hard_block_high          = 72.0;   // Block entry if RSI > this (overbought extreme)
     double rsi_hard_block_low           = 28.0;   // Block entry if RSI < this (oversold extreme)
 
-    // Priority 2c: Freshness + BB Bandwidth compound block (Regime Filter 3)
-    // Validated on 81 live trades (Sep 2025–Mar 2026):
-    //   FP=20%, net save +₹1,48,048, WR lifts 56.8% → 68.9%, PF 1.69 → 2.55.
-    // Logic: AND (both conditions must be true to block).
-    //   Low freshness = zone is unproven (TESTED with many touches, or FRESH but over-touched).
-    //   Low BB bandwidth = market is compressed / coiling — no directional commitment.
-    //   Together: entering an unproven zone in a directionless market. High SL rate.
-    bool   enable_freshness_bb_block    = true;   // Master toggle
-    double freshness_bb_min_freshness   = 3.0;    // Block if state_freshness_score < this
-    double freshness_bb_max_bandwidth   = 0.45;   // Block if BB bandwidth < this
-
     // Priority 2b: ADX transition-zone hard block (regime filter — validated on 168 trades)
     // ADX >= 55: mature running trend, S&D zones get steamrolled.  FP=12%, net +₹97,979.
     // Threshold calibrated down from 60 (which never triggered) to 55 (empirically validated).

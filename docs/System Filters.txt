@@ -1,0 +1,4 @@
+RSI > 65: 209 blocks
+RSI < 28: 181 blocks
+ADX ≥ 55: 132 blocks
+Freshness+BB (entry-time): 232 blocks — the entry-time fix is clearly active, generating far more blocks than the broken version did

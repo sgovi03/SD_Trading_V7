@@ -2366,33 +2366,6 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
 
         // Score the zone
         ZoneScore zone_score = scorer.evaluate_zone(zone, regime, current_bar);
-
-        // ⭐ REGIME FILTER 3: Freshness + BB Bandwidth compound block
-        // Validated on 81 live trades (Sep 2025–Mar 2026): FP=17-20%, net +₹1,48,048.
-        // Blocks when zone is unproven (low state_freshness_score) AND market is
-        // compressed (low BB bandwidth). AND logic — both must be true to block.
-        // IMPORTANT: reads zone_score (entry-time evaluation), NOT zone.zone_score
-        // (detection-time). Touch count accumulates between detection and entry —
-        // detection-time score may be stale and too high, letting degraded zones through.
-        if (config.enable_freshness_bb_block) {
-            double freshness_now = zone_score.state_freshness_score;
-            auto bb_now = MarketAnalyzer::calculate_bollinger_bands(
-                bar_history, 20, 2.0, current_index);
-            if (freshness_now < config.freshness_bb_min_freshness &&
-                bb_now.bandwidth < config.freshness_bb_max_bandwidth) {
-                zones_rejected++;
-                LOG_INFO("Freshness+BB block: rejecting zone " << zone.zone_id
-                         << " (freshness=" << std::fixed << std::setprecision(1) << freshness_now
-                         << " < " << config.freshness_bb_min_freshness
-                         << ", BB_BW=" << std::setprecision(3) << bb_now.bandwidth
-                         << " < " << config.freshness_bb_max_bandwidth << ")");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": Freshness+BB block (fresh="
-                          << std::fixed << std::setprecision(1) << freshness_now
-                          << " BB_BW=" << std::setprecision(3) << bb_now.bandwidth << ")\n";
-                continue;
-            }
-        }
         
         // Calculate entry decision
         EntryDecision decision;

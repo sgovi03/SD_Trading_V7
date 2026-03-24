@@ -333,7 +333,7 @@ trail_use_hybrid = YES
 # These filters prevent trading stale/violated zones
 
 min_zone_age_days = 0           # Minimum zone age (0 = can trade fresh zones)
-max_zone_age_days = 390          # ⭐ CRITICAL: Maximum 60 days (changed from 980!)
+max_zone_age_days = 990          # ⭐ CRITICAL: Maximum 60 days (changed from 980!)
                                 # Prevents trading stale zones that lost money in Run 2
 
 exclude_zone_age_range = NO     # Disable complex age range exclusion (not needed)
@@ -351,7 +351,7 @@ entry_optimal_score = 78.0
 max_retries_per_zone = 20
 rr_max_ratio = 1.750
 trail_fallback_tp_rr = 1.750
-max_loss_per_trade = 29600.0
+max_loss_per_trade = 35600.0
 sl_buffer_zone_pct = 1.0
 sl_buffer_atr = 0.5
 min_stop_distance_points = 65
@@ -411,8 +411,15 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
 max_position_lots = 6
-max_touch_count = 5000;
+max_touch_count = 30;
 
 enable_rsi_hard_block = YES
 rsi_hard_block_high = 65.0    # lower from 72 to 65
 rsi_hard_block_low  = 28.0
+
+# Regime Filter 3: Freshness + BB Bandwidth compound block
+# Validated: 81 live trades Sep 2025–Mar 2026, FP=20%, net +₹1,48,048
+# WR: 56.8% → 68.9%  |  PF: 1.69 → 2.55  |  20 trades blocked (16 losses, 4 wins)
+enable_freshness_bb_block    = YES
+freshness_bb_min_freshness   = 3.0
+freshness_bb_max_bandwidth   = 0.45

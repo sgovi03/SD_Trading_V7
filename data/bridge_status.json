@@ -1,9 +1,9 @@
 {
   "status": "running",
-  "last_update": "2026-03-19T11:16:16.744355",
+  "last_update": "2026-03-23T09:58:07.125801",
   "candles_count": 0,
   "symbol": "NSE:NIFTY26MARFUT",
-  "latest_timestamp": 1773899100,
+  "latest_timestamp": 1774239900,
   "auto_refresh": true,
-  "timestamp": "2026-03-19T11:16:16.747644"
+  "timestamp": "2026-03-23T09:58:07.126074"
 }

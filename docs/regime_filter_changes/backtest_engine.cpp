@@ -1130,28 +1130,6 @@ void BacktestEngine::check_for_entries(const Core::Bar& bar, int bar_index) {
             }
         }
         Core::ZoneScore zone_score = scorer.evaluate_zone(zone, regime, bar);
-
-        // ⭐ REGIME FILTER 3: Freshness + BB Bandwidth compound block
-        // Validated on 81 live trades (Sep 2025–Mar 2026): FP=17-20%, net +₹1,48,048.
-        // Blocks when zone is unproven (low state_freshness_score) AND market is
-        // compressed (low BB bandwidth). AND logic — both must be true to block.
-        // IMPORTANT: reads zone_score (entry-time evaluation), NOT zone.zone_score
-        // (detection-time). Touch count accumulates between detection and entry —
-        // detection-time score may be stale and too high, letting degraded zones through.
-        if (config.enable_freshness_bb_block) {
-            double freshness_now = zone_score.state_freshness_score;
-            auto bb_now = Core::MarketAnalyzer::calculate_bollinger_bands(
-                bars, 20, 2.0, bar_index);
-            if (freshness_now < config.freshness_bb_min_freshness &&
-                bb_now.bandwidth < config.freshness_bb_max_bandwidth) {
-                LOG_DEBUG("Freshness+BB block: rejecting zone " << zone.zone_id
-                         << " (freshness=" << std::fixed << std::setprecision(1) << freshness_now
-                         << " < " << config.freshness_bb_min_freshness
-                         << ", BB_BW=" << std::setprecision(3) << bb_now.bandwidth
-                         << " < " << config.freshness_bb_max_bandwidth << ")");
-                continue;
-            }
-        }
         
         // Calculate entry decision
         double atr = Core::MarketAnalyzer::calculate_atr(bars, config.atr_period, bar_index);
