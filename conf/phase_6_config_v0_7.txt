@@ -410,7 +410,7 @@ late_entry_cutoff_time   = 14:30  # HH:MM — no new entries at/after this time
 # Priority 4: Hard cap on position lots
 # 6-lot trade = -₹16,164 (worst). 4-lot trades = 78% WR, avg +₹12,326.
 # Applied AFTER max_loss_per_trade has already reduced size — absolute ceiling.
-max_position_lots = 6
+max_position_lots = 1
 max_touch_count = 5000;
 
 enable_rsi_hard_block = YES
