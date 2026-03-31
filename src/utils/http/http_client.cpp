@@ -22,7 +22,7 @@ size_t HttpClient::write_callback(void* contents, size_t size, size_t nmemb, voi
 std::string HttpClient::url_encode(const std::string& value) {
     if (!curl_handle_) return value;
     
-    char* encoded = curl_easy_escape(curl_handle_, value.c_str(), value.length());
+    char* encoded = curl_easy_escape(curl_handle_, value.c_str(), static_cast<int>(value.length()));
     if (!encoded) return value;
     
     std::string result(encoded);
@@ -126,6 +126,63 @@ HttpResponse HttpClient::post(const std::string& url,
     response.status_code = static_cast<int>(http_code);
     
     // Determine success based on HTTP status
+    response.success = (http_code >= 200 && http_code < 300);
+    
+    if (response.success) {
+        LOG_INFO("HTTP POST succeeded - Status: " << response.status_code);
+        LOG_DEBUG("Response: " << response.body.substr(0, 200) 
+                  << (response.body.length() > 200 ? "..." : ""));
+    } else {
+        LOG_WARN("HTTP POST returned status: " << response.status_code);
+        LOG_WARN("Response: " << response.body);
+    }
+    
+    return response;
+}
+
+HttpResponse HttpClient::post_json(const std::string& url, const std::string& json_body) {
+    HttpResponse response;
+    
+    if (!curl_handle_) {
+        response.error_message = "CURL handle not initialized";
+        LOG_ERROR(response.error_message);
+        return response;
+    }
+    
+    LOG_INFO("POST " << url);
+    LOG_DEBUG("JSON body: " << json_body);
+    
+    curl_easy_reset(curl_handle_);
+    
+    curl_easy_setopt(curl_handle_, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl_handle_, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDS, json_body.c_str());
+    curl_easy_setopt(curl_handle_, CURLOPT_TIMEOUT, timeout_seconds_);
+    curl_easy_setopt(curl_handle_, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl_handle_, CURLOPT_WRITEDATA, &response.body);
+    
+    if (verbose_) {
+        curl_easy_setopt(curl_handle_, CURLOPT_VERBOSE, 1L);
+    }
+    
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl_handle_, CURLOPT_HTTPHEADER, headers);
+    
+    CURLcode res = curl_easy_perform(curl_handle_);
+    
+    curl_slist_free_all(headers);
+    
+    if (res != CURLE_OK) {
+        response.success = false;
+        response.error_message = curl_easy_strerror(res);
+        LOG_ERROR("HTTP POST failed: " << response.error_message);
+        return response;
+    }
+    
+    long http_code = 0;
+    curl_easy_getinfo(curl_handle_, CURLINFO_RESPONSE_CODE, &http_code);
+    response.status_code = static_cast<int>(http_code);
     response.success = (http_code >= 200 && http_code < 300);
     
     if (response.success) {

@@ -94,6 +94,14 @@ public:
      */
     HttpResponse post(const std::string& url, 
                      const std::map<std::string, std::string>& form_params);
+
+    /**
+     * Execute HTTP POST request with JSON body
+     * @param url Target URL
+     * @param json_body JSON payload as a string
+     * @return HttpResponse with status and body
+     */
+    HttpResponse post_json(const std::string& url, const std::string& json_body);
     
     /**
      * Execute HTTP GET request

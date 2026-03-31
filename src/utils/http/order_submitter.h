@@ -19,7 +19,7 @@ namespace Live {
  * @brief Configuration for Spring Boot order submission
  */
 struct OrderSubmitConfig {
-    std::string base_url = "http://localhost:8080";  // Spring Boot base URL
+    std::string base_url = "http://localhost:8080/trade";  // Spring Boot base URL including application path (/trade, /xyz, etc.)
     int long_strategy_number = 13;                    // Strategy number for LONG trades
     int short_strategy_number = 14;                   // Strategy number for SHORT trades
     int week_num = 0;                                 // Week number (default: 0)
@@ -28,13 +28,25 @@ struct OrderSubmitConfig {
     int timeout_seconds = 10;                         // HTTP timeout
     bool enable_submission = true;                    // Master switch to enable/disable
     
+    // Normalize base URL by removing any trailing slash.
+    std::string normalized_base_url() const {
+        if (!base_url.empty() && base_url.back() == '/') {
+            return base_url.substr(0, base_url.size() - 1);
+        }
+        return base_url;
+    }
+
     // Derived endpoints
     std::string get_order_submit_url() const {
-        return base_url + "/multipleOrderSubmit";
+        return normalized_base_url() + "/multipleOrderSubmit";
     }
-    
+
     std::string get_square_off_url() const {
-        return base_url + "/trade/squareOffAllPositions";
+        return normalized_base_url() + "/squareOffPositionsByOrderTag";
+    }
+
+    std::string get_square_off_position_url() const {
+        return normalized_base_url() + "/squareOffPositionsByOrderTag";
     }
 };
 
@@ -57,21 +69,21 @@ struct OrderSubmitResult {
  * 
  * Architecture:
  * - C++ SD Engine generates trade signals (LONG/SHORT)
- * - OrderSubmitter converts to HTTP POST requests
+ * - OrderSubmitter converts to HTTP POST requests with JSON body
  * - Spring Boot microservice receives orders
  * - Fyers broker executes trades
- * 
+ *
  * Endpoints:
  * - POST /multipleOrderSubmit - Submit new order
  * - POST /squareOffAllPositions - Exit all positions
- * 
- * Form Parameters:
- * - quantity: Number of lots (e.g., "1")
+ *
+ * JSON Body Fields:
+ * - quantity: Number of lots (e.g., 1)
  * - strategyNumber: 13 for LONG, 14 for SHORT
- * - weekNum: Week identifier (default: "0")
- * - monthNum: Month identifier (default: "0")
+ * - weekNum: Week identifier (default: 0)
+ * - monthNum: Month identifier (default: 0)
  * - type: Order type (1=MARKET, 2=LIMIT)
- * 
+ *
  * Example Usage:
  *   OrderSubmitter submitter(config);
  *   
@@ -90,12 +102,12 @@ private:
     bool initialized_;
     
     /**
-     * Build form parameters for order submission
+     * Build JSON payload for order submission
      */
-    std::map<std::string, std::string> build_order_params(
-        const std::string& direction,
+    std::string build_order_json(
         int quantity,
-        int strategy_number
+        int strategy_number,
+        const std::string& order_tag = ""
     );
     
     /**
@@ -142,11 +154,23 @@ public:
         double zone_score = 0.0,
         double entry_price = 0.0,
         double stop_loss = 0.0,
-        double take_profit = 0.0
+        double take_profit = 0.0,
+        const std::string& order_tag = ""
     );
     
     /**
-     * Square off all open positions
+     * Submit a tag-specific exit order to /squareOffPosition.
+     * Looks up the tag in ActiveOrderRegistry. On success the tag is
+     * removed from the registry. On failure the tag is retained (position
+     * still open). Logs an error and returns failure if the tag is unknown.
+     * @param order_tag 16-char OrderTag from the entry
+     * @return OrderSubmitResult with success status
+     */
+    OrderSubmitResult submit_exit_order(const std::string& order_tag);
+
+    /**
+     * Square off ALL open positions (emergency use — not tag-specific).
+     * Keep this intact; call it manually when needed.
      * @return OrderSubmitResult with success status
      */
     OrderSubmitResult square_off_all_positions();

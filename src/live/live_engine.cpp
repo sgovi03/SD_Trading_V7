@@ -6,6 +6,8 @@
 #include "../csv_simulator_broker.h"  // ⭐ ADD THIS LINE
 #include "fyers_adapter.h"  // ⭐ NEW: For FyersAdapter dynamic_cast
 #include "../utils/logger.h"
+#include "../utils/system_initializer.h"
+#include "../system_config.h"
 #include "../analysis/market_analyzer.h"
 #include "../backtest/csv_reporter.h"  // ⭐ NEW: CSV export functionality
 #include "../backtest/performance_tracker.h"  // ⭐ NEW: Performance tracking
@@ -24,6 +26,8 @@
 #include <numeric>
 #include <algorithm>  // ⭐ FIX: Added for std::sort, std::stable_sort
 #include <json/json.h>
+#include "order_tag_generator.h"
+#include "active_order_registry.h"
 // In BacktestEngine files
 #include "../ITradingEngine.h"
 #include "../ZonePersistenceAdapter.h"
@@ -164,12 +168,30 @@ LiveEngine::LiveEngine(
 		LOG_INFO("LiveEngine created for " << symbol << " @ " << interval << " min");
 		
 		// ⭐ FIX: Moved OrderSubmitter initialization INSIDE constructor body
-		// Create OrderSubmitter
+		// Load Spring Boot order submitter settings from cached system_config.json when available
+		::SystemConfig system_config;
+		std::string config_file_path;
+		if (SystemInitializer::getInstance().isInitialized()) {
+			config_file_path = SystemInitializer::getInstance().getConfigPath();
+		}
+		if (!config_file_path.empty()) {
+			std::string absolute_config_path = fs::absolute(config_file_path).string();
+			LOG_INFO("Using cached system configuration from SystemInitializer: " << absolute_config_path);
+			system_config = ::SystemConfig(absolute_config_path);
+		} else {
+			if (SystemInitializer::getInstance().isInitialized()) {
+				LOG_WARN("SystemInitializer initialized but did not provide a config path; loading default system_config.json");
+			} else {
+				LOG_INFO("SystemInitializer not initialized - loading system_config.json directly");
+			}
+			system_config = ::SystemConfig();
+		}
 		OrderSubmitConfig order_config;
-		order_config.base_url = "http://localhost:8080";
-		order_config.long_strategy_number = 13;
-		order_config.short_strategy_number = 14;
-		order_config.enable_submission = true;  // false for dry-run
+		order_config.base_url = system_config.get_value("order_submitter", "base_url", "http://localhost:8080/trade");
+		order_config.long_strategy_number = system_config.get_int("order_submitter", "long_strategy_number", 13);
+		order_config.short_strategy_number = system_config.get_int("order_submitter", "short_strategy_number", 14);
+		order_config.timeout_seconds = system_config.get_int("order_submitter", "timeout_seconds", 10);
+		order_config.enable_submission = system_config.get_bool("order_submitter", "enabled", true);
 		order_submitter_ = std::make_unique<OrderSubmitter>(order_config);
 		
 		// ✅ V6.0: Initialize V6.0 components
@@ -2541,16 +2563,36 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
 
 
 		if (entered && order_submitter_ && order_submitter_->is_enabled()) {
-			const Trade& trade = trade_mgr.get_current_trade();
+			Trade& trade_ref = const_cast<Trade&>(trade_mgr.get_current_trade());
+			std::string tag = OrderTagGenerator::generate(trade_ref.direction);
+			trade_ref.order_tag = tag;
+
+			ActiveOrder ao;
+			ao.order_tag        = tag;
+			ao.symbol           = trading_symbol;
+			ao.side             = trade_ref.direction;
+			ao.lots             = trade_ref.position_size;
+			ao.entry_price      = trade_ref.entry_price;
+			ao.stop_loss        = trade_ref.stop_loss;
+			ao.zone_id          = zone.zone_id;
+			ao.entry_time_epoch = static_cast<long long>(std::time(nullptr));
+			get_order_registry().register_order(ao);
+
 			auto result = order_submitter_->submit_order(
-				trade.direction,       // "LONG" or "SHORT"
-				trade.position_size,   // Quantity
+				trade_ref.direction,
+				trade_ref.position_size,
 				zone.zone_id,
-				trade.zone_score,
-				trade.entry_price,
-				trade.stop_loss,
-				trade.take_profit
+				trade_ref.zone_score,
+				trade_ref.entry_price,
+				trade_ref.stop_loss,
+				trade_ref.take_profit,
+				tag
 			);
+			if (!result.success) {
+				get_order_registry().remove(tag);
+			} else {
+				LOG_INFO("OrderTag: " << tag << " Zone: " << zone.zone_id << " Side: " << trade_ref.direction);
+			}
 		}
 
         if (entered) {
@@ -3145,8 +3187,8 @@ void LiveEngine::manage_position() {
             std::cout.flush();
 
             if (order_submitter_ && order_submitter_->is_enabled()) {
-                auto result = order_submitter_->square_off_all_positions();
-                LOG_INFO("Called square_off_all_positions after VOL_CLIMAX. Success: " << result.success);
+                auto result = order_submitter_->submit_exit_order(closed_trade.order_tag);
+                LOG_INFO("Exit order after VOL_CLIMAX. Tag: " << closed_trade.order_tag << " Success: " << result.success);
             }
             performance.add_trade(closed_trade);
             performance.update_capital(trade_mgr.get_capital());
@@ -3224,8 +3266,8 @@ void LiveEngine::manage_position() {
                          << " (EMA9=" << ema9 << ", EMA20=" << ema20 << ")");
 
                 if (order_submitter_ && order_submitter_->is_enabled()) {
-                    auto result = order_submitter_->square_off_all_positions();
-                    LOG_INFO("Called square_off_all_positions after EMA_CROSS. Success: " << result.success);
+                    auto result = order_submitter_->submit_exit_order(closed_trade.order_tag);
+                    LOG_INFO("Exit order after EMA_CROSS. Tag: " << closed_trade.order_tag << " Success: " << result.success);
                 }
 
                 performance.add_trade(closed_trade);
@@ -3376,10 +3418,9 @@ void LiveEngine::manage_position() {
 
         LOG_INFO("Position closed: STOP_LOSS, P&L: $" << closed_trade.pnl);
 
-        // Call square_off_all_positions if available and enabled
         if (order_submitter_ && order_submitter_->is_enabled()) {
-            auto result = order_submitter_->square_off_all_positions();
-            LOG_INFO("Called square_off_all_positions after STOP_LOSS. Success: " << result.success);
+            auto result = order_submitter_->submit_exit_order(closed_trade.order_tag);
+            LOG_INFO("Exit order after STOP_LOSS. Tag: " << closed_trade.order_tag << " Success: " << result.success);
         }
 
         // ⭐ NEW: Update performance and export CSV
@@ -3442,10 +3483,9 @@ void LiveEngine::manage_position() {
             }
         }
 
-        // Call square_off_all_positions if available and enabled
         if (order_submitter_ && order_submitter_->is_enabled()) {
-            auto result = order_submitter_->square_off_all_positions();
-            LOG_INFO("Called square_off_all_positions after TAKE_PROFIT. Success: " << result.success);
+            auto result = order_submitter_->submit_exit_order(closed_trade.order_tag);
+            LOG_INFO("Exit order after TAKE_PROFIT. Tag: " << closed_trade.order_tag << " Success: " << result.success);
         }
 
         // ⭐ NEW: Update performance and export CSV
@@ -3597,10 +3637,31 @@ void LiveEngine::process_tick() {
                                         std::cout.flush();
 
                                         if (order_submitter_ && order_submitter_->is_enabled()) {
-                                            order_submitter_->submit_order(
-                                                t.direction, t.position_size,
-                                                tgt->zone_id, t.zone_score,
-                                                t.entry_price, t.stop_loss, t.take_profit);
+                                            Trade& t_ref = const_cast<Trade&>(trade_mgr.get_current_trade());
+                                            std::string cont_tag = OrderTagGenerator::generate(t_ref.direction);
+                                            t_ref.order_tag = cont_tag;
+
+                                            ActiveOrder cont_ao;
+                                            cont_ao.order_tag        = cont_tag;
+                                            cont_ao.symbol           = trading_symbol;
+                                            cont_ao.side             = t_ref.direction;
+                                            cont_ao.lots             = t_ref.position_size;
+                                            cont_ao.entry_price      = t_ref.entry_price;
+                                            cont_ao.stop_loss        = t_ref.stop_loss;
+                                            cont_ao.zone_id          = tgt->zone_id;
+                                            cont_ao.entry_time_epoch = static_cast<long long>(std::time(nullptr));
+                                            get_order_registry().register_order(cont_ao);
+
+                                            auto cont_result = order_submitter_->submit_order(
+                                                t_ref.direction, t_ref.position_size,
+                                                tgt->zone_id, t_ref.zone_score,
+                                                t_ref.entry_price, t_ref.stop_loss, t_ref.take_profit,
+                                                cont_tag);
+                                            if (!cont_result.success) {
+                                                get_order_registry().remove(cont_tag);
+                                            } else {
+                                                LOG_INFO("OrderTag: " << cont_tag << " Zone: " << tgt->zone_id << " Side: " << t_ref.direction);
+                                            }
                                         }
                                     } else {
                                         skip_reason = "enter_trade() rejected (SL/size validation)";

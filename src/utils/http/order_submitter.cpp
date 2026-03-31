@@ -4,6 +4,8 @@
 
 #include "order_submitter.h"
 #include "../logger.h"
+#include "active_order_registry.h"
+#include <json/json.h>
 #include <iostream>
 #include <iomanip>
 
@@ -17,6 +19,8 @@ OrderSubmitter::OrderSubmitter(const OrderSubmitConfig& config)
     
     LOG_INFO("OrderSubmitter created");
     LOG_INFO("  Base URL: " << config_.base_url);
+    LOG_INFO("  Order Submit URL: " << config_.get_order_submit_url());
+    LOG_INFO("  Square Off URL: " << config_.get_square_off_url());
     LOG_INFO("  LONG Strategy: " << config_.long_strategy_number);
     LOG_INFO("  SHORT Strategy: " << config_.short_strategy_number);
     LOG_INFO("  Enabled: " << (config_.enable_submission ? "YES" : "NO"));
@@ -75,20 +79,24 @@ bool OrderSubmitter::validate_order_params(
     return true;
 }
 
-std::map<std::string, std::string> OrderSubmitter::build_order_params(
-    const std::string& direction,
+std::string OrderSubmitter::build_order_json(
     int quantity,
-    int strategy_number
+    int strategy_number,
+    const std::string& order_tag
 ) {
-    std::map<std::string, std::string> params;
-    
-    params["quantity"] = std::to_string(quantity);
-    params["strategyNumber"] = std::to_string(strategy_number);
-    params["weekNum"] = std::to_string(config_.week_num);
-    params["monthNum"] = std::to_string(config_.month_num);
-    params["type"] = std::to_string(config_.order_type);
-    
-    return params;
+    Json::Value body;
+    body["quantity"] = quantity;
+    body["strategyNumber"] = strategy_number;
+    body["weekNum"] = config_.week_num;
+    body["monthNum"] = config_.month_num;
+    body["type"] = config_.order_type;
+    if (!order_tag.empty()) {
+        body["orderTag"] = order_tag;
+    }
+
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "";
+    return Json::writeString(writer, body);
 }
 
 OrderSubmitResult OrderSubmitter::submit_order(
@@ -98,7 +106,8 @@ OrderSubmitResult OrderSubmitter::submit_order(
     double zone_score,
     double entry_price,
     double stop_loss,
-    double take_profit
+    double take_profit,
+    const std::string& order_tag
 ) {
     OrderSubmitResult result;
     
@@ -127,8 +136,8 @@ OrderSubmitResult OrderSubmitter::submit_order(
     int strategy_number = (direction == "LONG") ? 
         config_.long_strategy_number : config_.short_strategy_number;
     
-    // Build form parameters
-    auto params = build_order_params(direction, quantity, strategy_number);
+    // Build JSON request body (includes orderTag if provided)
+    auto json_body = build_order_json(quantity, strategy_number, order_tag);
     
     // Log order details
     std::cout << "\n+====================================================+\n";
@@ -143,15 +152,16 @@ OrderSubmitResult OrderSubmitter::submit_order(
     std::cout << "  Stop Loss:       " << stop_loss << "\n";
     std::cout << "  Take Profit:     " << take_profit << "\n";
     std::cout << "  URL:             " << config_.get_order_submit_url() << "\n";
+    std::cout << "  Payload:         " << json_body << "\n";
     std::cout << "+====================================================+\n";
     std::cout.flush();
-    
-    LOG_INFO("Submitting " << direction << " order: " << quantity << " lots (strategy: " 
-             << strategy_number << ")");
-    
+
+    LOG_INFO("Submitting " << direction << " order: " << quantity << " lots (strategy: "
+             << strategy_number << ") Payload: " << json_body);
+
     // Submit HTTP request
     try {
-        auto http_response = http_client_->post(config_.get_order_submit_url(), params);
+        auto http_response = http_client_->post_json(config_.get_order_submit_url(), json_body);
         
         result.success = http_response.success;
         result.http_status = http_response.status_code;
@@ -185,6 +195,93 @@ OrderSubmitResult OrderSubmitter::submit_order(
         LOG_ERROR("Exception during order submission: " << e.what());
     }
     
+    return result;
+}
+
+OrderSubmitResult OrderSubmitter::submit_exit_order(const std::string& order_tag) {
+    OrderSubmitResult result;
+
+    if (!config_.enable_submission) {
+        result.success = true;
+        result.error_message = "Order submission disabled in config";
+        LOG_INFO("📝 [DRY-RUN] Exit order would be submitted for tag: " << order_tag);
+        get_order_registry().remove(order_tag);
+        return result;
+    }
+
+    if (!initialized_) {
+        result.error_message = "OrderSubmitter not initialized";
+        LOG_ERROR(result.error_message);
+        return result;
+    }
+
+    if (order_tag.empty()) {
+        result.error_message = "submit_exit_order called with empty tag";
+        LOG_ERROR("❌ " << result.error_message);
+        return result;
+    }
+
+    // Log a warning if the tag is not in the registry (e.g. entry HTTP failed
+    // and was rolled back), but still attempt the exit — the engine recorded
+    // the trade and the broker may have filled it.
+    if (!get_order_registry().has(order_tag)) {
+        LOG_WARN("⚠️  submit_exit_order: tag not in registry (entry may have failed): " << order_tag
+                 << " — attempting exit anyway");
+    }
+
+    Json::Value body;
+    body["orderTag"] = order_tag;
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "";
+    std::string json_body = Json::writeString(writer, body);
+
+    std::string url = config_.get_square_off_position_url();
+
+    std::cout << "\n+====================================================+\n";
+    std::cout << "| [HTTP EXIT] Submitting exit order                 |\n";
+    std::cout << "+====================================================+\n";
+    std::cout << "  OrderTag: " << order_tag << "\n";
+    std::cout << "  URL:      " << url << "\n";
+    std::cout << "  Payload:  " << json_body << "\n";
+    std::cout << "+====================================================+\n";
+    std::cout.flush();
+
+    LOG_INFO("Submitting exit for OrderTag: " << order_tag << " Payload: " << json_body);
+
+    try {
+        auto http_response = http_client_->post_json(url, json_body);
+
+        result.success       = http_response.success;
+        result.http_status   = http_response.status_code;
+        result.response_body = http_response.body;
+        result.error_message = http_response.error_message;
+
+        if (result.success) {
+            std::cout << "\n✅ [SUCCESS] Exit order submitted!\n";
+            std::cout << "   HTTP Status: " << result.http_status << "\n";
+            std::cout << std::endl;
+            std::cout.flush();
+            LOG_INFO("✅ Exit order submitted - Tag: " << order_tag
+                     << " Status: " << result.http_status);
+            get_order_registry().remove(order_tag);
+        } else {
+            std::cout << "\n❌ [ERROR] Exit order failed! Position may still be open.\n";
+            std::cout << "   HTTP Status: " << result.http_status << "\n";
+            std::cout << "   Error: " << result.error_message << "\n";
+            std::cout << std::endl;
+            std::cout.flush();
+            LOG_ERROR("❌ Exit order failed - Tag: " << order_tag
+                      << " Status: " << result.http_status
+                      << " Error: " << result.error_message);
+            // Do NOT remove from registry — position still open
+        }
+
+    } catch (const std::exception& e) {
+        result.success = false;
+        result.error_message = std::string("Exception: ") + e.what();
+        LOG_ERROR("Exception during exit order submission: " << e.what());
+    }
+
     return result;
 }
 
@@ -260,7 +357,7 @@ bool OrderSubmitter::test_connection() {
     LOG_INFO("Testing connection to Spring Boot service...");
     
     try {
-        // Try to access base URL (might return 404 but proves server is up)
+        // Try to access the configured base URL directly.
         auto response = http_client_->get(config_.base_url);
         
         // Any response (even 404) means server is reachable

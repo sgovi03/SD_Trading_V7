@@ -558,6 +558,9 @@ struct Trade {
     double exit_volume_ratio           = 0.0;  // Exit bar vol / baseline
     bool   exit_was_volume_climax      = false; // Did VOL_CLIMAX trigger exit?
 
+    // OrderTag (live trading only — empty in backtest)
+    std::string order_tag;
+
     Trade()
                 : trade_num(0), entry_price(0), exit_price(0), stop_loss(0),
                     take_profit(0), position_size(0), bars_in_trade(0), pnl(0), pnl_pct(0),
