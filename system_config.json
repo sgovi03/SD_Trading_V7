@@ -21,7 +21,7 @@
     "strategy_config": "conf/phase_6_config_v0_7.txt",
     "fyers_token": "scripts/fyers_token.txt",
     "fyers_config": "scripts/fyers_config.json",
-    "live_data_csv": "data/LiveTest/Live_Data_5Mins_Sep05_Mar26.csv",
+    "live_data_csv": "data/LiveTest/test_data_5Mins.csv",
     "historical_data_cache": "data/cache/historical",
     "bridge_status": "data/bridge_status.json",
     "python_log": "logs/fyers_bridge.log",
@@ -48,7 +48,7 @@
   },
   
   "trading": {
-    "symbol": "NSE:NIFTY26MARFUT",
+    "symbol": "NSE:NIFTY26APRFUT",
     "resolution": "5",
     "mode": "paper",
     "starting_capital": 300000,
