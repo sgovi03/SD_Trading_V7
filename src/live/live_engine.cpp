@@ -2834,6 +2834,24 @@ void LiveEngine::manage_position() {
                     << ") to avoid overnight gap risk");
             
             std::string current_time = current_bar.datetime;
+            
+            // ⭐ CIRCUIT BREAKER EXIT: Call /squareOffPositionsByOrderTag before local close_trade()
+            // Get the order_tag from the current trade to notify the Spring Boot backend
+            const Trade& current_trade_ref = trade_mgr.get_current_trade();
+            if (!current_trade_ref.order_tag.empty() && order_submitter_) {
+                LOG_INFO("📤 CIRCUIT BREAKER: Submitting exit order via /squareOffPositionsByOrderTag");
+                LOG_INFO("   Order Tag: " << current_trade_ref.order_tag);
+                OrderSubmitResult exit_result = order_submitter_->submit_exit_order(current_trade_ref.order_tag);
+                if (exit_result.success) {
+                    LOG_INFO("✅ CIRCUIT BREAKER: /squareOffPositionsByOrderTag succeeded");
+                } else {
+                    LOG_WARN("⚠️  CIRCUIT BREAKER: /squareOffPositionsByOrderTag failed - HTTP Status: " 
+                             << exit_result.http_status << ", Error: " << exit_result.error_message);
+                }
+            } else {
+                LOG_WARN("⚠️  CIRCUIT BREAKER: Cannot submit exit order - order_tag is empty or OrderSubmitter unavailable");
+            }
+            
             Trade closed_trade = trade_mgr.close_trade(current_time, "SESSION_END", current_price);
             fix_exit_price(closed_trade, current_price);  // ⭐ ISSUE-A fix
             
