@@ -3911,6 +3911,63 @@ bool LiveEngine::bootstrap_zones_on_startup() {
                                      << " zone(s) from EXHAUSTED/dirty state on cache load");
                         }
                     }
+
+                    // ⭐ STARTUP CONFLICT SCAN:
+                    // The conflicting-zone fix (process_zones) only fires when a zone is
+                    // NEWLY DETECTED. Pre-existing conflicts baked into the persistence file
+                    // before the fix was deployed are not caught at detection time.
+                    // This scan runs once after all zones are loaded and marks the OLDER
+                    // zone VIOLATED whenever a newer opposite-type zone occupies the same
+                    // price level (≥50% overlap of the smaller zone's width).
+                    // Zones are sorted by formation_bar so the loop always encounters the
+                    // older zone first — it is the one that must yield.
+                    {
+                        const double CONFLICT_THRESHOLD = 0.5;
+                        int conflict_count = 0;
+                        // Sort by formation_bar ascending so older zones come first
+                        std::vector<Zone*> sorted_ptrs;
+                        for (auto& z : active_zones) sorted_ptrs.push_back(&z);
+                        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
+                            [](const Zone* a, const Zone* b) {
+                                return a->formation_bar < b->formation_bar;
+                            });
+                        for (size_t ii = 0; ii < sorted_ptrs.size(); ++ii) {
+                            Zone* older = sorted_ptrs[ii];
+                            if (older->state == ZoneState::VIOLATED) continue;
+                            double lo1 = std::min(older->proximal_line, older->distal_line);
+                            double hi1 = std::max(older->proximal_line, older->distal_line);
+                            for (size_t jj = ii + 1; jj < sorted_ptrs.size(); ++jj) {
+                                Zone* newer = sorted_ptrs[jj];
+                                if (newer->state == ZoneState::VIOLATED) continue;
+                                if (newer->type == older->type)          continue;
+                                double lo2 = std::min(newer->proximal_line, newer->distal_line);
+                                double hi2 = std::max(newer->proximal_line, newer->distal_line);
+                                double overlap = std::max(0.0, std::min(hi1,hi2) - std::max(lo1,lo2));
+                                double smaller = std::min(hi1-lo1, hi2-lo2);
+                                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                                    older->state = ZoneState::VIOLATED;
+                                    conflict_count++;
+                                    LOG_INFO("⚡ STARTUP CONFLICT: older "
+                                            << (older->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                                            << " Z" << older->zone_id
+                                            << " @ " << older->distal_line << "-" << older->proximal_line
+                                            << " bar=" << older->formation_bar
+                                            << " → VIOLATED by newer "
+                                            << (newer->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                                            << " Z" << newer->zone_id
+                                            << " @ " << newer->distal_line << "-" << newer->proximal_line
+                                            << " bar=" << newer->formation_bar
+                                            << " (overlap=" << static_cast<int>(overlap/smaller*100) << "%)");
+                                    break; // older is now VIOLATED — no need to check further
+                                }
+                            }
+                        }
+                        if (conflict_count > 0) {
+                            LOG_INFO("⚡ Startup conflict scan: " << conflict_count
+                                     << " pre-existing conflicting zone(s) marked VIOLATED");
+                        }
+                    }
+
                     return true;
                 } else {
                     LOG_WARN("⚠️  Failed to load cached zones - regenerating");
@@ -4033,7 +4090,61 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     metadata["zone_count"] = std::to_string(active_zones.size());
     metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
     metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
-    
+
+    // ⭐ STARTUP CONFLICT SCAN (regeneration path):
+    // replay_historical_zone_states() replays price-action state correctly but does
+    // not apply the conflicting-zone rule. A zone that was never violated by price
+    // action may still be structurally superseded by a newer opposite-type zone at
+    // the same price level. This scan runs AFTER replay and BEFORE save so the
+    // persisted file already has the correct VIOLATED states.
+    // Sorted by formation_bar ascending: the older zone always yields to the newer.
+    // Threshold: ≥50% overlap of the smaller zone's width = conflicting.
+    {
+        const double CONFLICT_THRESHOLD = 0.5;
+        int conflict_count = 0;
+        std::vector<Zone*> sorted_ptrs;
+        for (auto& z : active_zones) sorted_ptrs.push_back(&z);
+        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
+            [](const Zone* a, const Zone* b) {
+                return a->formation_bar < b->formation_bar;
+            });
+        for (size_t ii = 0; ii < sorted_ptrs.size(); ++ii) {
+            Zone* older = sorted_ptrs[ii];
+            if (older->state == ZoneState::VIOLATED) continue;
+            double lo1 = std::min(older->proximal_line, older->distal_line);
+            double hi1 = std::max(older->proximal_line, older->distal_line);
+            for (size_t jj = ii + 1; jj < sorted_ptrs.size(); ++jj) {
+                Zone* newer = sorted_ptrs[jj];
+                if (newer->state == ZoneState::VIOLATED) continue;
+                if (newer->type == older->type)          continue;
+                double lo2 = std::min(newer->proximal_line, newer->distal_line);
+                double hi2 = std::max(newer->proximal_line, newer->distal_line);
+                double overlap = std::max(0.0, std::min(hi1, hi2) - std::max(lo1, lo2));
+                double smaller = std::min(hi1 - lo1, hi2 - lo2);
+                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                    older->state = ZoneState::VIOLATED;
+                    conflict_count++;
+                    LOG_INFO("⚡ CONFLICT (regen): older "
+                            << (older->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << older->zone_id
+                            << " @ " << older->distal_line << "-" << older->proximal_line
+                            << " bar=" << older->formation_bar
+                            << " → VIOLATED by newer "
+                            << (newer->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << newer->zone_id
+                            << " @ " << newer->distal_line << "-" << newer->proximal_line
+                            << " bar=" << newer->formation_bar
+                            << " (overlap=" << static_cast<int>(overlap / smaller * 100) << "%)");
+                    break; // older is now VIOLATED — no further checks needed for it
+                }
+            }
+        }
+        if (conflict_count > 0) {
+            LOG_INFO("⚡ Conflict scan (regen): " << conflict_count
+                     << " zone(s) marked VIOLATED before save");
+        }
+    }
+
     // Save master zones with metadata
     LOG_INFO("Saving master zones with metadata...");
     bool save_success = zone_persistence_.save_zones_with_metadata(

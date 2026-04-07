@@ -2024,6 +2024,63 @@ void BacktestEngine::run(int duration_minutes) {
     LOG_INFO("Reset touch_count=0 and state=FRESH for " << active_zones.size()
              << " zones before bar loop (detector preset discarded)");
 
+    // ⭐ STARTUP CONFLICT SCAN (BT):
+    // detect_zones_full() marks conflicting zones VIOLATED, but the RC1 reset above
+    // immediately overwrites every state back to FRESH — wiping out those markings.
+    // Running the scan HERE (after the reset, before the bar loop) re-applies conflict
+    // resolution on the clean slate that the bar loop will actually start from.
+    //
+    // A zone is conflicting when a NEWER opposite-type zone (higher formation_bar)
+    // overlaps its price body by ≥50% of the smaller zone's width. The older zone
+    // yields — it is marked VIOLATED so it will not generate entries during the
+    // bar loop. The bar loop's detect_and_add_zones() already handles conflicts that
+    // arise incrementally; this scan handles conflicts visible from the full scan.
+    {
+        const double CONFLICT_THRESHOLD = 0.5;
+        int conflict_count = 0;
+        std::vector<Core::Zone*> sorted_ptrs;
+        for (auto& z : active_zones) sorted_ptrs.push_back(&z);
+        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
+            [](const Core::Zone* a, const Core::Zone* b) {
+                return a->formation_bar < b->formation_bar;
+            });
+        for (size_t ii = 0; ii < sorted_ptrs.size(); ++ii) {
+            Core::Zone* older = sorted_ptrs[ii];
+            if (older->state == Core::ZoneState::VIOLATED) continue;
+            double lo1 = std::min(older->proximal_line, older->distal_line);
+            double hi1 = std::max(older->proximal_line, older->distal_line);
+            for (size_t jj = ii + 1; jj < sorted_ptrs.size(); ++jj) {
+                Core::Zone* newer = sorted_ptrs[jj];
+                if (newer->state == Core::ZoneState::VIOLATED) continue;
+                if (newer->type == older->type)                continue;
+                double lo2 = std::min(newer->proximal_line, newer->distal_line);
+                double hi2 = std::max(newer->proximal_line, newer->distal_line);
+                double overlap = std::max(0.0, std::min(hi1,hi2) - std::max(lo1,lo2));
+                double smaller = std::min(hi1-lo1, hi2-lo2);
+                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                    older->state = Core::ZoneState::VIOLATED;
+                    conflict_count++;
+                    LOG_INFO("⚡ STARTUP CONFLICT (BT): older "
+                            << (older->type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << older->zone_id
+                            << " @ " << older->distal_line << "-" << older->proximal_line
+                            << " bar=" << older->formation_bar
+                            << " → VIOLATED by newer "
+                            << (newer->type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << newer->zone_id
+                            << " @ " << newer->distal_line << "-" << newer->proximal_line
+                            << " bar=" << newer->formation_bar
+                            << " (overlap=" << static_cast<int>(overlap/smaller*100) << "%)");
+                    break; // older is VIOLATED — no further checks needed for it
+                }
+            }
+        }
+        if (conflict_count > 0) {
+            LOG_INFO("⚡ BT startup conflict scan: " << conflict_count
+                     << " conflicting zone(s) marked VIOLATED before bar loop");
+        }
+    }
+
     std::cout << "\nProcessing bars..." << std::endl;
     
     // Process each bar
