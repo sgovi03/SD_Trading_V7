@@ -661,6 +661,53 @@ void BacktestEngine::detect_and_add_zones(const Core::Bar& bar, int bar_index) {
         );
         record_event(zone, creation_event, config.record_zone_creation);
 
+        // ⭐ CONFLICTING ZONE FIX (detect_and_add_zones / BT):
+        // When a new zone is added to active_zones, mark any existing active zone of the
+        // OPPOSITE type at the same price level as VIOLATED. The newer zone (formed later
+        // in the timeline) supersedes the older structural read at that level.
+        // Threshold: 50% of the smaller zone's width must overlap to qualify as conflicting.
+        {
+            const double CONFLICT_THRESHOLD = 0.5;
+            double new_lo = std::min(zone.proximal_line, zone.distal_line);
+            double new_hi = std::max(zone.proximal_line, zone.distal_line);
+            for (auto& az : active_zones) {
+                if (az.state == Core::ZoneState::VIOLATED) continue;
+                if (az.type  == zone.type)                 continue;
+                double az_lo = std::min(az.proximal_line, az.distal_line);
+                double az_hi = std::max(az.proximal_line, az.distal_line);
+                double overlap = std::max(0.0, std::min(new_hi, az_hi) - std::max(new_lo, az_lo));
+                double smaller = std::min(new_hi - new_lo, az_hi - az_lo);
+                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                    std::string old_state_str = (az.state == Core::ZoneState::FRESH   ? "FRESH"  :
+                                                 az.state == Core::ZoneState::TESTED  ? "TESTED" : "RECLAIMED");
+                    az.state = Core::ZoneState::VIOLATED;
+                    LOG_INFO("⚡ CONFLICTING ZONE (BT): new "
+                            << (zone.type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << zone.zone_id
+                            << " @ " << zone.distal_line << "-" << zone.proximal_line
+                            << " bar=" << bar_index
+                            << " conflicts with existing "
+                            << (az.type == Core::ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                            << " Z" << az.zone_id
+                            << " @ " << az.distal_line << "-" << az.proximal_line
+                            << " → marked VIOLATED (overlap="
+                            << static_cast<int>(overlap / smaller * 100) << "%)");
+                    Core::ZoneStateEvent conflict_event(
+                        bar.datetime,
+                        bar_index,
+                        "CONFLICT_VIOLATED",
+                        old_state_str,
+                        "VIOLATED",
+                        (az.proximal_line + az.distal_line) / 2.0,
+                        bar.high,
+                        bar.low,
+                        az.touch_count
+                    );
+                    record_event(az, conflict_event, config.record_violations);
+                }
+            }
+        }
+
         active_zones.push_back(zone);
 
         LOG_DEBUG("New zone added: "

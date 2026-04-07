@@ -1716,6 +1716,55 @@ void LiveEngine::process_zones() {
             );
             record_event(zone, creation_event, config.record_zone_creation);
             
+            // ⭐ CONFLICTING ZONE FIX (process_zones / LT):
+            // A new zone of type T at price level P invalidates any existing active zone
+            // of the OPPOSITE type at the same level. The newer formation supersedes the
+            // older one — the market has reversed its structural bias at that price.
+            // We scan active_zones (not the detector output) because the older zone is
+            // already live and must be stopped from generating further trades.
+            // Threshold: 50% of the smaller zone's width must overlap.
+            {
+                const double CONFLICT_THRESHOLD = 0.5;
+                double new_lo = std::min(zone.proximal_line, zone.distal_line);
+                double new_hi = std::max(zone.proximal_line, zone.distal_line);
+                for (auto& az : active_zones) {
+                    if (az.state == ZoneState::VIOLATED) continue;
+                    if (az.type  == zone.type)           continue; // same type, no conflict
+                    double az_lo = std::min(az.proximal_line, az.distal_line);
+                    double az_hi = std::max(az.proximal_line, az.distal_line);
+                    double overlap = std::max(0.0, std::min(new_hi, az_hi) - std::max(new_lo, az_lo));
+                    double smaller = std::min(new_hi - new_lo, az_hi - az_lo);
+                    if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                        std::string old_state_str = (az.state == ZoneState::FRESH   ? "FRESH"  :
+                                                     az.state == ZoneState::TESTED  ? "TESTED" : "RECLAIMED");
+                        az.state = ZoneState::VIOLATED;
+                        LOG_INFO("⚡ CONFLICTING ZONE (LT): new "
+                                << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                                << " Z" << zone.zone_id
+                                << " @ " << zone.distal_line << "-" << zone.proximal_line
+                                << " conflicts with existing "
+                                << (az.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
+                                << " Z" << az.zone_id
+                                << " @ " << az.distal_line << "-" << az.proximal_line
+                                << " → marked VIOLATED (overlap="
+                                << static_cast<int>(overlap / smaller * 100) << "%)");
+                        // Record the conflict-driven violation as a state event
+                        ZoneStateEvent conflict_event(
+                            bar_history.back().datetime,
+                            static_cast<int>(bar_history.size()) - 1,
+                            "CONFLICT_VIOLATED",
+                            old_state_str,
+                            "VIOLATED",
+                            (az.proximal_line + az.distal_line) / 2.0,
+                            bar_history.back().high,
+                            bar_history.back().low,
+                            az.touch_count
+                        );
+                        record_event(az, conflict_event, config.record_violations);
+                    }
+                }
+            }
+
             active_zones.push_back(zone);
             zones_added = true;
             

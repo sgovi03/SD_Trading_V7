@@ -604,6 +604,44 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
             );
 
             if (decision == ZoneDecision::CREATE_NEW) {
+                // ⭐ CONFLICTING ZONE FIX: Before accepting a new zone, check whether
+                // any existing_zone of the OPPOSITE type occupies the same price level.
+                // A SUPPLY zone forming inside a DEMAND zone (or vice versa) means the
+                // market has reversed its bias at that level — the newer zone supersedes
+                // the older one. Mark the conflicting existing zone VIOLATED so it is no
+                // longer traded. The new zone is then added normally.
+                //
+                // Overlap is measured as a fraction of the SMALLER zone's width.
+                // threshold = 0.5 (50%): prevents false positives from nearby zones
+                // that merely approach each other without truly occupying the same level.
+                {
+                    const double CONFLICT_THRESHOLD = 0.5;
+                    double cand_lo = std::min(candidate.proximal_line, candidate.distal_line);
+                    double cand_hi = std::max(candidate.proximal_line, candidate.distal_line);
+                    for (auto& ez : existing_zones) {
+                        if (ez.state == ZoneState::VIOLATED) continue;
+                        if (ez.type == candidate.type)       continue; // same type, not conflicting
+                        double ez_lo = std::min(ez.proximal_line, ez.distal_line);
+                        double ez_hi = std::max(ez.proximal_line, ez.distal_line);
+                        double overlap = std::max(0.0, std::min(cand_hi, ez_hi) - std::max(cand_lo, ez_lo));
+                        double smaller = std::min(cand_hi - cand_lo, ez_hi - ez_lo);
+                        if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                            ez.state = ZoneState::VIOLATED;
+                            LOG_INFO("⚡ CONFLICTING ZONE: " +
+                                     std::string(candidate.type == ZoneType::SUPPLY ? "SUPPLY" : "DEMAND") +
+                                     " zone at " + std::to_string(candidate.distal_line) +
+                                     "-" + std::to_string(candidate.proximal_line) +
+                                     " (bar " + std::to_string(candidate.formation_bar) + ")" +
+                                     " conflicts with existing " +
+                                     std::string(ez.type == ZoneType::SUPPLY ? "SUPPLY" : "DEMAND") +
+                                     " Z" + std::to_string(ez.zone_id) +
+                                     " at " + std::to_string(ez.distal_line) +
+                                     "-" + std::to_string(ez.proximal_line) +
+                                     " → marking existing VIOLATED (overlap=" +
+                                     std::to_string(static_cast<int>(overlap / smaller * 100)) + "%)");
+                        }
+                    }
+                }
                 zones.push_back(candidate);
                 created_count++;
             } else if (decision == ZoneDecision::MERGE_WITH_EXISTING) {
@@ -911,6 +949,35 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
             );
 
             if (decision == ZoneDecision::CREATE_NEW) {
+                // ⭐ CONFLICTING ZONE FIX (detect_zones_full):
+                // When a new zone is accepted, invalidate any already-found zone of the
+                // opposite type that occupies the same price level (>=50% overlap of the
+                // smaller zone's width). The newer formation supersedes the older one.
+                {
+                    const double CONFLICT_THRESHOLD = 0.5;
+                    double cand_lo = std::min(candidate.proximal_line, candidate.distal_line);
+                    double cand_hi = std::max(candidate.proximal_line, candidate.distal_line);
+                    for (auto& ez : zones) {
+                        if (ez.state == ZoneState::VIOLATED) continue;
+                        if (ez.type == candidate.type)       continue;
+                        double ez_lo = std::min(ez.proximal_line, ez.distal_line);
+                        double ez_hi = std::max(ez.proximal_line, ez.distal_line);
+                        double overlap = std::max(0.0, std::min(cand_hi, ez_hi) - std::max(cand_lo, ez_lo));
+                        double smaller = std::min(cand_hi - cand_lo, ez_hi - ez_lo);
+                        if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
+                            ez.state = ZoneState::VIOLATED;
+                            LOG_INFO("⚡ CONFLICTING ZONE (full scan): " +
+                                     std::string(candidate.type == ZoneType::SUPPLY ? "SUPPLY" : "DEMAND") +
+                                     " bar=" + std::to_string(candidate.formation_bar) +
+                                     " conflicts with existing " +
+                                     std::string(ez.type == ZoneType::SUPPLY ? "SUPPLY" : "DEMAND") +
+                                     " Z" + std::to_string(ez.zone_id) +
+                                     " bar=" + std::to_string(ez.formation_bar) +
+                                     " → marked VIOLATED (overlap=" +
+                                     std::to_string(static_cast<int>(overlap / smaller * 100)) + "%)");
+                        }
+                    }
+                }
                 pass_all_checks++;
                 zones.push_back(candidate);
                 created_count++;
