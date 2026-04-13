@@ -1,0 +1,1 @@
+python live_sim_v8.py --csv ..\data\LiveTest\test_data_5Mins.csv --symbol NIFTY --interval .025

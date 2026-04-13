@@ -1,0 +1,47 @@
+{
+  "_comment": "SD Trading V8 — Symbol Registry",
+  "_version": "8.0",
+  "_description": "Source of truth for all tradeable symbols. Add symbol here AND create config/symbols/{SYMBOL}.config to activate.",
+
+  "symbols": [
+    {
+      "symbol": "NIFTY",
+      "display_name": "Nifty 50 Futures",
+      "asset_class": "INDEX_FUTURES",
+      "exchange": "NSE",
+      "lot_size": 75,
+      "tick_size": 0.05,
+      "margin_per_lot": 60000,
+      "expiry_day": "THURSDAY",
+      "live_feed_ticker": "NSE:NIFTY26APRFUT",
+      "config_file_path": "config/symbols/NIFTY.config",
+      "active": true
+    },
+    {
+      "symbol": "BANKNIFTY",
+      "display_name": "Bank Nifty Futures",
+      "asset_class": "INDEX_FUTURES",
+      "exchange": "NSE",
+      "lot_size": 15,
+      "tick_size": 5.0,
+      "margin_per_lot": 45000,
+      "expiry_day": "WEDNESDAY",
+      "live_feed_ticker": "NSE:BANKNIFTY26APRFUT",
+      "config_file_path": "config/symbols/BANKNIFTY.config",
+      "active": false
+    },
+    {
+      "symbol": "FINNIFTY",
+      "display_name": "Fin Nifty Futures",
+      "asset_class": "INDEX_FUTURES",
+      "exchange": "NSE",
+      "lot_size": 40,
+      "tick_size": 0.05,
+      "margin_per_lot": 30000,
+      "expiry_day": "TUESDAY",
+      "live_feed_ticker": "NSE:FINNIFTY26APRFUT",
+      "config_file_path": "config/symbols/FINNIFTY.config",
+      "active": false
+    }
+  ]
+}

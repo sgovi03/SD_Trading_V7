@@ -60,11 +60,17 @@ struct Bar {
     
     // NEW V6.0: Volume metadata (calculated in-memory)
     double norm_volume_ratio;   // volume / time-of-day baseline
+
+    // V8: data source tag passed from wire format field[0].
+    // "HISTORICAL" = bulk bootstrap or SQLite-preloaded bars → trading BLOCKED
+    // anything else (e.g. "AMIBROKER") = real-time live bar → trading ENABLED
+    // Default: "HISTORICAL" so bars created without a wire source are safe.
+    std::string source;
     
     Bar() 
         : datetime(""), open(0), high(0), low(0), 
           close(0), volume(0), oi(0), oi_fresh(false),
-          oi_age_seconds(0), norm_volume_ratio(0) {}
+          oi_age_seconds(0), norm_volume_ratio(0), source("HISTORICAL") {}
 };
 
 // ============================================================
@@ -1420,7 +1426,43 @@ struct SystemConfig {
     int zone_bootstrap_ttl_hours;
     std::string zone_bootstrap_refresh_time;
     bool zone_bootstrap_force_regenerate;
-    
+
+    // ---- V8: Multi-symbol / Scanner additions ----
+
+    // Symbol registry file — source of truth for all tradeable symbols.
+    // Replaces the single trading.symbol for scanner mode.
+    std::string symbol_registry_file;
+
+    // Config root directory for 3-tier cascade:
+    //   {config_root_dir}/MASTER.config
+    //   {config_root_dir}/classes/{ASSET_CLASS}.config
+    //   {config_root_dir}/symbols/{SYMBOL}.config
+    std::string config_root_dir;
+
+    // SQLite database file path (WAL mode, single file for all symbols)
+    std::string sqlite_db_path;
+
+    // Schema SQL file — applied once at first run
+    std::string sqlite_schema_path;
+
+    // Scanner mode settings
+    bool        scanner_mode_enabled;
+    double      scanner_signal_min_score;
+    std::string scanner_rank_by;            // "SCORE" | "RR" | "ZONE_STRENGTH"
+
+    // Compute backend selection
+    std::string compute_backend;            // "AUTO" | "CPU" | "CUDA"
+    int         cpu_thread_pool_size;       // Workers for CPU thread pool
+    int         cuda_device_id;             // GPU device index (0 = RTX 4050)
+    int         cuda_min_symbols_threshold; // Min symbols to justify GPU
+
+    // Order submitter (extracted from system_config.json order_submitter section)
+    bool        order_submitter_enabled;
+    std::string order_submitter_base_url;
+    int         order_submitter_long_strategy;
+    int         order_submitter_short_strategy;
+    int         order_submitter_timeout;
+
     // Constructor with defaults
     SystemConfig()
         : root_directory("."),
@@ -1468,7 +1510,23 @@ struct SystemConfig {
           zone_bootstrap_enabled(true),
           zone_bootstrap_ttl_hours(24),
           zone_bootstrap_refresh_time("08:50"),
-          zone_bootstrap_force_regenerate(false) {}
+          zone_bootstrap_force_regenerate(false),
+          symbol_registry_file("config/symbol_registry.json"),
+          config_root_dir("config"),
+          sqlite_db_path("data/sd_trading_v8.db"),
+          sqlite_schema_path("src/persistence/db_schema.sql"),
+          scanner_mode_enabled(false),
+          scanner_signal_min_score(65.0),
+          scanner_rank_by("SCORE"),
+          compute_backend("AUTO"),
+          cpu_thread_pool_size(8),
+          cuda_device_id(0),
+          cuda_min_symbols_threshold(20),
+          order_submitter_enabled(true),
+          order_submitter_base_url("http://localhost:8080/trade"),
+          order_submitter_long_strategy(13),
+          order_submitter_short_strategy(14),
+          order_submitter_timeout(10) {}
     
     /**
      * Get full path by resolving relative to root_directory

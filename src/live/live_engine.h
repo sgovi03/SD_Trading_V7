@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <functional>
+#include "../events/event_types.h"  // V8: Events::SignalEvent, TradeOpenEvent, TradeCloseEvent
 #include <optional>
 #include <map>
 #include <unordered_map>
@@ -131,6 +133,29 @@ protected:
     // ⭐ NEW: DryRun bootstrap phase tracking
     int dryrun_bootstrap_end_bar_;  // Bar index where bootstrap ends (only used in dryrun mode)
     bool skip_trading_until_bar_;   // Flag to skip trading until reaching bootstrap end bar
+
+    // V8: Two-phase operation gate.
+    // false = HISTORICAL mode → build zones, no trading
+    // true  = LIVE mode → full trading enabled
+    // Flips true on first bar whose source != "HISTORICAL"
+    bool historical_mode_;
+
+    // Dedup cache for process_zones() — rebuilt only when active_zones changes.
+    // Avoids copying active_zones on every bar (was O(n) allocation per tick).
+    std::vector<Zone> dedup_cache_;
+    size_t            dedup_cache_zone_count_ = 0;
+    int               dedup_cache_cutoff_     = -1;
+
+    // V8: trade event publish callbacks (wired by SymbolContext → EventBus → DbWriter)
+    std::function<void(const Events::SignalEvent&)>     signal_pub_cb_;
+    std::function<void(const Events::TradeOpenEvent&)>  trade_open_pub_cb_;
+    std::function<void(const Events::TradeCloseEvent&)> trade_close_pub_cb_;
+
+    // V8: zone callbacks
+    std::function<void(const std::string&, int,
+                       const std::string&, int, int)> zone_update_cb_;
+    std::function<void(const std::vector<Zone>&,
+                       const std::vector<Zone>&)>     zone_snapshot_cb_;
     
     // ⭐ NEW: Track exported trade count to prevent duplicate exports
     size_t last_exported_trade_count_ = 0;
@@ -146,6 +171,8 @@ protected:
      * Update bar history with latest bar from broker
      */
     void update_bar_history();
+    void fire_zone_update(const Zone& zone);
+    void publish_trade_events(const Trade& trade, const Zone& zone, bool is_close);
     
     /**
      * Detect and manage zones
@@ -355,7 +382,40 @@ public:
      * @return "live"
      */
     std::string get_engine_type() const override { return "live"; }
-    
+
+    /**
+     * V8: Preload bar history from external source (e.g. SQLite).
+     * Must be called BEFORE initialize(). Allows zone bootstrap
+     * on restart without requiring AFL to replay historical data.
+     */
+    void preload_bar_history(const std::vector<Bar>& bars) {
+        bar_history = bars;
+    }
+
+    // V8: Read-only access to active zones after initialize().
+    // Used by SymbolContext to publish ZoneSnapshotEvents to EventBus.
+    const std::vector<Zone>& get_active_zones() const { return active_zones; }
+    const std::vector<Zone>& get_inactive_zones() const { return inactive_zones; }
+
+    // V8: Trade event publish callbacks.
+    // SymbolContext wires these to bus_->publish() so signals and trades
+    // reach the DB via DbWriter without LiveEngine depending on EventBus.
+    using SignalPubCallback    = std::function<void(const Events::SignalEvent&)>;
+    using TradeOpenPubCallback = std::function<void(const Events::TradeOpenEvent&)>;
+    using TradeClosePubCallback= std::function<void(const Events::TradeCloseEvent&)>;
+
+    void set_signal_pub_callback(SignalPubCallback cb)     { signal_pub_cb_     = std::move(cb); }
+    void set_trade_open_callback(TradeOpenPubCallback cb)  { trade_open_pub_cb_ = std::move(cb); }
+    void set_trade_close_callback(TradeClosePubCallback cb){ trade_close_pub_cb_= std::move(cb); }
+
+    // V8: zone callbacks
+    using ZoneUpdateCallback   = std::function<void(const std::string&, int,
+                                                    const std::string&, int, int)>;
+    using ZoneSnapshotCallback = std::function<void(const std::vector<Zone>&,
+                                                    const std::vector<Zone>&)>;
+    void set_zone_update_callback(ZoneUpdateCallback cb)   { zone_update_cb_    = std::move(cb); }
+    void set_zone_snapshot_callback(ZoneSnapshotCallback cb){ zone_snapshot_cb_ = std::move(cb); }
+
     // ========================================
     // Public Accessors (unchanged)
     // ========================================

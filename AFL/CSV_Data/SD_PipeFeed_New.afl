@@ -1,0 +1,238 @@
+// ============================================================
+// SD TRADING V8 - PIPE FEED (Historical + Live Incremental)
+// afl/SD_PipeFeed.afl  v2 — File-based state (survives AB restart)
+//
+// First run  ? sends ALL historical bars (bulk bootstrap)
+// Every AR run (5 min) ? sends only NEW bars since last run
+//
+// State stored in: data/sd_pipe_state_{SYMBOL}.txt
+// This survives AmiBroker restarts — no more duplicate sends.
+// ============================================================
+
+TIMEFRAME_LABEL = "5min";
+IST_OFFSET      = "+05:30";
+MARKET_OPEN_TN  = 91500;
+MARKET_CLOSE_TN = 152500;
+
+// State file directory — adjust if your project root differs
+STATE_DIR = "D:\\SD_System\\SD_Volume_OI\\Scanner\\SD_Trading_V7\\data";
+
+function GetIST8601(bar_idx) {
+    dn_arr = DateNum();
+    tn_arr = TimeNum();
+    dn     = dn_arr[bar_idx];
+    tn     = tn_arr[bar_idx];
+
+    raw_yr  = int(dn / 10000);
+    full_yr = IIf(raw_yr < 200, 1900 + raw_yr, raw_yr);
+    mo_num  = int((dn - int(dn / 10000) * 10000) / 100);
+    dy_num  = int(dn - int(dn / 10000) * 10000 - mo_num * 100);
+    hh_num  = int(tn / 10000);
+    mm_num  = int((tn - hh_num * 10000) / 100);
+    ss_num  = int(tn - hh_num * 10000 - mm_num * 100);
+
+    yr = NumToStr(full_yr, 1.0, False);
+    mo = NumToStr(mo_num,  1.0, False);
+    dy = NumToStr(dy_num,  1.0, False);
+    hh = NumToStr(hh_num,  1.0, False);
+    mm = NumToStr(mm_num,  1.0, False);
+    ss = NumToStr(ss_num,  1.0, False);
+
+    if (StrLen(mo) < 2) mo = "0" + mo;
+    if (StrLen(dy) < 2) dy = "0" + dy;
+    if (StrLen(hh) < 2) hh = "0" + hh;
+    if (StrLen(mm) < 2) mm = "0" + mm;
+    if (StrLen(ss) < 2) ss = "0" + ss;
+
+    return yr + "-" + mo + "-" + dy + "T" + hh + ":" + mm + ":" + ss + IST_OFFSET;
+}
+
+function GetBarDT(bar_idx) {
+    dn_arr = DateNum();
+    tn_arr = TimeNum();
+    dn     = dn_arr[bar_idx];
+    tn     = tn_arr[bar_idx];
+
+    raw_yr  = int(dn / 10000);
+    full_yr = IIf(raw_yr < 200, 1900 + raw_yr, raw_yr);
+    mo_num  = int((dn - int(dn / 10000) * 10000) / 100);
+    dy_num  = int(dn - int(dn / 10000) * 10000 - mo_num * 100);
+    hh_num  = int(tn / 10000);
+    mm_num  = int((tn - hh_num * 10000) / 100);
+
+    yr = NumToStr(full_yr, 1.0, False);
+    mo = NumToStr(mo_num,  1.0, False);
+    dy = NumToStr(dy_num,  1.0, False);
+    hh = NumToStr(hh_num,  1.0, False);
+    mm = NumToStr(mm_num,  1.0, False);
+
+    if (StrLen(mo) < 2) mo = "0" + mo;
+    if (StrLen(dy) < 2) dy = "0" + dy;
+    if (StrLen(hh) < 2) hh = "0" + hh;
+    if (StrLen(mm) < 2) mm = "0" + mm;
+
+    return yr + mo + dy + hh + mm;
+}
+
+function Fmt2(val)   { return NumToStr(val, 1.2, False); }
+function FmtInt(val) { return NumToStr(val, 1.0, False); }
+
+// ============================================================
+// MAIN
+// ============================================================
+sym      = Name();
+pipeName = "\\\\.\\pipe\\SD_" + sym + "_" + TIMEFRAME_LABEL;
+
+// File-based state — survives AmiBroker restarts
+rawSym    = StrReplace(sym, ":", "_");
+stateFile = STATE_DIR + "\\sd_pipe_state_" + rawSym + ".txt";
+
+// Read last-sent timestamp from state file
+lastSentDT = "";
+fhRead = fopen(stateFile, "r");
+if (fhRead != 0) {
+    line = fgets(fhRead);
+    fclose(fhRead);  // Always close immediately after read
+    fhRead = 0;
+    if (StrLen(line) > 1) {
+        lastSentDT = StrLeft(line, StrLen(line) - 1);
+        if (StrRight(lastSentDT, 1) == "\r") {
+            lastSentDT = StrLeft(lastSentDT, StrLen(lastSentDT) - 1);
+        }
+    }
+}
+
+if (StrLen(lastSentDT) == 0) {
+    isFirstRun = 1;
+} else {
+    isFirstRun = 0;
+}
+
+bars    = BarCount;
+sentOK  = 0;
+skipped = 0;
+maxDT   = lastSentDT;
+tn_arr  = TimeNum();
+dn_arr  = DateNum();
+
+// Date range filter using DateNum() encoding.
+// AFL DateNum = (year-1900)*10000 + month*100 + day
+// e.g. 2025-08-01 = 1250801, 2026-04-10 = 1260410
+// Set to 0 to disable filter.
+FROM_DATE = Param("From DateNum (e.g.1250801=2025-08-01, 0=all)", 0, 0, 9999999, 1);
+TO_DATE   = Param("To DateNum   (e.g.1260410=2026-04-10, 0=all)", 0, 0, 9999999, 1);
+
+if (isFirstRun) {
+    runType = " FIRST RUN (full historical load)";
+} else {
+    runType = " Incremental";
+}
+_TRACE("SD PipeFeed [" + sym + "]:" + runType +
+       " | bars=" + NumToStr(bars, 1.0, False) +
+       " | lastSent=" + lastSentDT);
+
+// Open pipe ONCE — write all bars — close once
+fh = fopen(pipeName, "w");
+if (fh == 0) {
+    _TRACE("SD PipeFeed [" + sym + "]: PIPE UNAVAILABLE. " +
+           "Is run_v8_live.exe running? Pipe=" + pipeName);
+} else {
+    if (isFirstRun) {
+        source = "HISTORICAL";
+    } else {
+        source = "AMIBROKER";
+    }
+
+    for (i = 0; i < bars; i++) {
+        tn = tn_arr[i];
+        dn = dn_arr[i];
+
+        // Date range filter (only if Param values are set)
+        if (FROM_DATE > 0 AND dn < FROM_DATE) {
+            skipped++;
+            continue;
+        }
+        if (TO_DATE > 0 AND dn > TO_DATE) {
+            skipped++;
+            continue;
+        }
+
+        // Market hours only
+        if (tn < MARKET_OPEN_TN OR tn > MARKET_CLOSE_TN) {
+            skipped++;
+            continue;
+        }
+
+        // Skip null bars
+        if (IsNull(C[i]) OR C[i] == 0) {
+            skipped++;
+            continue;
+        }
+
+        // Skip forming bar (last bar unless 15:25)
+        isLastInArray  = (i == bars - 1);
+        isLastBarOfDay = (tn == MARKET_CLOSE_TN);
+        if (isLastInArray AND !isLastBarOfDay) {
+            skipped++;
+            continue;
+        }
+
+        // Incremental filter
+        barDT = GetBarDT(i);
+        if (isFirstRun == 0 AND barDT <= lastSentDT) {
+            skipped++;
+            continue;
+        }
+
+        // Build wire
+        ts    = GetIST8601(i);
+        barOI = OpenInt[i];
+        if (IsNull(barOI)) barOI = 0;
+
+        wire = source          + "|" +
+               sym             + "|" +
+               TIMEFRAME_LABEL + "|" +
+               ts              + "|" +
+               Fmt2(O[i])      + "|" +
+               Fmt2(H[i])      + "|" +
+               Fmt2(L[i])      + "|" +
+               Fmt2(C[i])      + "|" +
+               FmtInt(V[i])    + "|" +
+               FmtInt(barOI)   + "\n";
+
+        fputs(wire, fh);
+        sentOK++;
+
+        if (StrLen(maxDT) == 0 OR barDT > maxDT) {
+            maxDT = barDT;
+        }
+    }
+
+    fclose(fh);
+}
+
+// Persist state to FILE (not StaticVar — survives AB restart)
+if (sentOK > 0 AND StrLen(maxDT) > 0) {
+    fhWrite = fopen(stateFile, "w");
+    if (fhWrite != 0) {
+        fputs(maxDT + "\n", fhWrite);
+        fclose(fhWrite);
+        _TRACE("SD PipeFeed [" + sym + "]: State saved to " + stateFile);
+    }
+}
+
+// Summary
+if (isFirstRun) {
+    runLabel = "FULL LOAD";
+} else {
+    runLabel = "INCREMENTAL";
+}
+_TRACE("SD PipeFeed [" + sym + "]: " + runLabel +
+       " done | Sent=" + NumToStr(sentOK,  1.0, False) +
+       " Skipped="     + NumToStr(skipped, 1.0, False) +
+       " LastSent=" + maxDT);
+
+Buy   = 0;
+Sell  = 0;
+Short = 0;
+Cover = 0;

@@ -1,15 +1,16 @@
 {
-  "_comment": "SD Engine V4.0 - System Configuration",
-  "_version": "1.0",
+  "_comment": "SD Engine V8.0 - System Configuration",
+  "_version": "8.0",
 
   "system": {
-    "root_directory": "D:/SD_System/SD_Volume_OI/SD_Trading_V7",
+    "root_directory": "D:/SD_System/SD_Volume_OI/Scanner/SD_Trading_V8",
     "environment": "PRODUCTION",
     "log_level": "INFO"
   },
   
   "directories": {
     "conf": "conf",
+    "config": "conf",
     "data": "data",
     "logs": "logs",
     "scripts": "scripts",
@@ -34,7 +35,7 @@
     "secret_key": "A2J9ADLH9N",
     "redirect_uri": "http://127.0.0.1:5000/callback",
     "environment": "production",
-	"api_base" : "https://api-t1.fyers.in",
+    "api_base": "https://api-t1.fyers.in",
     "endpoints": {
       "test": {
         "api_base": "https://api-t1.fyers.in",
@@ -97,13 +98,11 @@
   },
 
   "entry_filters": {
-    "max_zone_distance_atr": 1000,
-    "comments": "Multiplier for ATR to determine max zone distance from current price; increase to allow more distant zones"
+    "max_zone_distance_atr": 1000
   },
 
   "zone_detection": {
-    "live_zone_detection_interval_bars": 10,
-    "comments": "Run zone detection every N bars to maintain fresh zone pipeline (0 = bootstrap only). Default: 20-30"
+    "live_zone_detection_interval_bars": 10
   }, 
   
   "volume_oi": {
@@ -161,12 +160,29 @@
   },
   
   "order_submitter": {
-    "enabled": true,              
+    "enabled": false,              
     "base_url": "http://localhost:8080/trade",
     "long_strategy_number": 13,
     "short_strategy_number": 14,
     "timeout_seconds": 10
-	}
-  
+  },
 
+  "v8": {
+    "_comment": "V8 multi-symbol scanner additions — new keys for M0.2 / M1.1",
+
+    "symbol_registry_file": "conf/symbol_registry.json",
+    "config_root_dir": "conf",
+
+    "sqlite_db_path": "data/sd_trading_v8.db",
+    "sqlite_schema_path": "src/persistence/db_schema.sql",
+
+    "scanner_mode_enabled": true,
+    "scanner_signal_min_score": 65.0,
+    "scanner_rank_by": "SCORE",
+
+    "compute_backend": "AUTO",
+    "cpu_thread_pool_size": 8,
+    "cuda_device_id": 0,
+    "cuda_min_symbols_threshold": 20
+  }
 }

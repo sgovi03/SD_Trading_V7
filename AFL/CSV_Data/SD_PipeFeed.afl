@@ -1,0 +1,211 @@
+// ============================================================
+// SD TRADING V8 - PIPE FEED (Historical + Live Incremental)
+// afl/SD_PipeFeed.afl
+//
+// KEY DESIGN:
+//   Opens pipe ONCE per scan run, writes ALL bars, closes once.
+//   C++ reads multiple lines per connection — handles both
+//   bulk historical load and live incremental correctly.
+//
+// HOW IT WORKS:
+//   First run  ? sends ALL historical bars in one connection
+//   Every AR run (5 min) ? sends only new bars since last run
+//
+// SETUP:
+//   1. Start run_v8_live.exe first
+//   2. Analysis ? New Analysis ? Load this formula
+//   3. Apply to: Watchlist (NIFTY-FUT, BANKNIFTY-FUT)
+//   4. Range: All Quotes
+//   5. Scan ? then enable Auto-Repeat 5 minutes
+// ============================================================
+
+TIMEFRAME_LABEL = "5min";
+IST_OFFSET      = "+05:30";
+MARKET_OPEN_TN  = 91500;
+MARKET_CLOSE_TN = 152500;
+
+// -- Timestamp from bar index --------------------------------
+function GetIST8601(bar_idx) {
+    dn_arr = DateNum();
+    tn_arr = TimeNum();
+    dn     = dn_arr[bar_idx];
+    tn     = tn_arr[bar_idx];
+
+    raw_yr  = int(dn / 10000);
+    full_yr = IIf(raw_yr < 200, 1900 + raw_yr, raw_yr);
+    mo_num  = int((dn - int(dn / 10000) * 10000) / 100);
+    dy_num  = int(dn - int(dn / 10000) * 10000 - mo_num * 100);
+    hh_num  = int(tn / 10000);
+    mm_num  = int((tn - hh_num * 10000) / 100);
+    ss_num  = int(tn - hh_num * 10000 - mm_num * 100);
+
+    yr = NumToStr(full_yr, 1.0, False);
+    mo = NumToStr(mo_num,  1.0, False);
+    dy = NumToStr(dy_num,  1.0, False);
+    hh = NumToStr(hh_num,  1.0, False);
+    mm = NumToStr(mm_num,  1.0, False);
+    ss = NumToStr(ss_num,  1.0, False);
+
+    if (StrLen(mo) < 2) mo = "0" + mo;
+    if (StrLen(dy) < 2) dy = "0" + dy;
+    if (StrLen(hh) < 2) hh = "0" + hh;
+    if (StrLen(mm) < 2) mm = "0" + mm;
+    if (StrLen(ss) < 2) ss = "0" + ss;
+
+    return yr + "-" + mo + "-" + dy + "T" + hh + ":" + mm + ":" + ss + IST_OFFSET;
+}
+
+// -- Sortable comparison string ------------------------------
+function GetBarDT(bar_idx) {
+    dn_arr = DateNum();
+    tn_arr = TimeNum();
+    dn     = dn_arr[bar_idx];
+    tn     = tn_arr[bar_idx];
+
+    raw_yr  = int(dn / 10000);
+    full_yr = IIf(raw_yr < 200, 1900 + raw_yr, raw_yr);
+    mo_num  = int((dn - int(dn / 10000) * 10000) / 100);
+    dy_num  = int(dn - int(dn / 10000) * 10000 - mo_num * 100);
+    hh_num  = int(tn / 10000);
+    mm_num  = int((tn - hh_num * 10000) / 100);
+
+    yr = NumToStr(full_yr, 1.0, False);
+    mo = NumToStr(mo_num,  1.0, False);
+    dy = NumToStr(dy_num,  1.0, False);
+    hh = NumToStr(hh_num,  1.0, False);
+    mm = NumToStr(mm_num,  1.0, False);
+
+    if (StrLen(mo) < 2) mo = "0" + mo;
+    if (StrLen(dy) < 2) dy = "0" + dy;
+    if (StrLen(hh) < 2) hh = "0" + hh;
+    if (StrLen(mm) < 2) mm = "0" + mm;
+
+    return yr + mo + dy + hh + mm;
+}
+
+function Fmt2(val)   { return NumToStr(val, 1.2, False); }
+function FmtInt(val) { return NumToStr(val, 1.0, False); }
+
+// ============================================================
+// MAIN
+// ============================================================
+sym      = Name();
+pipeName = "\\\\.\\pipe\\SD_" + sym + "_" + TIMEFRAME_LABEL;
+stateKey = "SD_lastSent_" + StrReplace(sym, ":", "_");
+
+lastSentDT = StaticVarGetText(stateKey);
+if (StrLen(lastSentDT) == 0) {
+    isFirstRun = 1;
+} else {
+    isFirstRun = 0;
+}
+
+bars    = BarCount;
+sentOK  = 0;
+skipped = 0;
+maxDT   = lastSentDT;
+tn_arr  = TimeNum();
+
+if (isFirstRun) {
+    runType = " FIRST RUN (full historical load)";
+} else {
+    runType = " Incremental";
+}
+_TRACE("SD PipeFeed [" + sym + "]:" + runType +
+       " | bars=" + NumToStr(bars, 1.0, False) +
+       " | pipe=" + pipeName);
+
+// ============================================================
+// OPEN PIPE ONCE — write all bars — close once
+// This is the key fix: one connection per scan run,
+// not one connection per bar.
+// C++ read_line() handles multi-line reads within one connection.
+// ============================================================
+fh = fopen(pipeName, "w");
+if (fh == 0) {
+    _TRACE("SD PipeFeed [" + sym + "]: PIPE UNAVAILABLE. " +
+           "Is run_v8_live.exe running? Pipe=" + pipeName);
+} else {
+    if (isFirstRun) {
+        source = "HISTORICAL";
+    } else {
+        source = "AMIBROKER";
+    }
+
+    for (i = 0; i < bars; i++) {
+
+        // Market hours filter
+        tn = tn_arr[i];
+        if (tn < MARKET_OPEN_TN OR tn > MARKET_CLOSE_TN) {
+            skipped++;
+            continue;
+        }
+
+        // Skip null/zero bars
+        if (IsNull(C[i]) OR C[i] == 0) {
+            skipped++;
+            continue;
+        }
+
+        // Skip forming bar (last bar unless it's 15:25)
+        isLastInArray  = (i == bars - 1);
+        isLastBarOfDay = (tn == MARKET_CLOSE_TN);
+        if (isLastInArray AND !isLastBarOfDay) {
+            skipped++;
+            continue;
+        }
+
+        // Incremental filter
+        barDT = GetBarDT(i);
+        if (isFirstRun == 0 AND barDT <= lastSentDT) {
+            skipped++;
+            continue;
+        }
+
+        // Build and write wire line
+        ts    = GetIST8601(i);
+        barOI = OpenInt[i];
+        if (IsNull(barOI)) barOI = 0;
+
+        wire = source          + "|" +
+               sym             + "|" +
+               TIMEFRAME_LABEL + "|" +
+               ts              + "|" +
+               Fmt2(O[i])      + "|" +
+               Fmt2(H[i])      + "|" +
+               Fmt2(L[i])      + "|" +
+               Fmt2(C[i])      + "|" +
+               FmtInt(V[i])    + "|" +
+               FmtInt(barOI)   + "\n";
+
+        fputs(wire, fh);
+        sentOK++;
+
+        if (StrLen(maxDT) == 0 OR barDT > maxDT) {
+            maxDT = barDT;
+        }
+    }
+
+    fclose(fh);  // ONE close for all bars
+}
+
+// Persist state for next AR run
+if (sentOK > 0 AND StrLen(maxDT) > 0) {
+    StaticVarSetText(stateKey, maxDT);
+}
+
+// Summary
+if (isFirstRun) {
+    runLabel = "FULL LOAD";
+} else {
+    runLabel = "INCREMENTAL";
+}
+_TRACE("SD PipeFeed [" + sym + "]: " + runLabel +
+       " done | Sent=" + NumToStr(sentOK,  1.0, False) +
+       " Skipped="     + NumToStr(skipped, 1.0, False) +
+       " LastSent=" + maxDT);
+
+Buy   = 0;
+Sell  = 0;
+Short = 0;
+Cover = 0;

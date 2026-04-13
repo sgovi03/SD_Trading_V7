@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\SD_System\SD_Volume_OI\Scanner\SD_Trading_V7\CMakeFiles\4d7fd1a2d8cd1b511eab707e340dca7e\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{73C76AEB-FF4C-3534-BFCA-2569147ECF97}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

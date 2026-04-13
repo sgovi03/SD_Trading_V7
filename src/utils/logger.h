@@ -1,6 +1,14 @@
 #ifndef SDTRADING_LOGGER_H
 #define SDTRADING_LOGGER_H
 
+// Prevent Windows ERROR macro collision
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifdef ERROR
+#undef ERROR
+#endif
+
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -18,10 +26,6 @@ namespace Utils {
 // ============================================================
 
 
-// Undefine Windows macros that conflict with our enum
-#ifdef ERROR
-#undef ERROR
-#endif
 enum class LogLevel {
     DEBUG = 0,
     INFO = 1,

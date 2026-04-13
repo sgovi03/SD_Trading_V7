@@ -7,6 +7,12 @@
 #include "utils/system_initializer.h"
 #include "utils/logger.h"
 #include <iostream>
+
+// Windows SDK defines ERROR as 0 via windows.h/winerror.h.
+// Undefine after all headers to protect LogLevel::ERROR usage below.
+#ifdef ERROR
+#undef ERROR
+#endif
 #include <filesystem>
 #include <string>
 #include <cstdlib>

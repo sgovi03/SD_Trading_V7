@@ -17,8 +17,17 @@ namespace Core {
  * - File locations
  * - Logging configuration
  * - Bridge settings
+ * - [V8] Scanner / multi-symbol settings (v8 section)
+ * - [V8] SQLite persistence paths
+ * - [V8] Compute backend (CPU thread pool / CUDA)
+ * - [V8] Order submitter settings
  * 
  * This is a bootstrap configuration loaded before strategy config.
+ * 
+ * V8 backward-compatibility guarantee:
+ *   If the "v8" section is absent from system_config.json, all
+ *   V8 fields retain their safe defaults from SystemConfig().
+ *   Existing V7 system_config.json files require no changes.
  */
 class SystemConfigLoader {
 public:
@@ -47,6 +56,14 @@ public:
     static bool save_to_json(const SystemConfig& config, const std::string& filepath);
 
 private:
+    /**
+     * [V8] Parse the "v8" JSON section into config.
+     * Called internally by load_from_json().
+     * No-op if the section is absent — V8 defaults apply.
+     */
+    static void load_v8_section(const std::string& v8_json,
+                                SystemConfig& config);
+
     /**
      * Simple JSON value extraction
      * Extracts value for a key from JSON text

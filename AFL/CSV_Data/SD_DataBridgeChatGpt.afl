@@ -1,0 +1,132 @@
+// ============================================================
+// SD TRADING V8 - AMIBROKER AFL DATA BRIDGE (FIXED VERSION)
+// ============================================================
+
+// -- Configuration ------------------------------------------
+TIMEFRAME_LABEL = "5min";
+SOURCE_LABEL    = "AMIBROKER";
+IST_OFFSET      = "+05:30";
+
+// -- Symbol normalisation -----------------------------------
+function GetCleanSymbol()
+{
+    sym = Name();
+    printf("Symbol: "+sym+"   \n");
+
+    if (StrFind(sym, "NSE:") == 0)
+        sym = StrMid(sym, 4);
+
+    pos = StrFind(sym, "-FUT");
+    if (pos >= 0)
+        sym = StrLeft(sym, pos);
+
+    len = StrLen(sym);
+    if (len > 7)
+    {
+        tail = StrRight(sym, 5);
+        c0   = StrMid(tail, 0, 1);
+        c2   = StrMid(tail, 2, 1);
+
+        if (c0 >= "0" AND c0 <= "9" AND c2 >= "A")
+            sym = StrLeft(sym, len - 5);
+    }
+
+    return sym;
+}
+
+// -- Timestamp builder --------------------------------------
+function GetIST8601(bar_idx)
+{
+    dtArray = DateTime();
+dt = DateTimeToStr(dtArray[bar_idx]);
+
+    yr = StrLeft(dt, 4);
+    mo = StrMid(dt, 5, 2);
+    dy = StrMid(dt, 8, 2);
+    hh = StrMid(dt, 11, 2);
+    mm = StrMid(dt, 14, 2);
+    ss = StrMid(dt, 17, 2);
+
+    return yr + "-" + mo + "-" + dy + "T" +
+           hh + ":" + mm + ":" + ss + IST_OFFSET;
+}
+
+// -- Format helpers -----------------------------------------
+function Fmt2(val)
+{
+    return NumToStr(val, 1.2, False);
+}
+
+function FmtInt(val)
+{
+    return NumToStr(val, 1.0, False);
+}
+
+// -- MAIN EXECUTION -----------------------------------------
+if (Status("action") == actionIndicator)
+{
+    currentBarIdx = LastValue(BarIndex());
+
+    // Static variable to prevent duplicate execution
+    lastProcessed = StaticVarGet("SD_LAST_BAR");
+
+    if (IsNull(lastProcessed) OR currentBarIdx != lastProcessed)
+    {
+        StaticVarSet("SD_LAST_BAR", currentBarIdx);
+
+        cleanSym = Name(); // GetCleanSymbol();
+        //cleanSym = GetCleanSymbol();
+		printf("Symbol $$$$$: "+cleanSym+"   \n");
+        // ? FIXED PIPE PATH
+        pipeName = "\\\\.\\pipe\\SD_" + cleanSym + "_" + TIMEFRAME_LABEL;
+
+        // Latest bar values
+        barO = LastValue(O);
+        barH = LastValue(H);
+        barL = LastValue(L);
+        barC = LastValue(C);
+        barV = LastValue(V);
+
+        // ? FIXED Open Interest
+        barOI = Nz(LastValue(OpenInt), 0);
+
+        // Timestamp
+        ts = GetIST8601(currentBarIdx);
+
+        // Wire format
+        wire = SOURCE_LABEL + "|" +
+               cleanSym + "|" +
+               TIMEFRAME_LABEL + "|" +
+               ts + "|" +
+               Fmt2(barO) + "|" +
+               Fmt2(barH) + "|" +
+               Fmt2(barL) + "|" +
+               Fmt2(barC) + "|" +
+               FmtInt(barV) + "|" +
+               FmtInt(barOI) + "\n";
+
+        // Write to pipe
+        fh = fopen(pipeName, "w");
+
+        if (fh)
+        {
+            fputs(wire, fh);
+            fclose(fh);
+        }
+        else
+        {
+            printf("PIPE UNAVAILABLE: " + pipeName + "\n");
+        }
+    }
+}
+
+// -- Chart Display ------------------------------------------
+Plot(C, "Close", colorGreen, styleCandle);
+
+PlotText(
+    "SD Bridge: " + GetCleanSymbol() + " @ " + TIMEFRAME_LABEL,
+    BarCount - 1,
+    H[BarCount - 1] * 1.001,
+    colorWhite,
+    colorBlack
+);

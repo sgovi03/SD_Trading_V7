@@ -178,6 +178,17 @@ public:
      * @return true if position exists
      */
     virtual bool has_position(const std::string& symbol) = 0;
+
+    /**
+     * Portfolio pre-filter — called by LiveEngine BEFORE check_for_entries().
+     * Default returns true (allow entry) — overridden by PipeBroker to
+     * delegate to PortfolioGuard.
+     *
+     * This is the ONLY addition needed to BrokerInterface for V8.
+     * All existing BrokerInterface implementations are unaffected
+     * because the default returns true (no behaviour change).
+     */
+    virtual bool is_entry_allowed() { return true; }
 };
 
 } // namespace Live

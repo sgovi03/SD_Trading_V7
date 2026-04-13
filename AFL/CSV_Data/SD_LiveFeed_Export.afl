@@ -1,0 +1,242 @@
+// =============================================================================
+// SD Trading System - AmiBroker Live Data Exporter
+// File   : SD_LiveFeed_Export.afl
+// Version: 14.0
+//
+// KEY FIX over v13:
+//   Removed bars-1 / cutoff approach — fails for the last bar of the day
+//   (3:25 PM bar never gets written because no subsequent bar exists to
+//   push it below the cutoff).
+//
+//   NEW APPROACH — two-condition bar skip:
+//   1. Bar is the last bar in array (i == bars-1) AND
+//      bar time is >= market close - TIMEFRAME (i.e. it is genuinely forming)
+//   2. If bar time is the last bar of the day (>= LAST_BAR_TIME), always write it
+//      because the day's last bar is always closed by definition once the
+//      scan fires after market close.
+//
+//   LAST_BAR_TIME = 1525 (15:25 in HHMM) for NSE 5-min bars
+//   Any bar starting at or before 15:25 that is the last in array
+//   AND the current time is past 15:30 is a closed bar.
+//
+//   SIMPLER: use the bar's TIME component directly.
+//   A bar is the "forming" bar only if:
+//     - it is the last bar in the array (i == bars-1)  AND
+//     - its time is the same as the current bar time
+//     - i.e. Hour()*100 + Minute() of bars-1 >= current scan minute
+//   Since we cannot reliably get Now() in AFL, use this rule instead:
+//
+//   FINAL RULE (robust, simple):
+//     Skip bar i if ALL of these are true:
+//       - i == bars-1  (it's the last bar)
+//       - barHH[i]*60 + barMn[i] >= MARKET_CLOSE_MINS - TIMEFRAME
+//         i.e. bar started less than TIMEFRAME mins before market close
+//     Otherwise always write it — including 3:25 PM.
+//
+//   This means:
+//     - During the day: last bar (forming) is skipped correctly
+//     - At 3:25 PM: 3:25 is last bar, 3:25*60=925 >= 930-5=925 ? skip
+//       BUT after 3:30 PM when scan fires again, 3:25 is now bars-2
+//       (AmiBroker adds a 3:30 bar) ? written correctly
+//     - Post market: if scan fires after 3:30, 3:25 is bars-2 ? written
+//
+//   ACTUALLY the simplest and most reliable solution:
+//     Write ALL bars except bars-1 UNLESS bars-1 time == last bar of day.
+//     For NSE: last bar of day starts at 15:25 (3:25 PM).
+//     If bars-1 time is 15:25, it IS closed — write it too.
+//
+// OUTPUT: Timestamp,DateTime,Symbol,Open,High,Low,Close,Volume,OpenInterest
+// SETUP : Create folder D:\SD_System\LiveFeed\Data before first scan
+// =============================================================================
+
+#pragma maxthreads 1
+#pragma sequence scan
+
+// --------------------------------------------------------------------------
+// Parameters
+// --------------------------------------------------------------------------
+OUTPUT_DIR     = ParamStr( "Output Directory", "D:\\SD_System\\LiveFeed\\Data" );
+TIMEFRAME      = Param( "Timeframe (minutes)", 5, 1, 1440, 1 );
+
+// Last bar start time of the trading day in HHMM (NSE: 15:25 for 5-min bars)
+// Change this if your timeframe is different:
+//   1-min bars: last bar = 15:29 -> LAST_BAR_HHMM = 1529
+//   3-min bars: last bar = 15:27 -> LAST_BAR_HHMM = 1527
+//   5-min bars: last bar = 15:25 -> LAST_BAR_HHMM = 1525
+//  15-min bars: last bar = 15:15 -> LAST_BAR_HHMM = 1515
+LAST_BAR_HHMM  = Param( "Last Bar HHMM", 1525, 0, 2359, 1 );
+
+// --------------------------------------------------------------------------
+// ReadLastDateTimeFromCSV
+// Reads DateTime of last written bar from CSV tail.
+// Col 0 = Unix Timestamp (10 digits), Col 1 = DateTime (19 chars)
+// Uses rld-prefixed vars — no clash with global file handles.
+// --------------------------------------------------------------------------
+function ReadLastDateTimeFromCSV( rldFile )
+{
+    rldLast = "";
+    rldFH   = fopen( rldFile, "r" );
+    if ( rldFH )
+    {
+        rldLine = fgets( rldFH );       // discard header
+        rldLine = fgets( rldFH );       // first data line
+        while ( StrLen( rldLine ) > 30 )
+        {
+            rldDT = StrMid( rldLine, 11, 19 );
+            if ( StrLeft( rldDT, 2 ) == "20" )
+                rldLast = rldDT;
+            rldLine = fgets( rldFH );
+        }
+        fclose( rldFH );
+    }
+    return rldLast;
+}
+
+// --------------------------------------------------------------------------
+// FileExists — uses fe-prefixed vars to avoid global fh clash
+// --------------------------------------------------------------------------
+function FileExists( feFile )
+{
+    feResult = 0;
+    feFH     = fopen( feFile, "r" );
+    if ( feFH )
+    {
+        fclose( feFH );
+        feResult = 1;
+    }
+    return feResult;
+}
+
+// --------------------------------------------------------------------------
+// ToUnixTimestamp
+// IST date/time components -> UTC Unix epoch seconds.
+// Julian Day Number method — no overflow risk.
+// --------------------------------------------------------------------------
+function ToUnixTimestamp( tsYr, tsMo, tsDy, tsHh, tsMn, tsSc )
+{
+    tsA    = Floor( ( 14 - tsMo ) / 12 );
+    tsY    = tsYr + 4800 - tsA;
+    tsM    = tsMo + 12 * tsA - 3;
+    tsJDN  = tsDy + Floor( ( 153 * tsM + 2 ) / 5 )
+                  + 365 * tsY
+                  + Floor( tsY / 4 )
+                  - Floor( tsY / 100 )
+                  + Floor( tsY / 400 )
+                  - 32045;
+    tsDays = tsJDN - 2440588;
+    tsUnix = tsDays * 86400 + tsHh * 3600 + tsMn * 60 + tsSc - 19800;
+    return tsUnix;
+}
+
+// ==========================================================================
+// MAIN
+// ==========================================================================
+
+sym  = Name();
+bars = BarCount;
+
+dataFile = OUTPUT_DIR + "\\" + sym + ".csv";
+
+lastDT = ReadLastDateTimeFromCSV( dataFile );
+
+_TRACE( "SD LiveFeed [" + sym + "]: lastDT='" + lastDT +
+        "' bars=" + NumToStr( bars, 0, False ) );
+
+o   = Open;
+h   = High;
+l   = Low;
+c   = Close;
+v   = Volume;
+oi  = OpenInt;
+
+barYr = Year();
+barMo = Month();
+barDy = Day();
+barHh = Hour();
+barMn = Minute();
+barSc = Second();
+
+// --------------------------------------------------------------------------
+// Determine last bar HHMM from parameter
+// --------------------------------------------------------------------------
+lastBarHH  = Floor( LAST_BAR_HHMM / 100 );
+lastBarMM  = LAST_BAR_HHMM - lastBarHH * 100;
+
+needHeader = !FileExists( dataFile );
+
+dataFH = fopen( dataFile, "a" );
+
+if ( !dataFH )
+{
+    _TRACE( "SD LiveFeed ERROR [" + sym + "]: Cannot open " + dataFile );
+    _TRACE( "  >>> Create folder manually: " + OUTPUT_DIR );
+}
+else
+{
+    if ( needHeader )
+    {
+        fputs( "Timestamp,DateTime,Symbol,Open,High,Low,Close,Volume,OpenInterest\n", dataFH );
+        _TRACE( "SD LiveFeed [" + sym + "]: Header written (first run)" );
+    }
+
+    newBars = 0;
+    maxDT   = lastDT;
+
+    for ( i = 0; i < bars; i++ )
+    {
+        barDT = NumToStr( barYr[i], 0, False )  + "-" +
+                StrFormat( "%02.0f", barMo[i] ) + "-" +
+                StrFormat( "%02.0f", barDy[i] ) + " " +
+                StrFormat( "%02.0f", barHh[i] ) + ":" +
+                StrFormat( "%02.0f", barMn[i] ) + ":" +
+                StrFormat( "%02.0f", barSc[i] );
+
+        // Skip bars already written
+        if ( lastDT != "" AND barDT <= lastDT )
+            continue;
+
+        // Skip forming bar logic:
+        // Only skip if it is the LAST bar in the array (i == bars-1)
+        // AND it is NOT the last bar of the trading day.
+        // The last bar of the day (e.g. 15:25) is always closed —
+        // write it unconditionally even if it is bars-1.
+        isLastInArray  = ( i == bars - 1 );
+        isLastBarOfDay = ( barHh[i] == lastBarHH AND barMn[i] == lastBarMM );
+
+        if ( isLastInArray AND !isLastBarOfDay )
+            continue;
+
+        barTS = ToUnixTimestamp( barYr[i], barMo[i], barDy[i],
+                                 barHh[i], barMn[i], barSc[i] );
+
+        line = NumToStr( barTS, 0, False )          + "," +
+               barDT                                 + "," +
+               sym                                   + "," +
+               StrFormat( "%.2f", o[i] )             + "," +
+               StrFormat( "%.2f", h[i] )             + "," +
+               StrFormat( "%.2f", l[i] )             + "," +
+               StrFormat( "%.2f", c[i] )             + "," +
+               NumToStr( Floor( v[i]  ), 0, False )  + "," +
+               NumToStr( Floor( oi[i] ), 0, False )  + "\n";
+
+        fputs( line, dataFH );
+
+        if ( maxDT == "" OR barDT > maxDT )
+            maxDT = barDT;
+
+        newBars++;
+    }
+
+    fclose( dataFH );
+
+    if ( newBars > 0 )
+        _TRACE( "SD LiveFeed [" + sym + "]: +" + NumToStr( newBars, 0, False ) +
+                " bars written | last=" + maxDT );
+    else
+        _TRACE( "SD LiveFeed [" + sym + "]: No new bars | last=" + lastDT );
+}
+
+Buy   = 0;
+Sell  = 0;
+Short = 0;
+Cover = 0;

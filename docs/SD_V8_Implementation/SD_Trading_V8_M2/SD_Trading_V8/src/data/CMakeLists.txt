@@ -1,0 +1,31 @@
+# ==================================================================
+# SD Trading V8 — Data Ingestion Library CMakeLists.txt
+# src/data/CMakeLists.txt
+# Milestone M2.2 / M2.3
+# ==================================================================
+
+add_library(sd_data STATIC
+    bar_validator.cpp
+    pipe_listener.cpp
+)
+
+target_include_directories(sd_data PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(sd_data PUBLIC
+    sd_core          # common_types.h, logger.h
+)
+
+target_compile_features(sd_data PUBLIC cxx_std_17)
+
+# Windows: link ws2_32 for any socket-adjacent API (pipe support)
+if(WIN32)
+    target_link_libraries(sd_data PUBLIC ws2_32)
+endif()
+
+message(STATUS "[Data] Library: sd_data")
+message(STATUS "[Data]   bar_validator.cpp  (M2.3 — 3-tier validation)")
+message(STATUS "[Data]   pipe_listener.cpp  (M2.2 — named pipe reader)")

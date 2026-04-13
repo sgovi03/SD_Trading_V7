@@ -84,7 +84,7 @@ EntryVolumeMetrics EntryDecisionEngine::calculate_entry_volume_metrics(
 
     metrics.volume_score = std::max(-50, std::min(60, metrics.volume_score));
 
-    LOG_INFO("\xF0\x9F\x93\x8A Entry volume score: " + std::to_string(metrics.volume_score)
+    LOG_DEBUG("Entry volume score: " + std::to_string(metrics.volume_score)
              + "/60 (pullback=" + std::to_string(metrics.pullback_volume_ratio) + "x)");
 
     return metrics;
@@ -159,14 +159,14 @@ double EntryDecisionEngine::calculate_take_profit(const Zone& zone, double entry
 EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneScore& score, double atr, MarketRegime regime, const ZoneQualityScore* zone_quality_score, const Bar* current_bar, const std::vector<Bar>* bar_history, bool is_continuation) const {
     EntryDecision decision;
     decision.score = score;
-    LOG_INFO("=== CALCULATE_ENTRY START ===");
-    LOG_INFO("Zone: " + std::to_string(zone.zone_id));
-    LOG_INFO("current_bar: " + std::string(current_bar ? "VALID" : "nullptr"));
-    LOG_INFO("v6_fully_enabled: " + std::string(config.v6_fully_enabled ? "YES" : "NO"));
-    LOG_INFO("Config dump:");
-    LOG_INFO("  v6_fully_enabled: " + std::string(config.v6_fully_enabled ? "YES" : "NO"));
-    LOG_INFO("  enable_volume_entry_filters: " + std::string(config.enable_volume_entry_filters ? "YES" : "NO"));
-    LOG_INFO("  min_entry_volume_ratio: " + std::to_string(config.min_entry_volume_ratio));
+    LOG_DEBUG("=== CALCULATE_ENTRY START ===");
+    LOG_DEBUG("Zone: " + std::to_string(zone.zone_id));
+    LOG_DEBUG("current_bar: " + std::string(current_bar ? "VALID" : "nullptr"));
+    LOG_DEBUG("v6_fully_enabled: " + std::string(config.v6_fully_enabled ? "YES" : "NO"));
+    LOG_DEBUG("Config dump:");
+    LOG_DEBUG("  v6_fully_enabled: " + std::string(config.v6_fully_enabled ? "YES" : "NO"));
+    LOG_DEBUG("  enable_volume_entry_filters: " + std::string(config.enable_volume_entry_filters ? "YES" : "NO"));
+    LOG_DEBUG("  min_entry_volume_ratio: " + std::to_string(config.min_entry_volume_ratio));
 
     // Initialize to safe default. Dynamic sizing is applied after entry/SL are computed.
     decision.lot_size = 1; // Safe default
@@ -186,7 +186,7 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
             LOG_ERROR("❌ V6 VOLUME FILTER: Entry REJECTED: " + vol_rejection);
             return decision;
         } else if (config.v6_log_volume_filters) {
-            LOG_INFO("✅ V6 VOLUME FILTER: Entry PASSED");
+            LOG_DEBUG("V6 VOLUME FILTER: Entry PASSED");
         }
 
         // OI validation
@@ -198,7 +198,7 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
             LOG_ERROR("❌ V6 OI FILTER: Entry REJECTED: " + oi_rejection);
             return decision;
         } else if (config.v6_log_oi_filters) {
-            LOG_INFO("✅ V6 OI FILTER: Entry PASSED");
+            LOG_DEBUG("V6 OI FILTER: Entry PASSED");
         }
     }
     
@@ -448,7 +448,7 @@ EntryDecision EntryDecisionEngine::calculate_entry(const Zone& zone, const ZoneS
             decision.entry_price,
             decision.stop_loss
         );
-        LOG_INFO("V6 position sizing used: " + std::to_string(decision.lot_size));
+        LOG_DEBUG("V6 position sizing used: " + std::to_string(decision.lot_size));
     }
 
     // === BUG #153 FIX: PENETRATION DEPTH CHECK ===
@@ -564,13 +564,13 @@ bool EntryDecisionEngine::should_enter_trade_two_stage(
 ) const {
     // ⭐ CRITICAL FIX: Filter VIOLATED zones (Run 2 issue)
     if (config.skip_violated_zones && zone.state == ZoneState::VIOLATED) {
-        LOG_INFO("❌ Zone " + std::to_string(zone.zone_id) + " REJECTED: State is VIOLATED");
+        LOG_DEBUG("Zone " + std::to_string(zone.zone_id) + " REJECTED: VIOLATED");
         return false;
     }
     
     // ⭐ OPTIONAL: Filter TESTED zones if prefer_fresh is enabled
     if (config.skip_tested_zones && zone.state == ZoneState::TESTED) {
-        LOG_INFO("❌ Zone " + std::to_string(zone.zone_id) + " REJECTED: State is TESTED (prefer fresh)");
+        LOG_DEBUG("Zone " + std::to_string(zone.zone_id) + " REJECTED: TESTED");
         return false;
     }
     
@@ -625,7 +625,7 @@ bool EntryDecisionEngine::should_enter_trade_two_stage(
     }
 
     if (!zone_scorer.meets_threshold(zone_score.total)) {
-        LOG_INFO("❌ Two-stage rejection: Zone quality below threshold (" +
+        LOG_DEBUG("Two-stage rejection: Zone quality below threshold (" +
                  std::to_string(zone_score.total) + "/" +
                  std::to_string(config.zone_quality_minimum_score) + ")");
         return false;
@@ -644,14 +644,14 @@ bool EntryDecisionEngine::should_enter_trade_two_stage(
     }
 
     if (!entry_scorer.meets_threshold(entry_score.total)) {
-        LOG_INFO("❌ Two-stage rejection: Entry validation below threshold (" +
+        LOG_DEBUG("Two-stage rejection: Entry validation below threshold (" +
                  std::to_string(entry_score.total) + "/" +
                  std::to_string(config.entry_validation_minimum_score) + ")");
         return false;
     }
 
     double combined_score = (zone_score.total + entry_score.total) / 2.0;
-    LOG_INFO("🎯 Two-stage approval: Combined=" + std::to_string(combined_score));
+    LOG_DEBUG("Two-stage approval: Combined=" + std::to_string(combined_score));
     return true;
 }
 
@@ -729,7 +729,7 @@ bool EntryDecisionEngine::validate_entry_volume(
 ) const {
     // Skip if volume baseline not available
     if (volume_baseline_ == nullptr || !volume_baseline_->is_loaded()) {
-        LOG_INFO("⚠️ V6 Volume Filter: Volume baseline not available - DEGRADED MODE (entry allowed)");
+        LOG_DEBUG("V6 Volume Filter: DEGRADED MODE (entry allowed)");
         return true; // Allow entry (degraded mode)
     }
     // Check if V6.0 volume filters are enabled
@@ -754,7 +754,7 @@ bool EntryDecisionEngine::validate_entry_volume(
                           std::to_string(zone.institutional_index) +
                           ", requires inst>=" +
                           std::to_string(config.min_inst_for_high_volume) + ")";
-        LOG_INFO("❌ V6 PATTERN FILTER: " + rejection_reason);
+        LOG_DEBUG("V6 PATTERN FILTER: " + rejection_reason);
         return false;
     }
     // 3. Minimum volume with exception for tight zones
@@ -790,7 +790,7 @@ bool EntryDecisionEngine::validate_entry_oi(
 ) const {
     // Skip if OI scorer not available
     if (oi_scorer_ == nullptr) {
-        LOG_INFO("⚠️ V6 OI Filter: OI scorer not available - DEGRADED MODE (entry allowed)");
+        LOG_DEBUG("V6 OI Filter: DEGRADED MODE (entry allowed)");
         return true; // Allow entry (degraded mode)
     }
     
@@ -915,7 +915,7 @@ int EntryDecisionEngine::calculate_dynamic_lot_size(
     int max_lots = std::max(1, config.max_lot_size);
     final_position = std::max(1, std::min(final_position, max_lots));
 
-    LOG_INFO("V6 Position sizing: Base=" + std::to_string(base_position) +
+    LOG_DEBUG("V6 Position sizing: Base=" + std::to_string(base_position) +
              " contracts, StopDist=" + std::to_string(stop_distance) +
              " pts, Multiplier=" + std::to_string(multiplier) +
              ", Final=" + std::to_string(final_position) + " contracts");

@@ -112,6 +112,15 @@ private:
         double tolerance_price
     ) const;
 
+    // Windows fileapi.h defines CREATE_NEW=1 and SKIP is used by some SDKs.
+    // Undefine here so the enum values compile correctly on MSVC.
+#ifdef CREATE_NEW
+#undef CREATE_NEW
+#endif
+#ifdef SKIP
+#undef SKIP
+#endif
+
     enum class ZoneDecision {
         CREATE_NEW,
         MERGE_WITH_EXISTING,

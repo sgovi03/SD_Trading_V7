@@ -1,0 +1,169 @@
+// ============================================================
+// SD TRADING V8 - AMIBROKER AFL DATA BRIDGE
+// afl/SD_DataBridge.afl
+// Milestone M2.1
+// ============================================================
+
+// -- Configuration ------------------------------------------
+TIMEFRAME_LABEL = "5min";
+SOURCE_LABEL    = "AMIBROKER";
+IST_OFFSET      = "+05:30";
+
+// -- Symbol normalisation ------------------------------------
+function GetCleanSymbol() {
+    sym = Name();
+
+    // Strip "NSE:" prefix
+    if (StrFind(sym, "NSE:") == 0) {
+        sym = StrMid(sym, 4);
+    }
+
+    // Strip "-FUT" suffix (NIFTY-FUT ? NIFTY)
+    pos = StrFind(sym, "-FUT");
+    if (pos >= 0) {
+        sym = StrLeft(sym, pos);
+    }
+
+    // Strip contract month suffix e.g. "26APR" (NIFTY26APR ? NIFTY)
+    len = StrLen(sym);
+    if (len > 7) {
+        tail = StrRight(sym, 5);
+        c0 = StrMid(tail, 0, 1);
+        c2 = StrMid(tail, 2, 1);
+        if (c0 >= "0" AND c0 <= "9" AND c2 >= "A") {
+            sym = StrLeft(sym, len - 5);
+        }
+    }
+
+    return sym;
+}
+
+// -- Build ISO8601 timestamp from a specific bar index -------
+function GetIST8601(bar_idx) {
+    // DateNum() returns YYYYMMDD as float array  e.g. 20260410
+    // TimeNum() returns HHMMSS   as float array  e.g. 112500
+    // Both are arrays — index with [bar_idx] to get scalar for specific bar.
+
+    dn_arr = DateNum();
+	dn = dn_arr[bar_idx];   // e.g. 1260410  (note: year stored as YY not YYYY pre-2000)
+	tn_arr =  TimeNum();
+	tn = tn_arr[bar_idx];
+  
+
+    // DateNum encodes as: year*10000 + month*100 + day
+    // For post-2000 dates: dn = 1260410 means year=126 (=2026), mo=04, dy=10
+    // AmiBroker DateNum stores year as years-since-1900 * 10000
+    raw_yr = int(dn / 10000);
+    if (raw_yr < 200) {
+        // Encoded as offset from 1900 (e.g. 126 = 2026)
+        full_yr = 1900 + raw_yr;
+    } else {
+        // Already full year (e.g. 2026)
+        full_yr = raw_yr;
+    }
+    mo_num = int((dn - int(dn/10000)*10000) / 100);
+    dy_num = int(dn - int(dn/10000)*10000 - mo_num*100);
+
+    // TimeNum encodes as: hour*10000 + min*100 + sec
+    hh_num = int(tn / 10000);
+    mm_num = int((tn - hh_num*10000) / 100);
+    ss_num = int(tn - hh_num*10000 - mm_num*100);
+
+    yr = NumToStr(full_yr, 1.0, False);
+    mo = NumToStr(mo_num,  1.0, False);
+    dy = NumToStr(dy_num,  1.0, False);
+    hh = NumToStr(hh_num,  1.0, False);
+    mm = NumToStr(mm_num,  1.0, False);
+    ss = NumToStr(ss_num,  1.0, False);
+
+    if (StrLen(mo) < 2) mo = "0" + mo;
+    if (StrLen(dy) < 2) dy = "0" + dy;
+    if (StrLen(hh) < 2) hh = "0" + hh;
+    if (StrLen(mm) < 2) mm = "0" + mm;
+    if (StrLen(ss) < 2) ss = "0" + ss;
+
+    return yr + "-" + mo + "-" + dy + "T" + hh + ":" + mm + ":" + ss + IST_OFFSET;
+}
+
+// -- Format helpers ------------------------------------------
+function Fmt2(val) {
+    return NumToStr(val, 1.2, False);
+}
+function FmtInt(val) {
+    return NumToStr(val, 1.0, False);
+}
+
+// ============================================================
+// MAIN LOGIC
+// ============================================================
+// Uses StaticVarGet/Set to persist lastBarIdx across AFL calls.
+// AFL plain variables (lastBarIdx = 0) reset on EVERY call —
+// that caused the repeated duplicate bar sends seen in the log.
+// StaticVarGet/Set survive between calls within the same session.
+
+cleanSym = Name();
+pipeName = "\\\\.\\pipe\\SD_" + cleanSym + "_" + TIMEFRAME_LABEL;
+
+// Persistent state key — unique per symbol+timeframe
+stateKey = "SD_lastBar_" + cleanSym + "_" + TIMEFRAME_LABEL;
+
+// Retrieve last processed bar index (0 on first run)
+lastBarIdx = StaticVarGet(stateKey);
+if (IsEmpty(lastBarIdx) OR IsNull(lastBarIdx)) {
+    lastBarIdx = -1;
+}
+
+// Current completed bar is BarCount-2
+// (BarCount-1 is the forming/in-progress bar — never send it)
+completedBarIdx = BarCount - 2;
+
+if (completedBarIdx > lastBarIdx AND completedBarIdx >= 0) {
+    // New completed bar — update state FIRST to prevent double-send
+    StaticVarSet(stateKey, completedBarIdx);
+
+    // Extract bar data at the completed bar index
+    barO  = O[completedBarIdx];
+    barH  = H[completedBarIdx];
+    barL  = L[completedBarIdx];
+    barC  = C[completedBarIdx];
+    barV  = V[completedBarIdx];
+
+    barOI = OpenInt[completedBarIdx];
+    if (IsNull(barOI)) {
+        barOI = 0;
+    }
+
+    // Build timestamp from the bar's own DateTime
+    ts = GetIST8601(completedBarIdx);
+
+    // Build wire message
+    wire = SOURCE_LABEL     + "|" +
+           cleanSym         + "|" +
+           TIMEFRAME_LABEL  + "|" +
+           ts               + "|" +
+           Fmt2(barO)       + "|" +
+           Fmt2(barH)       + "|" +
+           Fmt2(barL)       + "|" +
+           Fmt2(barC)       + "|" +
+           FmtInt(barV)     + "|" +
+           FmtInt(barOI)    + "\n";
+
+    // Write to named pipe
+    fh = fopen(pipeName, "w");
+    if (fh != 0) {
+        fputs(wire, fh);
+        fclose(fh);
+        printf("PIPE OK: " + wire);
+    } else {
+        printf("PIPE UNAVAILABLE: " + pipeName + "\n");
+        printf("  Wire: " + wire + "\n");
+    }
+}
+
+// -- Chart display -------------------------------------------
+Plot(C, "Close", colorGreen, styleCandle);
+PlotText("SD Bridge: " + cleanSym + " @ " + TIMEFRAME_LABEL
+         + " | Last: " + NumToStr(StaticVarGet(stateKey), 1.0, False),
+         BarCount - 1, H[BarCount-1] * 1.001, colorWhite, colorBlack);
+
+// ============================================================

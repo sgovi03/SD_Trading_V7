@@ -1,0 +1,184 @@
+// ============================================================
+// SD TRADING V8 - AMIBROKER AFL DATA BRIDGE
+// afl/SD_DataBridge.afl
+// Milestone M2.1
+//
+// PURPOSE:
+//   Runs inside AmiBroker on each bar close.
+//   Writes OHLCV + OI to a named pipe per symbol.
+//   The C++ PipeListener reads this pipe and feeds the engine.
+//
+// WIRE FORMAT:
+//   SOURCE|SYMBOL|TIMEFRAME|TIMESTAMP|O|H|L|C|V|OI
+//   All fields pipe-delimited (|), newline-terminated.
+//   Example:
+//   AMIBROKER|NIFTY|5min|2026-04-09T09:30:00+05:30|
+//   22950.00|23010.50|22940.00|22985.00|142500|9875400
+//
+// SETUP INSTRUCTIONS:
+//   1. Open AmiBroker
+//   2. Open AFL Editor (Tools > Formula Editor)
+//   3. Paste this script
+//   4. Assign it to your NIFTY/BANKNIFTY chart via
+//      Charts > Apply to > All Quotes
+//   5. Set chart timeframe to 5 minutes
+//   6. Run the C++ PipeListener AFTER AFL is loaded
+//      (AFL creates the pipe as server; C++ connects as client)
+//
+// PIPE NAMING:
+//   \\.\pipe\SD_{SYMBOL}_{TIMEFRAME}
+//   e.g. \\.\pipe\SD_NIFTY_5min
+//        \\.\pipe\SD_BANKNIFTY_5min
+//
+// NOTES:
+//   - OI (Open Interest) requires your data vendor to supply it.
+//   - If OI is not available, write 0 in its place.
+//   - This script is per-chart. Run one chart per symbol.
+//   - AmiBroker's fwrite() supports named pipes directly.
+// ============================================================
+
+// ── Configuration ──────────────────────────────────────────
+// Timeframe label — must match what PipeListener expects
+TIMEFRAME_LABEL = "5min";
+
+// Source label — identifies the data origin in audit logs
+SOURCE_LABEL = "AMIBROKER";
+
+// IST offset for timestamp (UTC+5:30 = +05:30)
+IST_OFFSET = "+05:30";
+
+// ── Symbol normalisation ────────────────────────────────────
+// AmiBroker may include exchange prefix (NSE:NIFTY-FUT → NIFTY)
+// Adjust the strip logic below for your symbol naming convention.
+function GetCleanSymbol() {
+    sym = Name();
+
+    // Strip "NSE:" prefix if present
+    if (StrFind(sym, "NSE:") == 0) {
+        sym = StrMid(sym, 4);
+    }
+
+    // Strip "-FUT" suffix if present (NIFTY-FUT → NIFTY)
+    pos = StrFind(sym, "-FUT");
+    if (pos >= 0) {
+        sym = StrLeft(sym, pos);
+    }
+
+    // Strip "26APR" style contract month (NIFTY26APR → NIFTY)
+    // Matches 2-digit year + 3-letter month at end
+    // This handles NSE futures ticker format
+    len = StrLen(sym);
+    if (len > 7) {
+        tail = StrRight(sym, 5);  // last 5 chars e.g. "26APR"
+        // Check if chars 0-1 are digits and chars 2-4 are alpha
+        c0 = StrMid(tail, 0, 1);
+        c2 = StrMid(tail, 2, 1);
+        if (c0 >= "0" AND c0 <= "9" AND c2 >= "A") {
+            sym = StrLeft(sym, len - 5);
+        }
+    }
+
+    return sym;
+}
+
+// ── Build ISO8601 timestamp with IST offset ─────────────────
+function GetIST8601(bar_idx) {
+    dt   = DateTimeToStr(DateTime());
+
+    // DateTimeToStr returns "YYYY/MM/DD HH:MM:SS"
+    // Convert to "YYYY-MM-DDTHH:MM:SS+05:30"
+    yr   = StrLeft(dt, 4);
+    mo   = StrMid(dt, 5, 2);
+    dy   = StrMid(dt, 8, 2);
+    hh   = StrMid(dt, 11, 2);
+    mm   = StrMid(dt, 14, 2);
+    ss   = StrMid(dt, 17, 2);
+
+    return yr + "-" + mo + "-" + dy + "T" + hh + ":" + mm + ":" + ss + IST_OFFSET;
+}
+
+// ── Format price to 2 decimal places ───────────────────────
+function Fmt2(val) {
+    return NumToStr(val, 1.2, False);
+}
+
+// ── Format integer (volume, OI) ────────────────────────────
+function FmtInt(val) {
+    return NumToStr(val, 1.0, False);
+}
+
+// ── Main logic: fires every bar ────────────────────────────
+// Only process on completed (closed) bars, not in-progress ones.
+// In AmiBroker, LastValue(BarIndex()) gives the most recent bar.
+// We detect bar close by watching for BarIndex change.
+
+// Static variable to track last processed bar index
+// (AFL static variables persist between calls within a session)
+lastBarIdx = 0;
+
+currentBarIdx = LastValue(BarIndex());
+
+if (currentBarIdx != lastBarIdx) {
+    // New bar closed — process it
+    lastBarIdx = currentBarIdx;
+
+    // Build pipe path
+    cleanSym  = GetCleanSymbol();
+    pipeName  = "\\\\.\\\pipe\\SD_" + cleanSym + "_" + TIMEFRAME_LABEL;
+
+    // Build wire data from most-recent bar values
+    barO  = LastValue(O);    // Open
+    barH  = LastValue(H);    // High
+    barL  = LastValue(L);    // Low
+    barC  = LastValue(C);    // Close
+    barV  = LastValue(V);    // Volume
+
+    // Open Interest
+    // AmiBroker stores OI in OpenInt array if your data vendor provides it.
+    // If OpenInt() is not available, substitute 0.
+    barOI = LastValue(OpenInt());
+    if (IsNull(barOI)) {
+        barOI = 0;
+    }
+
+    // Build ISO8601 timestamp
+    ts = GetIST8601(currentBarIdx);
+
+    // Build wire message
+    wire = SOURCE_LABEL + "|" +
+           cleanSym      + "|" +
+           TIMEFRAME_LABEL + "|" +
+           ts             + "|" +
+           Fmt2(barO)     + "|" +
+           Fmt2(barH)     + "|" +
+           Fmt2(barL)     + "|" +
+           Fmt2(barC)     + "|" +
+           FmtInt(barV)   + "|" +
+           FmtInt(barOI)  + "\n";
+
+    // Write to named pipe
+    // fopen() in AmiBroker supports named pipes as file paths.
+    // If the pipe is not yet open (C++ listener not running),
+    // fopen returns 0 — we handle this gracefully.
+    fh = fopen(pipeName, "w");
+    if (fh != 0) {
+        fputs(wire, fh);
+        fclose(fh);
+
+        // Optional: log to AmiBroker output window (comment out in production)
+        // printf("PIPE OK: " + wire);
+    } else {
+        // Pipe not available — C++ listener may not be running yet
+        // Log to AmiBroker output for debugging
+        printf("PIPE UNAVAILABLE: " + pipeName + "\n");
+        printf("  Wire would be: " + wire);
+    }
+}
+
+// ── Chart display (optional) ────────────────────────────────
+// Show a simple indicator on the chart to confirm the script is active.
+Plot(C, "Close", colorGreen, styleCandle);
+PlotText("SD Bridge: " + GetCleanSymbol() + " @ " + TIMEFRAME_LABEL,
+         BarCount - 1, H[BarCount-1] * 1.001, colorWhite, colorBlack);
+
+// ── End of script ───────────────────────────────────────────

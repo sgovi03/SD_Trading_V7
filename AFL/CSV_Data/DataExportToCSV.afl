@@ -1,0 +1,57 @@
+//Coded by Rajandran R 
+//Website - www.marketcalls.in / www.openalgo.in
+
+
+
+_SECTION_BEGIN("Amibroker Export Intraday/EOD data");
+
+exportdata = ParamList("Data Type","EOD|INTRADAY");
+header = "";
+
+fh = fopen( "D://AmiExplore//"+Name()+"_"+exportdata+".csv", "w");
+
+if(exportdata=="EOD")
+{
+header="Ticker,Date,Open,High,Low,Close,Volume";
+}
+if(exportdata=="INTRADAY")
+{
+header="Ticker,Date,Time,Open,High,Low,Close,Volume";
+}
+
+if( fh )
+{
+
+fputs( header, fh );
+y = Year();
+m = Month();
+d = Day();
+r = Hour();
+e = Minute();
+n = Second();
+
+for( i = 0; i < BarCount; i++ )
+{
+fputs( "\n"+Name() + "," , fh );
+ds = StrFormat("%02.0f-%02.0f-%02.0f,",
+y[ i ], m[ i ], d[ i ] );
+fputs( ds, fh );
+
+if(exportdata=="INTRADAY")
+{
+ts = StrFormat("%02.0f:%02.0f:%02.0f,",
+r[ i ],e[ i ],n[ i ] );
+fputs( ts, fh );
+}
+qs = StrFormat("%.4f,%.4f,%.4f,%.4f,%.0f",
+O[ i ],H[ i ],L[ i ],C[ i ],V[ i ] );
+fputs( qs, fh );
+}
+
+fclose( fh );
+}
+
+Buy = 0;
+
+
+_SECTION_END();

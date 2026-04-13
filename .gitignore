@@ -1,119 +1,47 @@
-# ============================================================
-# SD Trading System V4.0 - Git Ignore File
-# ============================================================
-
-# Build directories
+# ── Build output ─────────────────────────────────────
 build/
-bin/
-obj/
 out/
-Debug/
-Release/
-RelWithDebInfo/
-MinSizeRel/
-x64/
-x86/
-Win32/
-.vs/
-
-# Build outputs
 *.exe
 *.dll
-*.so
-*.dylib
 *.lib
-*.a
+*.pdb
 *.obj
 *.o
-*.pdb
 *.ilk
 *.exp
-*.idb
 
-# CMake generated files
+# ── CMake ────────────────────────────────────────────
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
-*.cmake
-!CMakeLists.txt
 
-# IDE specific files
-.vscode/
-.idea/
-*.vcxproj
-*.vcxproj.filters
+# ── Visual Studio ────────────────────────────────────
+.vs/
 *.vcxproj.user
-*.sln
 *.suo
+*.user
 *.sdf
 *.opensdf
 *.VC.db
-*.VC.opendb
 
-# Results and logs
-results/
+# ── Runtime data (never commit live trade data) ──────
+data/sd_trading_v8.db
+data/sd_trading_v8.db-shm
+data/sd_trading_v8.db-wal
+data/*.db
+results/live_trades/*.json
+results/live_trades/*.csv
 logs/
-*.log
-*.csv
-*.txt.bak
-backtest_results.txt
 
-# Temporary files
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-*.bak
-*.orig
-~$*.docx
+# ── Secrets / credentials ────────────────────────────
+*.token
+fyers_token.json
+*secret*
+*password*
+*credentials*
 
-# System files
+# ── OS noise ─────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
-._*
-
-# Test outputs
-test_results/
-coverage/
-
-# Documentation build
-docs/_build/
-docs/.buildinfo
-
-# Python (if any scripts)
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-venv/
-env/
-
-# Data files (comment out if you want to commit data)
-data/
-data/**
-# data/*.csv
-# data/*.txt
-
-# Config backups (keep originals)
-*.config.bak
-*_backup.txt
-
-# Dependencies (if managed externally)
-third_party/
-external/
-lib/
-
-# Package files
-*.zip
-*.tar.gz
-*.rar
-
-# Keep these files
-!.gitignore
-!README.md
-!LICENSE
-!CMakeLists.txt

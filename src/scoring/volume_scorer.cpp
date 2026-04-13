@@ -114,28 +114,28 @@ double VolumeScorer::calculate_volume_score(const VolumeProfile& profile, const 
     // COMPONENT 1: DEPARTURE VOLUME (0-25 points)
     if (profile.departure_volume_ratio > 3.0) {
         score += 25.0;
-        LOG_INFO("🔥 EXTREME departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+25pts)");
+        LOG_DEBUG("EXTREME departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+25pts)");
     } else if (profile.departure_volume_ratio > 2.0) {
         score += 20.0;
-        LOG_INFO("✅ STRONG departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+20pts)");
+        LOG_DEBUG("STRONG departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+20pts)");
     } else if (profile.departure_volume_ratio > 1.5) {
         score += 12.0;
-        LOG_INFO("➡️ MODERATE departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+12pts)");
+        LOG_DEBUG("MODERATE departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+12pts)");
     } else if (profile.departure_volume_ratio >= 1.0) {
         score += 5.0;
-        LOG_INFO("⚠️ NORMAL departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+5pts)");
+        LOG_DEBUG("NORMAL departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (+5pts)");
     } else {
         score -= 15.0;
-        LOG_WARN("❌ WEAK departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (-15pts penalty!)");
+        LOG_DEBUG("WEAK departure volume: " + std::to_string(profile.departure_volume_ratio) + "x baseline (-15pts penalty!)");
     }
 
     // COMPONENT 2: INITIATIVE vs ABSORPTION (0-15 points)
     if (profile.is_initiative) {
         score += 15.0;
-        LOG_INFO("✅ Initiative volume detected - clean institutional move (+15pts)");
+        LOG_DEBUG("Initiative volume detected - clean institutional move (+15pts)");
     } else {
         score -= 20.0;
-        LOG_WARN("❌ ABSORPTION detected - high vol but small move (-20pts penalty!)");
+        LOG_DEBUG("ABSORPTION detected - high vol but small move (-20pts penalty!)");
     }
 
     // COMPONENT 3: FORMATION VOLUME (0-10 points)
@@ -148,13 +148,13 @@ double VolumeScorer::calculate_volume_score(const VolumeProfile& profile, const 
     // COMPONENT 4: VOLUME CLIMAX AT BASE (0-10 points)
     if (profile.has_volume_climax) {
         score += 10.0;
-        LOG_INFO("🔥 Volume climax detected at base - absorption complete (+10pts)");
+        LOG_DEBUG("Volume climax detected at base - absorption complete (+10pts)");
     }
 
     // COMPONENT 5: MULTI-TOUCH VOLUME TREND (penalty only)
     if (profile.volume_rising_on_retests) {
         score -= 30.0;
-        LOG_WARN("❌ Rising volume on retests detected (-30pts penalty!)");
+        LOG_DEBUG("Rising volume on retests detected (-30pts penalty!)");
     }
 
     // Clamp to valid range [0, 60]

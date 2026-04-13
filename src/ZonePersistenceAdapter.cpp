@@ -313,10 +313,13 @@ ZonePersistenceAdapter::ZonePersistenceAdapter(
     const std::string& mode,
     const std::string& output_dir,
     bool enable_filtering
+,
+    const std::string& symbol
 ) : mode_(mode), 
     output_dir_(output_dir), 
     is_live_mode_(mode == "live"),
-    enable_live_zone_filtering_(enable_filtering) {  // ⭐ NEW: Initialize filtering flag
+    enable_live_zone_filtering_(enable_filtering),
+    symbol_(symbol) {  // ⭐ NEW: Initialize filtering flag
     
     // Create output directory if it doesn't exist
     fs::create_directories(output_dir_);
@@ -340,8 +343,11 @@ std::string ZonePersistenceAdapter::get_current_date() const {
 
 std::string ZonePersistenceAdapter::generate_filename() const {
     if (is_live_mode_) {
-        // Live mode: Master persistent file (all zones + is_active flag)
-        return "zones_live_master.json";
+        // V8: per-symbol master file so each symbol has independent zone state
+        std::string sym = symbol_.empty() ? "unknown" : symbol_;
+        // Replace "-" with "_" for safe filenames: NIFTY-FUT → NIFTY_FUT
+        std::replace(sym.begin(), sym.end(), '-', '_');
+        return "zones_live_" + sym + "_master.json";
     } else {
         // Backtest mode: Date-stamped file
         std::string date = get_current_date();
@@ -351,8 +357,10 @@ std::string ZonePersistenceAdapter::generate_filename() const {
 
 std::string ZonePersistenceAdapter::generate_active_filename() const {
     if (is_live_mode_) {
-        // Live mode: Active zones cache file (for fast loading)
-        return "zones_live_active.json";
+        // V8: per-symbol active zones cache file
+        std::string sym = symbol_.empty() ? "unknown" : symbol_;
+        std::replace(sym.begin(), sym.end(), '-', '_');
+        return "zones_live_" + sym + "_active.json";
     } else {
         // Backtest mode: No separate active file
         return "";
@@ -377,12 +385,13 @@ bool ZonePersistenceAdapter::save_zones(
     int next_zone_id
 ) {
     try {
-        // DEBUG: Log what we're about to save
+        // Debug: first zone spot-check (LOG_DEBUG — not visible in INFO mode)
         if (!zones.empty()) {
             const Zone& first_zone = zones[0];
-            LOG_ERROR("🔍 [SAVE_ZONES DEBUG] First zone institutional_index: " + std::to_string(first_zone.institutional_index));
-            LOG_ERROR("    volume_ratio: " + std::to_string(first_zone.volume_profile.volume_ratio));
-            LOG_ERROR("    oi_score: " + std::to_string(first_zone.oi_profile.oi_score));
+            LOG_DEBUG("[SAVE_ZONES] First zone Z-" << first_zone.zone_id
+                      << " institutional_index=" << first_zone.institutional_index
+                      << " volume_ratio=" << first_zone.volume_profile.volume_ratio
+                      << " oi_score=" << first_zone.oi_profile.oi_score);
         }
         
         // Build JSON with proper formatting (beautified)

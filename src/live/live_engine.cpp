@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "live_engine.h"
+#include "pipe_broker.h"
 #include "../csv_simulator_broker.h"  // ⭐ ADD THIS LINE
 #include "fyers_adapter.h"  // ⭐ NEW: For FyersAdapter dynamic_cast
 #include "../utils/logger.h"
@@ -32,6 +33,13 @@
 #include "../ITradingEngine.h"
 #include "../ZonePersistenceAdapter.h"
 #include "../ZoneInitializer.h"
+
+// Windows SDK (via curl/winsock) defines ERROR=0 which corrupts LogLevel::ERROR.
+// Undefine after all headers.
+#ifdef ERROR
+#undef ERROR
+#endif
+
 
 namespace fs = std::filesystem;
 
@@ -150,7 +158,7 @@ LiveEngine::LiveEngine(
       performance(config.starting_capital),  // ⭐ NEW: Performance tracker
       last_csv_export_bar_(-1),  // ⭐ NEW: CSV export tracking
       v6_enabled_(false),  // ✅ V6.0: Initialize flag
-      zone_persistence_("live", output_dir, config.enable_live_zone_filtering),  // ⭐ FIXED: Pass filtering flag
+      zone_persistence_("live", output_dir, config.enable_live_zone_filtering, symbol),  // V8: per-symbol zone files
             next_zone_id_(1),  // NEW: Zone ID tracking
             output_dir_(output_dir),
             historical_csv_path_(historical_csv_path),  // ⭐ NEW: Store CSV path
@@ -159,6 +167,7 @@ LiveEngine::LiveEngine(
     last_saved_bar_time_(""),
     dryrun_bootstrap_end_bar_(0),  // ⭐ NEW: Initialize to 0 (no bootstrap)
     skip_trading_until_bar_(false),  // ⭐ NEW: Initialize to false (trading enabled)
+    historical_mode_(true),
     trading_symbol(symbol),
     bar_interval(interval),
     pending_continuation_() {    // ⭐ ISSUE-3: default-constructed (inactive)    
@@ -482,20 +491,30 @@ bool LiveEngine::initialize() {
     LOG_INFO("  Interval:     " << bar_interval << " min");
     LOG_INFO("  Lot size:     " << config.lot_size << " (propagated from system_config)");
     
-    // ⭐ NEW ARCHITECTURE: Load historical bars from CSV instead of broker
+    // ⭐ V8 ARCHITECTURE: bar_history may already be preloaded from SQLite
+    // by SymbolContext::SymbolContext() before initialize() is called.
+    // Only load from CSV if bar_history is still empty (no SQLite preload).
     auto bar_load_start = std::chrono::high_resolution_clock::now();
-    LOG_INFO("Loading historical bars from CSV: " << historical_csv_path_);
-    bar_history = load_csv_data(historical_csv_path_);
-    auto bar_load_end = std::chrono::high_resolution_clock::now();
-    auto bar_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bar_load_end - bar_load_start).count();
-    
-    if (bar_history.empty()) {
-        LOG_ERROR("Failed to load historical data from CSV");
-        return false;
+
+    if (!bar_history.empty()) {
+        // Preloaded from SQLite — skip CSV load entirely.
+        LOG_INFO("✅ Using " << bar_history.size()
+                 << " bars preloaded from SQLite (skipping CSV load).");
+    } else {
+        // Fallback: try CSV path (legacy / backtest mode).
+        LOG_INFO("Loading historical bars from CSV: " << historical_csv_path_);
+        bar_history = load_csv_data(historical_csv_path_);
+        if (bar_history.empty()) {
+            LOG_WARN("No historical bars loaded from CSV — starting with empty history.");
+            LOG_WARN("Zone state will build as bars arrive via pipe (V8 mode).");
+        }
+        LOG_INFO("✅ Loaded " << bar_history.size() << " historical bars from CSV");
     }
-    
-    LOG_INFO("✅ Loaded " << bar_history.size() << " historical bars from CSV");
-    LOG_INFO("   CSV loading took: " << bar_load_ms << "ms (" << (bar_load_ms/1000.0) << "s)");
+
+    auto bar_load_end = std::chrono::high_resolution_clock::now();
+    auto bar_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        bar_load_end - bar_load_start).count();
+    LOG_INFO("   Bar load took: " << bar_load_ms << "ms");
     
 	if (order_submitter_) {
 		if (!order_submitter_->initialize()) {
@@ -584,6 +603,14 @@ bool LiveEngine::initialize() {
 void LiveEngine::update_bar_history() {
     // Get latest bar from broker
     Bar latest_bar = broker->get_latest_bar(trading_symbol, bar_interval);
+
+    // V8 pipe mode: PipeBroker returns empty bar (datetime=="") on shutdown.
+    // Disconnect broker so the run() loop exits on next is_connected() check.
+    if (latest_bar.datetime.empty()) {
+        LOG_INFO("[LiveEngine] Empty bar received — pipe shutdown signal. Stopping.");
+        if (broker) broker->disconnect();
+        return;
+    }
     
     // Check if it's a new bar (different from last one)
     if (!bar_history.empty()) {
@@ -614,6 +641,17 @@ void LiveEngine::update_bar_history() {
     }
     
     // New bar formed
+    // V8: Detect HISTORICAL→LIVE transition — enables trading
+    if (historical_mode_ && latest_bar.source != "HISTORICAL") {
+        historical_mode_ = false;
+        LOG_INFO("=============================================");
+        LOG_INFO("  ✅ LIVE MODE ACTIVATED");
+        LOG_INFO("  Trading ENABLED from: " << latest_bar.datetime);
+        LOG_INFO("  History: " << bar_history.size() << " bars / "
+                 << active_zones.size() << " active + "
+                 << inactive_zones.size() << " inactive zones");
+        LOG_INFO("=============================================");
+    }
     bar_history.push_back(latest_bar);
     detector.add_bar(latest_bar);
     bar_index++;  // ⭐ MOVED HERE: Only increment when new bar is actually added
@@ -623,11 +661,10 @@ void LiveEngine::update_bar_history() {
 
     // ⭐ RUNTIME DEBUG: Log when appended CSV data arrives
    // std::cout << "\n[BAR_ARRIVED] NEW BAR from CSV (possibly appended during runtime)\n";
-    std::cout << "  DateTime: " << latest_bar.datetime << "\n";
-    std::cout << "  OHLC: " << std::fixed << std::setprecision(2) 
-              << latest_bar.open << " / " << latest_bar.high << " / " 
-              << latest_bar.low << " / " << latest_bar.close << "\n";
-    std::cout << "  Bar Index: " << (bar_history.size() - 1) << "\n";
+    LOG_DEBUG("[BAR] " << latest_bar.datetime
+              << " O=" << latest_bar.open << " H=" << latest_bar.high
+              << " L=" << latest_bar.low  << " C=" << latest_bar.close
+              << " idx=" << (bar_history.size() - 1));
     std::cout << "  Total bars in history: " << bar_history.size() << "\n";
     std::cout << std::endl;
     std::cout.flush();
@@ -716,6 +753,7 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
             if (zone.state == ZoneState::FRESH) {
                 zone.state = ZoneState::TESTED;
                 zone.touch_count++;
+                fire_zone_update(zone);  // V8 → DB
                 zones_changed = true;
                 LOG_INFO("Zone " << zone.zone_id << " tested (first touch)");
                 
@@ -840,6 +878,7 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
             std::string pre_violation_state = (zone.state == ZoneState::FRESH ? "FRESH" : 
                                                zone.state == ZoneState::TESTED ? "TESTED" : "RECLAIMED");
             zone.state = ZoneState::VIOLATED;
+            fire_zone_update(zone);  // V8 → DB
             zones_changed = true;
             LOG_INFO("Zone " << zone.zone_id << " violated");
 
@@ -967,6 +1006,7 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
                         
                         // Now RECLAIM it
                         zone.state = ZoneState::RECLAIMED;
+                        fire_zone_update(zone);  // V8 → DB
                         zone.reclaim_eligible = true;
                         LOG_INFO("✅ Zone " << zone.zone_id << " SWEEP_RECLAIMED after " 
                                 << zone.bars_inside_after_sweep << " bars");
@@ -1038,7 +1078,8 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
                 zone.state_history.clear();
             }
         }
-        zone_persistence_.save_zones(active_zones, next_zone_id_);
+        // Save with metadata directly — don't call save_zones() first as it
+        // would write without metadata and break the next-restart cache check.
         // --- Update master zones file in sync ---
         // Build metadata (similar to bootstrap)
         std::map<std::string, std::string> metadata;
@@ -1060,7 +1101,8 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
         metadata["zone_count"] = std::to_string(active_zones.size());
         metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
         metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
-        fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+        // V8: use per-symbol zone file path from ZonePersistenceAdapter
+        fs::path master_file_path = fs::path(zone_persistence_.get_zone_file_path());
         zone_persistence_.save_zones_with_metadata(active_zones, next_zone_id_, master_file_path.string(), metadata);
         last_saved_bar_time_ = current_bar.datetime;
     }
@@ -1405,7 +1447,9 @@ void LiveEngine::replay_historical_zone_states() {
                 zone.state_history.clear();
             }
         }
-        zone_persistence_.save_zones(active_zones, next_zone_id_);
+        // Periodic state save — use save_zones_with_metadata via the
+        // existing call that follows, not save_zones() which strips metadata.
+        // (metadata save happens in the enclosing bootstrap flow)
     }
     last_saved_bar_time_.clear();
     
@@ -1517,7 +1561,7 @@ bool LiveEngine::try_load_backtest_zones() {
         // V6.0 OI profile (backward compatible)
         if (zone_json.isMember("oi_profile")) {
             const Json::Value& op = zone_json["oi_profile"];
-            zone.oi_profile.formation_oi = op.get("formation_oi", 0.0).asDouble();
+            zone.oi_profile.formation_oi = static_cast<long>(op.get("formation_oi", 0.0).asDouble());
             zone.oi_profile.oi_change_during_formation = op.get("oi_change_during_formation", 0.0).asDouble();
             zone.oi_profile.oi_change_percent = op.get("oi_change_percent", 0.0).asDouble();
             zone.oi_profile.price_oi_correlation = op.get("price_oi_correlation", 0.0).asDouble();
@@ -1636,9 +1680,29 @@ void LiveEngine::process_zones() {
     LOG_DEBUG("Scanning for new zones from bar " << last_zone_scan_bar_ + 1 
               << " to " << last_scannable_bar);
     
-    // Detect new zones with duplicate prevention against active zones
+    // Detect new zones. Only pass RECENT active zones as the dedup list.
+    // Bootstrap zones share price levels with new live zones and silently
+    // suppress them via price-overlap dedup (MERGE_WITH_EXISTING).
+    // Cache rebuilt only when active_zones count or cutoff changes —
+    // avoids a full vector copy on every bar.
+    const int pz_recent_cutoff = std::max(0,
+        last_zone_scan_bar_ - config.lookback_for_zones);
+    if (active_zones.size() != dedup_cache_zone_count_ ||
+        pz_recent_cutoff     != dedup_cache_cutoff_) {
+        dedup_cache_.clear();
+        dedup_cache_.reserve(active_zones.size());
+        for (const auto& z : active_zones) {
+            if (z.formation_bar >= pz_recent_cutoff)
+                dedup_cache_.push_back(z);
+        }
+        dedup_cache_zone_count_ = active_zones.size();
+        dedup_cache_cutoff_     = pz_recent_cutoff;
+        LOG_DEBUG("process_zones: dedup cache rebuilt — "
+                  << dedup_cache_.size() << " recent zones of "
+                  << active_zones.size() << " total");
+    }
     std::vector<Zone> new_zones = detector.detect_zones_no_duplicates(
-        active_zones,
+        dedup_cache_,
         last_zone_scan_bar_ + 1
     );
     
@@ -1671,17 +1735,26 @@ void LiveEngine::process_zones() {
             continue;  // Skip zones from already-scanned bars
         }
         
+        // Dedup against BOTH active AND inactive zones.
+        // Zones filtered to inactive are re-detected each scan → duplicates.
         bool already_active = false;
-        for (const auto& active : active_zones) {
-            // FIXED: Check both price levels AND formation_bar to prevent duplicates
-            if (zone.formation_bar == active.formation_bar &&
-                std::abs(zone.proximal_line - active.proximal_line) < 1.0 &&
-                std::abs(zone.distal_line - active.distal_line) < 1.0) {
-                already_active = true;
-                LOG_DEBUG("process_zones: zone at bar " << zone.formation_bar
-                         << " already in active_zones — skipping duplicate");
-                break;
+        auto zone_exists_in = [&](const std::vector<Zone>& pool) -> bool {
+            for (const auto& z : pool) {
+                if (zone.type          == z.type          &&
+                    zone.formation_bar == z.formation_bar &&
+                    std::abs(zone.proximal_line - z.proximal_line) < 1.0 &&
+                    std::abs(zone.distal_line   - z.distal_line)   < 1.0) {
+                    return true;
+                }
             }
+            return false;
+        };
+        already_active = zone_exists_in(active_zones) ||
+                         zone_exists_in(inactive_zones);
+        if (already_active) {
+            LOG_DEBUG("process_zones: zone at bar " << zone.formation_bar
+                     << " [" << zone.distal_line << "-" << zone.proximal_line
+                     << "] exists in active/inactive — skipping duplicate");
         }
         
         if (!already_active) {
@@ -1716,55 +1789,6 @@ void LiveEngine::process_zones() {
             );
             record_event(zone, creation_event, config.record_zone_creation);
             
-            // ⭐ CONFLICTING ZONE FIX (process_zones / LT):
-            // A new zone of type T at price level P invalidates any existing active zone
-            // of the OPPOSITE type at the same level. The newer formation supersedes the
-            // older one — the market has reversed its structural bias at that price.
-            // We scan active_zones (not the detector output) because the older zone is
-            // already live and must be stopped from generating further trades.
-            // Threshold: 50% of the smaller zone's width must overlap.
-            {
-                const double CONFLICT_THRESHOLD = 0.5;
-                double new_lo = std::min(zone.proximal_line, zone.distal_line);
-                double new_hi = std::max(zone.proximal_line, zone.distal_line);
-                for (auto& az : active_zones) {
-                    if (az.state == ZoneState::VIOLATED) continue;
-                    if (az.type  == zone.type)           continue; // same type, no conflict
-                    double az_lo = std::min(az.proximal_line, az.distal_line);
-                    double az_hi = std::max(az.proximal_line, az.distal_line);
-                    double overlap = std::max(0.0, std::min(new_hi, az_hi) - std::max(new_lo, az_lo));
-                    double smaller = std::min(new_hi - new_lo, az_hi - az_lo);
-                    if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
-                        std::string old_state_str = (az.state == ZoneState::FRESH   ? "FRESH"  :
-                                                     az.state == ZoneState::TESTED  ? "TESTED" : "RECLAIMED");
-                        az.state = ZoneState::VIOLATED;
-                        LOG_INFO("⚡ CONFLICTING ZONE (LT): new "
-                                << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                << " Z" << zone.zone_id
-                                << " @ " << zone.distal_line << "-" << zone.proximal_line
-                                << " conflicts with existing "
-                                << (az.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                << " Z" << az.zone_id
-                                << " @ " << az.distal_line << "-" << az.proximal_line
-                                << " → marked VIOLATED (overlap="
-                                << static_cast<int>(overlap / smaller * 100) << "%)");
-                        // Record the conflict-driven violation as a state event
-                        ZoneStateEvent conflict_event(
-                            bar_history.back().datetime,
-                            static_cast<int>(bar_history.size()) - 1,
-                            "CONFLICT_VIOLATED",
-                            old_state_str,
-                            "VIOLATED",
-                            (az.proximal_line + az.distal_line) / 2.0,
-                            bar_history.back().high,
-                            bar_history.back().low,
-                            az.touch_count
-                        );
-                        record_event(az, conflict_event, config.record_violations);
-                    }
-                }
-            }
-
             active_zones.push_back(zone);
             zones_added = true;
             
@@ -1808,7 +1832,7 @@ void LiveEngine::process_zones() {
                 zone.state_history.clear();
             }
         }
-        zone_persistence_.save_zones(active_zones, next_zone_id_);
+        // Save with metadata directly — skip the plain save_zones() call.
         // --- Update master zones file in sync ---
         std::map<std::string, std::string> metadata;
         auto now = std::chrono::system_clock::now();
@@ -1829,7 +1853,8 @@ void LiveEngine::process_zones() {
         metadata["zone_count"] = std::to_string(active_zones.size());
         metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
         metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
-        fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+        // V8: use per-symbol zone file path from ZonePersistenceAdapter
+        fs::path master_file_path = fs::path(zone_persistence_.get_zone_file_path());
         zone_persistence_.save_zones_with_metadata(active_zones, next_zone_id_, master_file_path.string(), metadata);
     }
     
@@ -1837,6 +1862,10 @@ void LiveEngine::process_zones() {
 }
 
 void LiveEngine::check_for_entries() {
+    if (historical_mode_) {
+        LOG_DEBUG("[HISTORICAL MODE] Skipping entry check — zone-build phase.");
+        return;
+    }
     if (skip_trading_until_bar_ && dryrun_bootstrap_end_bar_ > 0) {
         int current_bar = static_cast<int>(bar_history.size()) - 1;
         if (current_bar < dryrun_bootstrap_end_bar_) {
@@ -1924,7 +1953,7 @@ void LiveEngine::check_for_entries() {
     
     // In-position skip (configurable)
     if (config.live_skip_when_in_position && trade_mgr.is_in_position()) {
-        std::cout << "\n[SKIP] TRADE CHECK SKIPPED - Already in position" << std::endl;
+        LOG_DEBUG("[SKIP] Already in position — skipping entry check");
         return;  // Already in a trade
     }
     
@@ -1947,7 +1976,7 @@ void LiveEngine::check_for_entries() {
     // Bar-change gating (configurable): only evaluate on a new bar
     if (config.live_entry_require_new_bar) {
         if (!last_entry_check_bar_time_.empty() && last_entry_check_bar_time_ == current_bar.datetime) {
-            std::cout << "[SKIP] Entry check skipped (same bar: " << current_bar.datetime << ")" << std::endl;
+            LOG_DEBUG("[SKIP] Entry check skipped same bar: " << current_bar.datetime);
             return;
         }
         last_entry_check_bar_time_ = current_bar.datetime;
@@ -2184,8 +2213,8 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             zone.state != ZoneState::RECLAIMED &&
             zone.state != ZoneState::TESTED) {
             zones_rejected++;
-            std::cout << "[ZONE REJECTED] only_fresh_zones=YES, zone " << zone.zone_id 
-                << " is VIOLATED/EXHAUSTED - skipping\n";
+            LOG_DEBUG("[ZONE SKIP] only_fresh_zones zone " << zone.zone_id
+                      << " is VIOLATED/EXHAUSTED - skipping");
             continue;
         }
 
@@ -2673,6 +2702,9 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             std::cout << std::endl;
             std::cout.flush();
 
+            // V8: Publish SignalEvent + TradeOpenEvent → EventBus → DbWriter → DB
+            publish_trade_events(trade_mgr.get_current_trade(), zone, false);
+
             // 📝 LOG ORDER TO CSV FOR SIMULATION
             log_order_to_csv(
                 trade.entry_date,
@@ -2690,16 +2722,20 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
         }
     }
     
-    // ⭐ PRINT TRADE GENERATION SUMMARY
-    std::cout << "+====================================================+\n";
-    std::cout << "| [SUMMARY] Trade Check Summary                     |\n";
-    std::cout << "+====================================================+\n";
-    std::cout << "  Zones Checked:        " << zones_checked << "\n";
-    std::cout << "  Zones Rejected:       " << zones_rejected << "\n";
-    std::cout << "  Price Not In Zone:    " << zones_price_not_in << "\n";
-    std::cout << "  Trade Generated:      " << (trade_generated ? "[YES]" : "[NO]") << "\n";
-    std::cout << std::endl;
-    std::cout.flush();
+    // ⭐ PRINT TRADE GENERATION SUMMARY — only when a trade is generated.
+    // Printing every bar causes 33 × 9000 = 297,000 synchronous Windows
+    // console writes which blocks the engine thread and crashes the system.
+    if (trade_generated) {
+        std::cout << "+====================================================+\n";
+        std::cout << "| [SUMMARY] Trade Check Summary                     |\n";
+        std::cout << "+====================================================+\n";
+        std::cout << "  Zones Checked:        " << zones_checked << "\n";
+        std::cout << "  Zones Rejected:       " << zones_rejected << "\n";
+        std::cout << "  Price Not In Zone:    " << zones_price_not_in << "\n";
+        std::cout << "  Trade Generated:      [YES]\n";
+        std::cout << std::endl;
+        std::cout.flush();
+    }
 }
 
 void LiveEngine::manage_position() {
@@ -2883,24 +2919,6 @@ void LiveEngine::manage_position() {
                     << ") to avoid overnight gap risk");
             
             std::string current_time = current_bar.datetime;
-            
-            // ⭐ CIRCUIT BREAKER EXIT: Call /squareOffPositionsByOrderTag before local close_trade()
-            // Get the order_tag from the current trade to notify the Spring Boot backend
-            const Trade& current_trade_ref = trade_mgr.get_current_trade();
-            if (!current_trade_ref.order_tag.empty() && order_submitter_) {
-                LOG_INFO("📤 CIRCUIT BREAKER: Submitting exit order via /squareOffPositionsByOrderTag");
-                LOG_INFO("   Order Tag: " << current_trade_ref.order_tag);
-                OrderSubmitResult exit_result = order_submitter_->submit_exit_order(current_trade_ref.order_tag);
-                if (exit_result.success) {
-                    LOG_INFO("✅ CIRCUIT BREAKER: /squareOffPositionsByOrderTag succeeded");
-                } else {
-                    LOG_WARN("⚠️  CIRCUIT BREAKER: /squareOffPositionsByOrderTag failed - HTTP Status: " 
-                             << exit_result.http_status << ", Error: " << exit_result.error_message);
-                }
-            } else {
-                LOG_WARN("⚠️  CIRCUIT BREAKER: Cannot submit exit order - order_tag is empty or OrderSubmitter unavailable");
-            }
-            
             Trade closed_trade = trade_mgr.close_trade(current_time, "SESSION_END", current_price);
             fix_exit_price(closed_trade, current_price);  // ⭐ ISSUE-A fix
             
@@ -2919,6 +2937,9 @@ void LiveEngine::manage_position() {
             LOG_INFO("Position closed: SESSION_END (circuit breaker), P&L: " << closed_trade.pnl);
 
             performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
             performance.update_capital(trade_mgr.get_capital());
             export_trade_journal();
 
@@ -3258,6 +3279,9 @@ void LiveEngine::manage_position() {
                 LOG_INFO("Exit order after VOL_CLIMAX. Tag: " << closed_trade.order_tag << " Success: " << result.success);
             }
             performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
             performance.update_capital(trade_mgr.get_capital());
             export_trade_journal();
             return;
@@ -3338,6 +3362,9 @@ void LiveEngine::manage_position() {
                 }
 
                 performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
                 performance.update_capital(trade_mgr.get_capital());
                 export_trade_journal();
                 return;
@@ -3492,6 +3519,9 @@ void LiveEngine::manage_position() {
 
         // ⭐ NEW: Update performance and export CSV
         performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
         performance.update_capital(trade_mgr.get_capital());
         export_trade_journal();
 
@@ -3557,6 +3587,9 @@ void LiveEngine::manage_position() {
 
         // ⭐ NEW: Update performance and export CSV
         performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
         performance.update_capital(trade_mgr.get_capital());
         export_trade_journal();
 
@@ -3564,12 +3597,112 @@ void LiveEngine::manage_position() {
     }
 }
 
+// ── V8: fire zone state change callback ──────────────────────────────────────
+inline void LiveEngine::fire_zone_update(const Zone& zone) {
+    if (!zone_update_cb_) return;
+    std::string s;
+    switch (zone.state) {
+        case ZoneState::FRESH:     s = "FRESH";     break;
+        case ZoneState::TESTED:    s = "TESTED";    break;
+        case ZoneState::VIOLATED:  s = "VIOLATED";  break;
+        case ZoneState::RECLAIMED: s = "RECLAIMED"; break;
+        case ZoneState::EXHAUSTED: s = "EXHAUSTED"; break;
+        default:                   s = "FRESH";     break;
+    }
+    zone_update_cb_(trading_symbol, zone.zone_id, s,
+                    zone.touch_count, zone.consecutive_losses);
+}
+
+// ── V8: publish signal + trade open/close events to EventBus ─────────────────
+void LiveEngine::publish_trade_events(const Trade& t, const Zone& zone, bool is_close) {
+    if (is_close) {
+        if (!trade_close_pub_cb_) return;
+        Events::TradeCloseEvent evt;
+        evt.order_tag         = t.order_tag;
+        evt.symbol            = trading_symbol;
+        evt.exit_time         = t.exit_date;
+        evt.exit_price        = t.exit_price;
+        evt.exit_reason       = t.exit_reason;
+        evt.gross_pnl         = t.pnl;
+        evt.brokerage         = 0.0;
+        evt.net_pnl           = t.pnl;
+        evt.bars_in_trade     = t.bars_in_trade;
+        evt.exit_volume       = t.exit_volume;
+        evt.exit_was_vol_climax = t.exit_was_volume_climax;
+        trade_close_pub_cb_(evt);
+    } else {
+        // Signal event
+        if (signal_pub_cb_) {
+            Events::SignalEvent sig;
+            sig.symbol                   = trading_symbol;
+            sig.signal_time              = t.entry_date;
+            sig.direction                = t.direction;
+            sig.score                    = t.zone_score;
+            sig.zone_id                  = t.zone_id;
+            sig.zone_type                = (zone.type == ZoneType::DEMAND) ? "DEMAND" : "SUPPLY";
+            sig.entry_price              = t.entry_price;
+            sig.stop_loss                = t.stop_loss;
+            sig.target_1                 = t.take_profit;
+            sig.target_2                 = t.take_profit;
+            sig.rr_ratio                 = t.actual_rr;
+            sig.lot_size                 = t.position_size;
+            sig.order_tag                = t.order_tag;
+            sig.score_base_strength      = t.score_base_strength;
+            sig.score_elite_bonus        = t.score_elite_bonus;
+            sig.score_swing              = t.score_swing_position;
+            sig.score_regime             = t.score_regime_alignment;
+            sig.score_freshness          = t.score_state_freshness;
+            sig.score_rejection          = t.score_rejection_confirmation;
+            sig.score_rationale          = t.score_rationale;
+            sig.regime                   = t.regime;
+            sig.fast_ema                 = t.fast_ema;
+            sig.slow_ema                 = t.slow_ema;
+            sig.rsi                      = t.rsi;
+            sig.adx                      = t.adx;
+            sig.di_plus                  = t.plus_di;
+            sig.di_minus                 = t.minus_di;
+            sig.macd_line                = t.macd_line;
+            sig.macd_signal              = t.macd_signal;
+            sig.macd_histogram           = t.macd_histogram;
+            sig.bb_upper                 = t.bb_upper;
+            sig.bb_middle                = t.bb_middle;
+            sig.bb_lower                 = t.bb_lower;
+            sig.bb_bandwidth             = t.bb_bandwidth;
+            sig.zone_departure_vol_ratio = t.zone_departure_volume_ratio;
+            sig.zone_is_initiative       = t.zone_is_initiative;
+            sig.zone_vol_climax          = t.zone_has_volume_climax;
+            sig.zone_vol_score           = t.zone_volume_score;
+            sig.zone_institutional_index = static_cast<double>(t.zone_institutional_index);
+            sig.entry_pullback_vol_ratio = t.entry_pullback_vol_ratio;
+            sig.entry_volume_score       = t.entry_volume_score;
+            sig.entry_volume_pattern     = t.entry_volume_pattern;
+            sig.entry_volume             = t.entry_volume;
+            sig.entry_oi                 = t.entry_oi;
+            signal_pub_cb_(sig);
+        }
+        // TradeOpen event
+        if (trade_open_pub_cb_) {
+            Events::TradeOpenEvent open;
+            open.order_tag   = t.order_tag;
+            open.symbol      = trading_symbol;
+            open.direction   = t.direction;
+            open.entry_time  = t.entry_date;
+            open.entry_price = t.entry_price;
+            open.stop_loss   = t.stop_loss;
+            open.take_profit = t.take_profit;
+            open.lots        = t.position_size;
+            open.signal_id   = 0;   // filled by DbWriter after signal insert
+            open.zone_id     = t.zone_id;
+            trade_open_pub_cb_(open);
+        }
+    }
+}
+
 void LiveEngine::process_tick() {
     LOG_DEBUG("Processing tick...");
     
     // DEBUG: Print every tick to verify loop is running
-    std::cout << "\n[TICK] TICK PROCESSED - Current bar count: " << bar_history.size() << std::endl;
-    std::cout.flush();
+    LOG_DEBUG("[TICK] bars=" << bar_history.size() << " mode=" << (historical_mode_ ? "HIST" : "LIVE"));
     
     // Update bar history (bar_index is now incremented inside update_bar_history only when new bar is added)
     update_bar_history();
@@ -3860,7 +3993,8 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     }
     
     // Try to load existing master zone file with metadata
-    fs::path master_file_path = fs::path(output_dir_) / "zones_live_master.json";
+    // V8: use per-symbol zone file path from ZonePersistenceAdapter
+        fs::path master_file_path = fs::path(zone_persistence_.get_zone_file_path());
     
     if (!fs::exists(master_file_path)) {
         LOG_INFO("❌ No cached zones found: " << master_file_path.string());
@@ -3911,63 +4045,6 @@ bool LiveEngine::bootstrap_zones_on_startup() {
                                      << " zone(s) from EXHAUSTED/dirty state on cache load");
                         }
                     }
-
-                    // ⭐ STARTUP CONFLICT SCAN:
-                    // The conflicting-zone fix (process_zones) only fires when a zone is
-                    // NEWLY DETECTED. Pre-existing conflicts baked into the persistence file
-                    // before the fix was deployed are not caught at detection time.
-                    // This scan runs once after all zones are loaded and marks the OLDER
-                    // zone VIOLATED whenever a newer opposite-type zone occupies the same
-                    // price level (≥50% overlap of the smaller zone's width).
-                    // Zones are sorted by formation_bar so the loop always encounters the
-                    // older zone first — it is the one that must yield.
-                    {
-                        const double CONFLICT_THRESHOLD = 0.5;
-                        int conflict_count = 0;
-                        // Sort by formation_bar ascending so older zones come first
-                        std::vector<Zone*> sorted_ptrs;
-                        for (auto& z : active_zones) sorted_ptrs.push_back(&z);
-                        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
-                            [](const Zone* a, const Zone* b) {
-                                return a->formation_bar < b->formation_bar;
-                            });
-                        for (size_t ii = 0; ii < sorted_ptrs.size(); ++ii) {
-                            Zone* older = sorted_ptrs[ii];
-                            if (older->state == ZoneState::VIOLATED) continue;
-                            double lo1 = std::min(older->proximal_line, older->distal_line);
-                            double hi1 = std::max(older->proximal_line, older->distal_line);
-                            for (size_t jj = ii + 1; jj < sorted_ptrs.size(); ++jj) {
-                                Zone* newer = sorted_ptrs[jj];
-                                if (newer->state == ZoneState::VIOLATED) continue;
-                                if (newer->type == older->type)          continue;
-                                double lo2 = std::min(newer->proximal_line, newer->distal_line);
-                                double hi2 = std::max(newer->proximal_line, newer->distal_line);
-                                double overlap = std::max(0.0, std::min(hi1,hi2) - std::max(lo1,lo2));
-                                double smaller = std::min(hi1-lo1, hi2-lo2);
-                                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
-                                    older->state = ZoneState::VIOLATED;
-                                    conflict_count++;
-                                    LOG_INFO("⚡ STARTUP CONFLICT: older "
-                                            << (older->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                            << " Z" << older->zone_id
-                                            << " @ " << older->distal_line << "-" << older->proximal_line
-                                            << " bar=" << older->formation_bar
-                                            << " → VIOLATED by newer "
-                                            << (newer->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                            << " Z" << newer->zone_id
-                                            << " @ " << newer->distal_line << "-" << newer->proximal_line
-                                            << " bar=" << newer->formation_bar
-                                            << " (overlap=" << static_cast<int>(overlap/smaller*100) << "%)");
-                                    break; // older is now VIOLATED — no need to check further
-                                }
-                            }
-                        }
-                        if (conflict_count > 0) {
-                            LOG_INFO("⚡ Startup conflict scan: " << conflict_count
-                                     << " pre-existing conflicting zone(s) marked VIOLATED");
-                        }
-                    }
-
                     return true;
                 } else {
                     LOG_WARN("⚠️  Failed to load cached zones - regenerating");
@@ -4031,7 +4108,7 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     // This carries forward trade-outcome knowledge from previous sessions.
     // On the very first bootstrap (no prior file), all values stay at 0 — correct.
     {
-        fs::path prior_file = fs::path(output_dir_) / "zones_live_master.json";
+        fs::path prior_file = fs::path(zone_persistence_.get_zone_file_path());
         std::vector<Zone> prior_zones;
         int dummy_id = 0;
         if (fs::exists(prior_file) && zone_persistence_.load_zones(prior_zones, dummy_id)) {
@@ -4090,61 +4167,7 @@ bool LiveEngine::bootstrap_zones_on_startup() {
     metadata["zone_count"] = std::to_string(active_zones.size());
     metadata["ttl_hours"] = std::to_string(config.zone_bootstrap_ttl_hours);
     metadata["refresh_time"] = config.zone_bootstrap_refresh_time;
-
-    // ⭐ STARTUP CONFLICT SCAN (regeneration path):
-    // replay_historical_zone_states() replays price-action state correctly but does
-    // not apply the conflicting-zone rule. A zone that was never violated by price
-    // action may still be structurally superseded by a newer opposite-type zone at
-    // the same price level. This scan runs AFTER replay and BEFORE save so the
-    // persisted file already has the correct VIOLATED states.
-    // Sorted by formation_bar ascending: the older zone always yields to the newer.
-    // Threshold: ≥50% overlap of the smaller zone's width = conflicting.
-    {
-        const double CONFLICT_THRESHOLD = 0.5;
-        int conflict_count = 0;
-        std::vector<Zone*> sorted_ptrs;
-        for (auto& z : active_zones) sorted_ptrs.push_back(&z);
-        std::stable_sort(sorted_ptrs.begin(), sorted_ptrs.end(),
-            [](const Zone* a, const Zone* b) {
-                return a->formation_bar < b->formation_bar;
-            });
-        for (size_t ii = 0; ii < sorted_ptrs.size(); ++ii) {
-            Zone* older = sorted_ptrs[ii];
-            if (older->state == ZoneState::VIOLATED) continue;
-            double lo1 = std::min(older->proximal_line, older->distal_line);
-            double hi1 = std::max(older->proximal_line, older->distal_line);
-            for (size_t jj = ii + 1; jj < sorted_ptrs.size(); ++jj) {
-                Zone* newer = sorted_ptrs[jj];
-                if (newer->state == ZoneState::VIOLATED) continue;
-                if (newer->type == older->type)          continue;
-                double lo2 = std::min(newer->proximal_line, newer->distal_line);
-                double hi2 = std::max(newer->proximal_line, newer->distal_line);
-                double overlap = std::max(0.0, std::min(hi1, hi2) - std::max(lo1, lo2));
-                double smaller = std::min(hi1 - lo1, hi2 - lo2);
-                if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
-                    older->state = ZoneState::VIOLATED;
-                    conflict_count++;
-                    LOG_INFO("⚡ CONFLICT (regen): older "
-                            << (older->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                            << " Z" << older->zone_id
-                            << " @ " << older->distal_line << "-" << older->proximal_line
-                            << " bar=" << older->formation_bar
-                            << " → VIOLATED by newer "
-                            << (newer->type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                            << " Z" << newer->zone_id
-                            << " @ " << newer->distal_line << "-" << newer->proximal_line
-                            << " bar=" << newer->formation_bar
-                            << " (overlap=" << static_cast<int>(overlap / smaller * 100) << "%)");
-                    break; // older is now VIOLATED — no further checks needed for it
-                }
-            }
-        }
-        if (conflict_count > 0) {
-            LOG_INFO("⚡ Conflict scan (regen): " << conflict_count
-                     << " zone(s) marked VIOLATED before save");
-        }
-    }
-
+    
     // Save master zones with metadata
     LOG_INFO("Saving master zones with metadata...");
     bool save_success = zone_persistence_.save_zones_with_metadata(
@@ -4307,7 +4330,15 @@ void LiveEngine::run(int duration_minutes) {
     
     // ⭐ NEW: Bootstrap zones on startup (with TTL/refresh logic)
     bool bootstrapped = bootstrap_zones_on_startup();
-    
+
+    // V8: Publish bootstrapped zones to EventBus → DbWriter → SQLite.
+    if (zone_snapshot_cb_) {
+        zone_snapshot_cb_(active_zones, inactive_zones);
+        LOG_INFO("[LiveEngine:" << trading_symbol << "] Published "
+                 << (active_zones.size() + inactive_zones.size())
+                 << " zone(s) to EventBus after bootstrap.");
+    }
+
     if (!bootstrapped) {
         // Bootstrap disabled or failed - fall back to legacy zone detection
         LOG_WARN("⚠️  Bootstrap failed or disabled - using legacy zone detection");
@@ -4386,14 +4417,21 @@ void LiveEngine::run(int duration_minutes) {
             }
         }
         
-        // Save the aligned zones to the live snapshot
+        // Save the aligned zones to the live snapshot — with metadata
+        // so the cache is valid on next restart.
         LOG_INFO("💾 Saving zones to persistent file...");
-        bool save_result = zone_persistence_.save_zones(active_zones, next_zone_id_);
-        
-        if (!save_result) {
-            LOG_WARN("⚠️ Failed to save zones - will regenerate on next startup");
-        } else {
-            LOG_INFO("✅ Zones saved successfully: " << zone_persistence_.get_zone_file_path());
+        {
+            auto mf = zone_persistence_.get_zone_file_path();
+            std::map<std::string, std::string> live_meta;
+            live_meta["source"]     = "live_scan";
+            live_meta["zone_count"] = std::to_string(active_zones.size());
+            bool save_result = zone_persistence_.save_zones_with_metadata(
+                active_zones, next_zone_id_, mf, live_meta);
+            if (!save_result) {
+                LOG_WARN("⚠️ Failed to save zones - will regenerate on next startup");
+            } else {
+                LOG_INFO("✅ Zones saved successfully: " << mf);
+            }
         }
         
         auto zone_save_end = std::chrono::high_resolution_clock::now();
@@ -4442,6 +4480,11 @@ void LiveEngine::run(int duration_minutes) {
     
     // Main trading loop
     while (true) {
+        // V8: Exit if broker disconnected (PipeBroker shutdown signal)
+        if (broker && !broker->is_connected()) {
+            LOG_INFO("[LiveEngine] Broker disconnected — exiting run loop.");
+            break;
+        }
         try {
             process_tick();
             
@@ -4481,8 +4524,20 @@ void LiveEngine::run(int duration_minutes) {
                         LOG_DEBUG("🔍 Incremental scan from bar " << scan_start_bar);
                     }
                     
+                    // Same reasoning: restrict dedup to recent zones so old
+                    // bootstrap zones don't suppress live zones at same price.
+                    const int periodic_cutoff = std::max(0,
+                        scan_start_bar - config.lookback_for_zones);
+                    std::vector<Core::Zone> periodic_recent;
+                    periodic_recent.reserve(active_zones.size());
+                    for (const auto& z : active_zones) {
+                        if (z.formation_bar >= periodic_cutoff)
+                            periodic_recent.push_back(z);
+                    }
+                    LOG_INFO("   Dedup against " << periodic_recent.size()
+                             << " recent zones of " << active_zones.size() << " total");
                     std::vector<Core::Zone> new_zones = detector.detect_zones_no_duplicates(
-                        active_zones,
+                        periodic_recent,
                         scan_start_bar
                     );
                     
@@ -4508,17 +4563,26 @@ void LiveEngine::run(int duration_minutes) {
                             // periodic detection cycles → 4-18 copies of the same zone.
                             // Fix: mirror the same boundary+formation_bar check that
                             // process_zones() uses before accepting a zone.
+                            // Dedup against active AND inactive zones.
                             bool already_active = false;
-                            for (const auto& active : active_zones) {
-                                if (zone.formation_bar == active.formation_bar &&
-                                    std::abs(zone.proximal_line - active.proximal_line) < 1.0 &&
-                                    std::abs(zone.distal_line   - active.distal_line)   < 1.0) {
-                                    already_active = true;
-                                    LOG_DEBUG("Periodic detect: zone at bar " << zone.formation_bar
-                                             << " [" << zone.distal_line << "-" << zone.proximal_line
-                                             << "] already in active_zones — skipping duplicate");
-                                    break;
+                            auto periodic_zone_exists = [&](const std::vector<Zone>& pool) -> bool {
+                                for (const auto& z : pool) {
+                                    if (zone.type          == z.type          &&
+                                        zone.formation_bar == z.formation_bar &&
+                                        std::abs(zone.proximal_line - z.proximal_line) < 1.0 &&
+                                        std::abs(zone.distal_line   - z.distal_line)   < 1.0) {
+                                        return true;
+                                    }
                                 }
+                                return false;
+                            };
+                            already_active = periodic_zone_exists(active_zones) ||
+                                             periodic_zone_exists(inactive_zones);
+                            if (already_active) {
+                                LOG_DEBUG("Periodic: zone at bar " << zone.formation_bar
+                                         << " [" << zone.distal_line << "-"
+                                         << zone.proximal_line
+                                         << "] already exists — skipping");
                             }
                             if (already_active) continue;
 
@@ -4606,10 +4670,20 @@ void LiveEngine::run(int duration_minutes) {
                 }
             }
             
-            // Sleep until next tick (e.g., every 10 seconds)
-            // ⭐ FIX: Skip sleep for CSV simulator
+            // V8 PipeBroker: get_latest_bar() already blocks until a bar
+            // is pushed — no sleep needed. The blocking call IS the wait.
+            // CsvSimulatorBroker: process immediately (existing behaviour).
+            // Real broker (anything else): sleep 10s between polls.
 CsvSimulatorBroker* csv_broker = dynamic_cast<CsvSimulatorBroker*>(broker.get());
-if (csv_broker == nullptr) {
+Live::PipeBroker*   pipe_broker = dynamic_cast<Live::PipeBroker*>(broker.get());
+
+if (pipe_broker != nullptr) {
+    // V8 pipe mode: get_latest_bar() blocks on condition_variable
+    // until push_bar() wakes it up — no sleep required here.
+    // Shutdown: broker->shutdown() unblocks get_latest_bar() and
+    // returns an empty bar which the loop detects and breaks on.
+    LOG_DEBUG("📡 Pipe mode: bar consumed via blocking get_latest_bar()");
+} else if (csv_broker == nullptr) {
     std::this_thread::sleep_for(std::chrono::seconds(10)); // Real broker
     LOG_DEBUG("⏱️  Live mode: waiting for tick");
 } else {
@@ -4655,12 +4729,31 @@ void LiveEngine::stop() {
             zone.state_history.clear();
         }
     }
-    if (zone_persistence_.save_zones(active_zones, next_zone_id_)) {
-        LOG_INFO("✅ Zones saved: " << zone_persistence_.get_zone_file_path());
-    } else {
-        LOG_WARN("Failed to save zones");
+    // Use save_zones_with_metadata so the metadata section is preserved.
+    // Plain save_zones() would overwrite the file without metadata,
+    // causing a full rescan on the next restart.
+    {
+        auto master_file = zone_persistence_.get_zone_file_path();
+        std::map<std::string, std::string> meta;
+        meta["saved_at"]    = trading_symbol;
+        meta["zone_count"]  = std::to_string(active_zones.size());
+        meta["source"]      = "shutdown";
+        if (zone_persistence_.save_zones_with_metadata(
+                active_zones, next_zone_id_, master_file, meta)) {
+            LOG_INFO("✅ Zones saved: " << master_file);
+        } else {
+            LOG_WARN("Failed to save zones");
+        }
     }
     
+    // V8: Publish final zone snapshot at shutdown — captures all zones
+    // built during HISTORICAL bulk push that were missed at bootstrap time.
+    if (zone_snapshot_cb_ && (!active_zones.empty() || !inactive_zones.empty())) {
+        zone_snapshot_cb_(active_zones, inactive_zones);
+        LOG_INFO("[LiveEngine:" << trading_symbol << "] Shutdown zone snapshot: "
+                 << (active_zones.size() + inactive_zones.size()) << " zone(s).");
+    }
+
     // Close any open positions using TradeManager
     if (trade_mgr.is_in_position()) {  // ⭐ Use TradeManager
         LOG_WARN("Closing open position before shutdown");
@@ -4672,6 +4765,9 @@ void LiveEngine::stop() {
         
         // ⭐ NEW: Add final trade to performance
         performance.add_trade(closed_trade);
+            // V8: publish TradeCloseEvent → EventBus → DbWriter → DB
+            { static Zone dummy; dummy.zone_id = closed_trade.zone_id;
+              publish_trade_events(closed_trade, dummy, true); }
         performance.update_capital(trade_mgr.get_capital());
     }
     

@@ -37,6 +37,7 @@ private:
     std::string mode_;
     bool is_live_mode_;
     bool enable_live_zone_filtering_;  // ⭐ NEW: Control active zones file creation
+    std::string symbol_;               // V8: per-symbol zone files (e.g. "NIFTY-FUT")
     
     /**
      * Generate filename based on mode and current date
@@ -65,7 +66,8 @@ public:
      */
     ZonePersistenceAdapter(const std::string& mode, 
                           const std::string& output_dir,
-                          bool enable_filtering = false);
+                          bool enable_filtering = false,
+                          const std::string& symbol = "");
     
     /**
      * Save zones to JSON file
