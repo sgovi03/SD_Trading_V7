@@ -44,4 +44,10 @@ fyers_token.json
 # ── OS noise ─────────────────────────────────────────
 .DS_Store
 Thumbs.db
-desktop.ini
+desktop.iniconf/*.bak 
+"conf/symbols/symbol_registry.json---" 
+docs/*.zip 
+results/ 
+*.db 
+*.db-shm 
+*.db-wal 
