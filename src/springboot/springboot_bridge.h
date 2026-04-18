@@ -71,6 +71,7 @@ public:
 private:
     std::unique_ptr<SignalConsumer>      consumer_;
     std::unique_ptr<TradeCloseListener>  close_listener_;
+    std::unique_ptr<Persistence::SqliteConnection> close_conn_;
     Events::EventBus&                    bus_;
 };
 

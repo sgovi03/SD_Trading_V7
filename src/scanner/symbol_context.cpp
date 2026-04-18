@@ -186,7 +186,17 @@ void SymbolContext::push_bar(const Core::Bar& bar) {
                  << "] push_bar called but not running — dropped.");
         return;
     }
-    broker_->push_bar(bar);
+    // FIX: populate norm_volume_ratio before routing.
+    // BarValidatedEvent carries no norm_volume_ratio so every pipe bar
+    // arrives with 0.0, breaking V6 volume scoring.
+    // LiveEngine::compute_norm_volume_ratio() uses its internal
+    // VolumeBaseline — no new dependencies needed here.
+    Core::Bar enriched = bar;
+    if (engine_) {
+        enriched.norm_volume_ratio =
+            engine_->compute_norm_volume_ratio(bar.datetime, bar.volume);
+    }
+    broker_->push_bar(enriched);
 }
 
 // ============================================================
@@ -260,6 +270,12 @@ void SymbolContext::run_engine() {
             running_.store(false);
             return;
         }
+
+        // FIX: enrich historical bars with norm_volume_ratio now that
+        // VolumeBaseline is loaded (initialize() runs AFTER preload_bar_history()).
+        engine_->enrich_bar_history_ratios();
+        LOG_INFO("[SymbolContext:" << profile_.symbol
+                 << "] Enriched bar_history with norm_volume_ratio.");
 
         if (bus_) {
             // ── Zone state update callback ─────────────────────

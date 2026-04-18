@@ -55,7 +55,7 @@
 // --------------------------------------------------------------------------
 // Parameters
 // --------------------------------------------------------------------------
-OUTPUT_DIR     = ParamStr( "Output Directory", "D:\\SD_System\\LiveFeed\\Data" );
+OUTPUT_DIR     = ParamStr( "Output Directory", "D:\\SD_System\\SD_Volume_OI\\SD_Trading_V7\\data\\LiveTest" );
 TIMEFRAME      = Param( "Timeframe (minutes)", 5, 1, 1440, 1 );
 
 // Last bar start time of the trading day in HHMM (NSE: 15:25 for 5-min bars)

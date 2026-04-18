@@ -689,12 +689,19 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.exclude_zone_age_end = std::stoi(value);
     } else if (key == "trailing_stop_activation_r") {
         config.trailing_stop_activation_r = std::stod(value);
+    } else {
+        return parse_section_trade_and_runtime_extended(key, value, config);
     }
+
+    return true;
+}
+
+bool ConfigLoader::parse_section_trade_and_runtime_extended(const std::string& key, const std::string& value, Config& config) {
     // ============================================================
-    // ⭐ NEW FILTERS — Priority 1-4 (March 2026 live trade analysis)
+    // New filters — Priority 1-4 (March 2026 live trade analysis)
     // ============================================================
     // Priority 1: Zone consecutive-loss exhaustion
-    else if (key == "enable_zone_exhaustion") {
+    if (key == "enable_zone_exhaustion") {
         config.enable_zone_exhaustion = parse_bool(value);
     } else if (key == "zone_consecutive_loss_max") {
         config.zone_consecutive_loss_max = std::stoi(value);
@@ -737,7 +744,7 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         if (normalize_hhmm(value, normalized)) {
             config.late_entry_cutoff_time = normalized;
         } else {
-            LOG_WARN("Invalid late_entry_cutoff_time '" << value << "' — expected HH:MM");
+            LOG_WARN("Invalid late_entry_cutoff_time '" << value << "' - expected HH:MM");
         }
     }
     // Priority 4: Hard lot cap
@@ -745,7 +752,7 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.max_position_lots = std::stoi(value);
     }
     // ============================================================
-    // V6.0: VOLUME & OI INTEGRATION
+    // V6.0: Volume & OI integration
     // ============================================================
     // Volume Entry Filters
     else if (key == "enable_volume_entry_filters") {
@@ -860,8 +867,21 @@ bool ConfigLoader::parse_section_trade_and_runtime(const std::string& key, const
         config.v6_validate_baseline_on_startup = parse_bool(value);
     }
     // ============================================================
-    else {
-        return false;
+    else if (key == "min_entry_sl_points") {
+        config.min_entry_sl_points = std::stod(value);
+    } else {
+        // ── Extended keys (inside else to avoid MSVC C1061 nesting limit) ──
+        if (key == "zone_bootstrap_force_regenerate") {
+            config.zone_bootstrap_force_regenerate = parse_bool(value);
+        } else if (key == "zone_bootstrap_enabled") {
+            config.zone_bootstrap_enabled = parse_bool(value);
+        } else if (key == "zone_bootstrap_ttl_hours") {
+            config.zone_bootstrap_ttl_hours = std::stoi(value);
+        } else if (key == "zone_bootstrap_refresh_time") {
+            config.zone_bootstrap_refresh_time = value;
+        } else {
+            return false;
+        }
     }
 
     return true;

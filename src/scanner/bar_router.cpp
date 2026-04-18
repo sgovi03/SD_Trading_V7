@@ -48,7 +48,7 @@ void BarRouter::on_bar_validated(const Events::BarValidatedEvent& evt) {
     bar.high         = evt.high;
     bar.low          = evt.low;
     bar.close        = evt.close;
-    bar.volume       = static_cast<long>(evt.volume);
+    bar.volume       = evt.volume;   // preserve double — no long cast
     bar.oi           = static_cast<double>(evt.open_interest);
     bar.source       = evt.source;   // "HISTORICAL" gates trading; "AMIBROKER" enables it
 

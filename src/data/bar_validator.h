@@ -47,6 +47,12 @@ struct ValidatorConfig {
     // because structurally broken bars corrupt zone geometry.
     bool   enabled                   = true;
 
+    // ── Tier-1 structural switch ──────────────────────────────────────────────
+    // Set bar_validation_tier1_structural_enabled = NO in MASTER.config to
+    // bypass structural checks too. Use with care: malformed bars can propagate
+    // into downstream zone/trade logic.
+    bool   tier1_structural_enabled  = true;
+
     // ── Tier-2 thresholds ─────────────────────────────────────────────────────
     // Defaults are tuned for NSE NIFTY/BANKNIFTY 5-min futures:
     //   - gap_pct=5%  : covers overnight events; 3% wrongly rejects Sep opens

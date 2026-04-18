@@ -1722,17 +1722,27 @@ void LiveEngine::process_zones() {
     
     // Detect new zones. Only pass RECENT active zones as the dedup list.
     // Bootstrap zones share price levels with new live zones and silently
-    // ⭐ FIX: Pass ALL active_zones to detect_zones_no_duplicates — V7 parity.
-    // The old dedup_cache_ only passed "recent" zones (filtered by pz_recent_cutoff),
-    // hiding bootstrap zones from the deduplication engine. This caused the detector
-    // to output new zones at identical price levels as existing bootstrap zones
-    // (zone cloning), because it could not see them to suppress them.
-    // The secondary fallback check (formation_bar match) then failed to catch them
-    // since the new zone formed on a different bar — so both zones coexisted at the
-    // same price, giving the broken level a clean slate to accumulate more losses.
-    // V7 passes active_zones directly with no cutoff filter.
+    // suppress them via price-overlap dedup (MERGE_WITH_EXISTING).
+    // Cache rebuilt only when active_zones count or cutoff changes —
+    // avoids a full vector copy on every bar.
+    const int pz_recent_cutoff = std::max(0,
+        last_zone_scan_bar_ - config.lookback_for_zones);
+    if (active_zones.size() != dedup_cache_zone_count_ ||
+        pz_recent_cutoff     != dedup_cache_cutoff_) {
+        dedup_cache_.clear();
+        dedup_cache_.reserve(active_zones.size());
+        for (const auto& z : active_zones) {
+            if (z.formation_bar >= pz_recent_cutoff)
+                dedup_cache_.push_back(z);
+        }
+        dedup_cache_zone_count_ = active_zones.size();
+        dedup_cache_cutoff_     = pz_recent_cutoff;
+        LOG_DEBUG("process_zones: dedup cache rebuilt — "
+                  << dedup_cache_.size() << " recent zones of "
+                  << active_zones.size() << " total");
+    }
     std::vector<Zone> new_zones = detector.detect_zones_no_duplicates(
-        active_zones,
+        dedup_cache_,
         last_zone_scan_bar_ + 1
     );
     
@@ -1818,44 +1828,7 @@ void LiveEngine::process_zones() {
                 0  // No touches yet
             );
             record_event(zone, creation_event, config.record_zone_creation);
-
-            // ⭐ CONFLICTING ZONE FIX (process_zones / V8 live) — V7 parity.
-            // When a new zone is added, mark any existing active zone of the OPPOSITE
-            // type at the same price level as VIOLATED. The newer zone supersedes the
-            // older structural read. Threshold: 50% overlap of the smaller zone's width.
-            // This was deleted from V8 process_zones but kept in bootstrap — restored here.
-            {
-                const double CONFLICT_THRESHOLD = 0.5;
-                double new_lo = std::min(zone.proximal_line, zone.distal_line);
-                double new_hi = std::max(zone.proximal_line, zone.distal_line);
-                for (auto& az : active_zones) {
-                    if (az.state == ZoneState::VIOLATED) continue;
-                    if (az.type  == zone.type)           continue;
-                    double az_lo = std::min(az.proximal_line, az.distal_line);
-                    double az_hi = std::max(az.proximal_line, az.distal_line);
-                    double overlap = std::max(0.0,
-                        std::min(new_hi, az_hi) - std::max(new_lo, az_lo));
-                    double smaller = std::min(new_hi - new_lo, az_hi - az_lo);
-                    if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
-                        std::string old_state_str =
-                            (az.state == ZoneState::FRESH    ? "FRESH"    :
-                             az.state == ZoneState::TESTED   ? "TESTED"   : "RECLAIMED");
-                        az.state = ZoneState::VIOLATED;
-                        fire_zone_update(az);
-                        LOG_INFO("⚡ CONFLICTING ZONE (live): new "
-                            << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                            << " Z" << zone.zone_id
-                            << " @ " << zone.distal_line << "-" << zone.proximal_line
-                            << " conflicts with existing "
-                            << (az.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                            << " Z" << az.zone_id
-                            << " @ " << az.distal_line << "-" << az.proximal_line
-                            << " → marked VIOLATED (overlap="
-                            << static_cast<int>(overlap / smaller * 100) << "%)");
-                    }
-                }
-            }
-
+            
             active_zones.push_back(zone);
             zones_added = true;
             
@@ -2199,7 +2172,7 @@ std::stable_sort(active_zones.begin(), active_zones.end(),
             auto it = zone_sl_session_.find(zone.zone_id);
             if (it != zone_sl_session_.end() && it->second == today) {
                 zones_rejected++;
-                LOG_DEBUG("[RE-ENTRY GUARD] Zone " << zone.zone_id
+                LOG_INFO("[RE-ENTRY GUARD] Zone " << zone.zone_id
                          << " SKIPPED: already exited in session " << today);
                 continue;
             }
@@ -2531,12 +2504,8 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
         }
 
 
-        // ⭐ FIX 9: Use config params for regime detection — parity with V7.
-        // V7 uses htf_lookback_bars and htf_trending_threshold.
-        // Computing once per zone avoids repeated O(N) calls inside the zone loop.
-        int regime_lookback = (config.htf_lookback_bars > 0) ? config.htf_lookback_bars : 100;
-        MarketRegime regime = MarketAnalyzer::detect_regime(
-            bar_history, regime_lookback, config.htf_trending_threshold);
+        // Detect market regime for scoring and entry logic
+        MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
         // Score the zone
         ZoneScore zone_score = scorer.evaluate_zone(zone, regime, current_bar);
 
@@ -2653,14 +2622,19 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
                           << "pts > " << max_sl_dist << "pt cap) — tightening rejected");
                 continue;
             }
-            // FIX RC1: Minimum SL distance guard — blocks post-TRAIL_SL
-            // re-entries where trail ratcheted to within a few pts of entry.
+
+            // FIX RC1: Minimum SL distance guard.
+            // After a TRAIL_SL exit, the re-entry decision inherits a trailing
+            // stop already ratcheted to within a few points of entry price.
+            // Any tick reversal instantly stops it out at near-zero risk/reward.
+            // Reject any entry whose structural SL < min_entry_sl_points.
+            // config.min_entry_sl_points = 0 disables this guard.
             if (config.min_entry_sl_points > 0 && sl_dist < config.min_entry_sl_points) {
                 zones_rejected++;
                 LOG_INFO("Zone#" << zone.zone_id << " SKIPPED: SL too tight ("
                          << std::fixed << std::setprecision(1) << sl_dist
                          << "pts < min " << config.min_entry_sl_points << "pts)"
-                         << " — post-TRAIL_SL re-entry with ratcheted stop");
+                         << " — likely post-TRAIL_SL re-entry with ratcheted stop");
                 continue;
             }
         }
@@ -3527,8 +3501,10 @@ void LiveEngine::manage_position() {
                                   << zone.consecutive_losses << " consecutive SL losses)"
                                   << std::endl;
                     }
-                    // FIX RC2: Persist zone file after consecutive_losses changes
-                    // so the counter survives an engine restart.
+                    // FIX RC2: Persist zone file immediately after consecutive_losses
+                    // changes so the counter survives an engine restart.
+                    // Without this, zone.consecutive_losses resets to 0 on restart
+                    // (RC3 restore only works if the file has the updated count).
                     {
                         fs::path master_file_path = fs::path(zone_persistence_.get_zone_file_path());
                         std::map<std::string, std::string> meta;
@@ -3543,7 +3519,9 @@ void LiveEngine::manage_position() {
                 } else {
                     // TRAIL_SL: only a genuine winner resets the counter.
                     // A losing TRAIL_SL (trail moved past entry, then reversed) is
-                    // still a zone failure — do NOT reset. Parity with V7.
+                    // still a zone failure — do NOT reset.
+                    // SESSION_END: treat as neutral — do not penalise the zone.
+                    // Parity with V7: only reset when pnl > 0.
                     bool is_winner = (exit_reason == "TRAIL_SL" && pnl > 0.0) ||
                                      (exit_reason == "SESSION_END");
                     if (is_winner && zone.consecutive_losses > 0) {
@@ -4359,14 +4337,6 @@ bool LiveEngine::check_bootstrap_validity(const std::map<std::string, std::strin
         LOG_INFO("❌ Validity: force_regenerate=true");
         return false;
     }
-
-    // ⭐ FIX: A cache written at shutdown has no "generated_at" key.
-    // Without a timestamp we cannot enforce TTL — treat as invalid to
-    // force a proper bootstrap regeneration with ZoneInitializer.
-    if (metadata.find("generated_at") == metadata.end()) {
-        LOG_INFO("❌ Validity: no generated_at in metadata (shutdown cache) — regenerating");
-        return false;
-    }
     
     // Check generated_at timestamp (TTL check)
     if (metadata.find("generated_at") != metadata.end()) {
@@ -4678,14 +4648,20 @@ void LiveEngine::run(int duration_minutes) {
                         LOG_DEBUG("🔍 Incremental scan from bar " << scan_start_bar);
                     }
                     
-                    // ⭐ FIX: Pass ALL active_zones to detector for dedup — V7 parity.
-                    // The old periodic_recent filter hid bootstrap zones from the detector,
-                    // allowing new zones to form at identical price levels (cloning).
-                    // Same fix as process_zones() — use full active_zones, no cutoff filter.
-                    LOG_INFO("   Dedup against " << active_zones.size()
-                             << " zones (full list, no cutoff)");
+                    // Same reasoning: restrict dedup to recent zones so old
+                    // bootstrap zones don't suppress live zones at same price.
+                    const int periodic_cutoff = std::max(0,
+                        scan_start_bar - config.lookback_for_zones);
+                    std::vector<Core::Zone> periodic_recent;
+                    periodic_recent.reserve(active_zones.size());
+                    for (const auto& z : active_zones) {
+                        if (z.formation_bar >= periodic_cutoff)
+                            periodic_recent.push_back(z);
+                    }
+                    LOG_INFO("   Dedup against " << periodic_recent.size()
+                             << " recent zones of " << active_zones.size() << " total");
                     std::vector<Core::Zone> new_zones = detector.detect_zones_no_duplicates(
-                        active_zones,
+                        periodic_recent,
                         scan_start_bar
                     );
                     
@@ -4742,40 +4718,6 @@ void LiveEngine::run(int duration_minutes) {
                                 zone.zone_score = scorer.evaluate_zone(zone, regime, bar_history[score_bar_idx]);
                             }
                             zone.zone_id = next_zone_id_++;
-
-                            // ⭐ FIX 8: CONFLICTING ZONE invalidation on periodic add — V7 parity.
-                            // When a new zone is added during live periodic detection,
-                            // mark any existing active zone of the OPPOSITE type at the
-                            // same price level as VIOLATED. Matches process_zones() fix.
-                            {
-                                const double CONFLICT_THRESHOLD = 0.5;
-                                double new_lo = std::min(zone.proximal_line, zone.distal_line);
-                                double new_hi = std::max(zone.proximal_line, zone.distal_line);
-                                for (auto& az : active_zones) {
-                                    if (az.state == ZoneState::VIOLATED) continue;
-                                    if (az.type  == zone.type)           continue;
-                                    double az_lo = std::min(az.proximal_line, az.distal_line);
-                                    double az_hi = std::max(az.proximal_line, az.distal_line);
-                                    double overlap = std::max(0.0,
-                                        std::min(new_hi, az_hi) - std::max(new_lo, az_lo));
-                                    double smaller = std::min(new_hi - new_lo, az_hi - az_lo);
-                                    if (smaller > 0.0 && (overlap / smaller) >= CONFLICT_THRESHOLD) {
-                                        az.state = ZoneState::VIOLATED;
-                                        fire_zone_update(az);
-                                        LOG_INFO("⚡ CONFLICTING ZONE (periodic): new "
-                                            << (zone.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                            << " Z" << zone.zone_id
-                                            << " @ " << zone.distal_line << "-" << zone.proximal_line
-                                            << " conflicts with existing "
-                                            << (az.type == ZoneType::DEMAND ? "DEMAND" : "SUPPLY")
-                                            << " Z" << az.zone_id
-                                            << " @ " << az.distal_line << "-" << az.proximal_line
-                                            << " → marked VIOLATED (overlap="
-                                            << static_cast<int>(overlap / smaller * 100) << "%)");
-                                    }
-                                }
-                            }
-
                             active_zones.push_back(zone);
                             added_count++;
                             
@@ -4917,28 +4859,9 @@ void LiveEngine::stop() {
     {
         auto master_file = zone_persistence_.get_zone_file_path();
         std::map<std::string, std::string> meta;
-        // ⭐ FIX: Write the same metadata keys that check_bootstrap_validity() reads.
-        // Old code wrote saved_at/source/zone_count — none of which are checked.
-        // Now write generated_at/symbol/interval/bar_count so the next startup
-        // can correctly evaluate TTL and decide whether to reuse or regenerate.
-        {
-            auto now_t     = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            std::tm now_tm = {};
-            #ifdef _WIN32
-                localtime_s(&now_tm, &now_t);
-            #else
-                now_tm = *std::localtime(&now_t);
-            #endif
-            std::ostringstream ts;
-            ts << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S");
-            meta["generated_at"] = ts.str();
-        }
-        meta["symbol"]     = trading_symbol;
-        meta["interval"]   = bar_interval;
-        meta["bar_count"]  = std::to_string(bar_history.size());
-        meta["zone_count"] = std::to_string(active_zones.size());
-        meta["ttl_hours"]  = std::to_string(config.zone_bootstrap_ttl_hours);
-        meta["source"]     = "shutdown";
+        meta["saved_at"]    = trading_symbol;
+        meta["zone_count"]  = std::to_string(active_zones.size());
+        meta["source"]      = "shutdown";
         if (zone_persistence_.save_zones_with_metadata(
                 active_zones, next_zone_id_, master_file, meta)) {
             LOG_INFO("✅ Zones saved: " << master_file);

@@ -74,6 +74,9 @@ public:
     // Get the signal_id for a given order_tag (needed for trade insert).
     int64_t get_signal_id_by_tag(const std::string& order_tag);
 
+    // Get the trade id for a given order_tag (needed for equity_curve FK).
+    int64_t get_trade_id_by_tag(const std::string& order_tag);
+
     // ── CSV export (on-demand, backward compatibility) ──────
 
     // Export closed trades for a symbol to CSV string.

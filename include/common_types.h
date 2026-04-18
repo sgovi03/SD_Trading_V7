@@ -940,6 +940,10 @@ public:
     // Root Cause: 81 trades (33%) = ₹268,030 loss (81% of total losses)
     // Impact: Without these 81 trades → +₹241,825 profit!
     double max_loss_per_trade = 1500.0;          // ⭐ NEW: Hard cap at ₹1,500 per trade
+    double min_entry_sl_points = 0.0;            // Reject entries with SL distance < N pts
+                                                  // 0 = disabled. Set to 20 to block
+                                                  // post-TRAIL_SL re-entries with ratcheted
+                                                  // 3pt stop (RC1 drawdown fix)
     // ========== EMA Trend Filter ========== (around line 422-426)
     bool use_ema_trend_filter = false;           // Use EMA trend filter
     int ema_fast_period = 9;                     // EMA fast period

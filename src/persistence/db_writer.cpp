@@ -90,12 +90,18 @@ void DbWriter::on_trade_open(const Events::TradeOpenEvent& evt) {
 
 void DbWriter::on_trade_close(const Events::TradeCloseEvent& evt) {
     conn_.with_transaction([this, &evt]() {
-        trade_repo_.update_trade_close(evt);
+        const bool closed_now = trade_repo_.update_trade_close(evt);
+        if (!closed_now) {
+            LOG_DEBUG("[DbWriter] Trade close ignored (already processed): "
+                      << evt.order_tag);
+            return;
+        }
+
         ++trades_closed_;
 
-        // Update running equity for this symbol
-        // Get the trade_id for the equity curve FK
-        int64_t trade_id = trade_repo_.get_signal_id_by_tag(evt.order_tag);
+        // Update running equity for this symbol.
+        // equity_curve.trade_id references trades(id), not signals(id).
+        int64_t trade_id = trade_repo_.get_trade_id_by_tag(evt.order_tag);
         update_equity(evt.symbol, evt.net_pnl, evt.exit_time, trade_id);
     });
 }

@@ -3,6 +3,7 @@
 // Implements ITradingEngine interface with zone persistence
 // ============================================================
 
+#pragma once   // MSVC belt-and-suspenders guard (prevents C1014 depth=1024)
 #ifndef LIVE_ENGINE_H
 #define LIVE_ENGINE_H
 
@@ -139,6 +140,11 @@ protected:
     // true  = LIVE mode → full trading enabled
     // Flips true on first bar whose source != "HISTORICAL"
     bool historical_mode_;
+
+    // Feed quality diagnostics: late HISTORICAL bars arriving after LIVE activation.
+    int late_historical_drop_count_ = 0;
+    int late_historical_last_summary_bar_ = -1;
+    int late_historical_summary_interval_bars_ = 100;
 
     // Dedup cache for process_zones() — rebuilt only when active_zones changes.
     // Avoids copying active_zones on every bar (was O(n) allocation per tick).
@@ -388,6 +394,32 @@ public:
      * Must be called BEFORE initialize(). Allows zone bootstrap
      * on restart without requiring AFL to replay historical data.
      */
+    // Compute time-of-day normalised volume ratio using the engine's loaded
+    // VolumeBaseline. Returns 1.0 if baseline not loaded.
+    // Called from SymbolContext::push_bar() so every pipe bar gets a valid
+    // norm_volume_ratio before entering bar_history.
+    double compute_norm_volume_ratio(const std::string& datetime,
+                                     double volume) const {
+        if (!volume_baseline_.is_loaded()) return 1.0;
+        return volume_baseline_.get_normalized_ratio(
+            volume_baseline_.extract_time_slot(datetime), volume);
+    }
+
+    // Enrich a vector of bars with norm_volume_ratio from the loaded baseline.
+    void enrich_with_norm_ratios(std::vector<Bar>& bars) const {
+        if (!volume_baseline_.is_loaded()) return;
+        for (auto& b : bars) {
+            b.norm_volume_ratio = volume_baseline_.get_normalized_ratio(
+                volume_baseline_.extract_time_slot(b.datetime), b.volume);
+        }
+    }
+
+    // Enrich bar_history AFTER initialize() has loaded the baseline.
+    // Called by SymbolContext after engine->initialize().
+    void enrich_bar_history_ratios() {
+        enrich_with_norm_ratios(bar_history);
+    }
+
     void preload_bar_history(const std::vector<Bar>& bars) {
         bar_history = bars;
     }

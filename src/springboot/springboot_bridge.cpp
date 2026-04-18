@@ -17,7 +17,22 @@ SpringBootBridge::SpringBootBridge(
     : bus_(bus)
 {
     consumer_       = std::make_unique<SignalConsumer>(cfg.signal, order_cfg, bus);
-    close_listener_ = std::make_unique<TradeCloseListener>(cfg.close_listener, conn, bus);
+
+    // TradeCloseListener runs on its own polling thread. It must not share the
+    // write connection used by DbWriter/EventBus worker when SQLite is opened
+    // with NOMUTEX. Use a dedicated read-only connection for this thread.
+    try {
+        close_conn_ = Persistence::SqliteConnectionFactory::create_read_connection();
+    } catch (const std::exception& e) {
+        LOG_WARN("[SpringBootBridge] Failed to create dedicated read connection"
+                 << " for TradeCloseListener: " << e.what()
+                 << " -- falling back to shared connection");
+    }
+
+    close_listener_ = std::make_unique<TradeCloseListener>(
+        cfg.close_listener,
+        close_conn_ ? *close_conn_ : conn,
+        bus);
     LOG_INFO("[SpringBootBridge] Created.");
 }
 

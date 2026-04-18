@@ -30,6 +30,7 @@ private:
     static bool parse_section_scoring(const std::string& key, const std::string& value, Config& config);
     static bool parse_section_indicators_and_entry(const std::string& key, const std::string& value, Config& config);
     static bool parse_section_trade_and_runtime(const std::string& key, const std::string& value, Config& config);
+    static bool parse_section_trade_and_runtime_extended(const std::string& key, const std::string& value, Config& config);
     static std::string trim(const std::string& str);
     static bool parse_bool(const std::string& value);
     static std::vector<std::string> get_validation_errors(const Config& config);

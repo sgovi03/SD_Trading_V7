@@ -1,4 +1,5 @@
 #include "zone_scorer.h"
+#include <algorithm>  // std::max
 #include "../utils/logger.h"
 
 namespace SDTrading {
@@ -159,16 +160,16 @@ ZoneScore ZoneScorer::evaluate_zone(const Zone& zone, MarketRegime regime, const
     score.state_freshness_score = calculate_state_freshness_score(zone);
     score.rejection_confirmation_score = calculate_rejection_score(zone, current_bar);
     
-    // === BUG #152 FIX: ADD VOLUME AND INSTITUTIONAL SCORES ===
-    // Volume profile contribution (max 25 points) 
-	/*
+    // Volume profile contribution (max 25 points)
+    // volume_score range is [-30, 60] — normalise to [0,1] before weighting
     double volume_max = config.scoring.weight_volume_profile * 100.0;
-    score.volume_profile_score = (zone.volume_profile.volume_score / 100.0) * volume_max;
-    
+    double vol_normalised = std::max(0.0,
+        (zone.volume_profile.volume_score + 30.0) / 90.0);
+    score.volume_profile_score = vol_normalised * volume_max;
+
     // Institutional participation contribution (max 15 points)
     double inst_max = config.scoring.weight_institutional * 100.0;
     score.institutional_score = (zone.institutional_index / 100.0) * inst_max;
-    */
     // Calculate composite score (calls method defined in common_types.h)
     //score.calculate_composite();
     score.calculate_composite();

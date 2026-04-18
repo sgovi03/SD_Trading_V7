@@ -15,7 +15,7 @@ MARKET_OPEN_TN  = 91500;
 MARKET_CLOSE_TN = 152500;
 
 // State file directory — adjust if your project root differs
-STATE_DIR = "D:\\SD_System\\SD_Volume_OI\\Scanner\\SD_Trading_V7\\data";
+STATE_DIR = "D:\\SD_System\\SD_Volume_OI\\Scanner\\SD_Trading_V8\\data";
 
 function GetIST8601(bar_idx) {
     dn_arr = DateNum();

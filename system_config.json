@@ -5,7 +5,7 @@
   "system": {
     "root_directory": "D:/SD_System/SD_Volume_OI/Scanner/SD_Trading_V8",
     "environment": "PRODUCTION",
-    "log_level": "INFO"
+    "log_level": "ERROR"
   },
   
   "directories": {
@@ -78,7 +78,7 @@
       "backup_count": 5
     },
     "cpp": {
-      "level": "INFO",
+      "level": "ERROR",
       "file": "logs/sd_engine.log",
       "max_size_mb": 10
     }
@@ -161,7 +161,7 @@
   
   "order_submitter": {
     "enabled": false,              
-    "base_url": "http://localhost:8080/trade",
+    "base_url": "http://localhost:8086/trade",
     "long_strategy_number": 13,
     "short_strategy_number": 14,
     "timeout_seconds": 10

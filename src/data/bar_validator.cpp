@@ -22,6 +22,7 @@ BarValidator::BarValidator(const std::string& symbol,
     : symbol_(symbol), cfg_(cfg) {
     LOG_INFO("[BarValidator:" << symbol_ << "] Initialized.");
     LOG_INFO("[BarValidator:" << symbol_ << "]"
+             << "  tier1=" << (cfg_.tier1_structural_enabled ? "ON" : "OFF")
              << "  max_gap_pct=" << cfg_.max_gap_pct
              << "  atr_spike=" << cfg_.atr_spike_multiplier
              << "  vol_spike=" << cfg_.max_volume_spike_mult
@@ -34,21 +35,23 @@ BarValidator::BarValidator(const std::string& symbol,
 
 ValidationResult BarValidator::validate(const RawBar& bar) {
     // Tier 1 — structural (fast, no state needed)
-    auto t1 = check_tier1_structural(bar);
-    if (!t1.passed) {
-        ++bars_rejected_;
-        ++consecutive_rejects_;
-        if (is_alert_threshold_hit()) {
-            LOG_WARN("[BarValidator:" << symbol_ << "] "
-                     << consecutive_rejects_ << " consecutive rejections! "
-                     << "Last reason: " << t1.reason);
+    if (cfg_.tier1_structural_enabled) {
+        auto t1 = check_tier1_structural(bar);
+        if (!t1.passed) {
+            ++bars_rejected_;
+            ++consecutive_rejects_;
+            if (is_alert_threshold_hit()) {
+                LOG_WARN("[BarValidator:" << symbol_ << "] "
+                         << consecutive_rejects_ << " consecutive rejections! "
+                         << "Last reason: " << t1.reason);
+            }
+            return t1;
         }
-        return t1;
     }
 
     // Enabled check: when bar_validation_enabled=NO in config, tier-2 and tier-3
-    // are bypassed entirely. Tier-1 above always runs because structurally broken
-    // bars (H<L, C outside range) would corrupt zone geometry regardless.
+    // are bypassed entirely. Tier-1 is controlled separately via
+    // bar_validation_tier1_structural_enabled.
     if (!cfg_.enabled) {
         update_state(bar);
         ++bars_validated_;

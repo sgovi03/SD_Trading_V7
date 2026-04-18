@@ -143,6 +143,18 @@ int64_t SqliteTradeRepository::get_signal_id_by_tag(const std::string& order_tag
     return -1;
 }
 
+int64_t SqliteTradeRepository::get_trade_id_by_tag(const std::string& order_tag) {
+    try {
+        auto stmt = conn_.prepare(
+            "SELECT id FROM trades WHERE order_tag=? LIMIT 1");
+        stmt.bind_text(1, order_tag);
+        if (stmt.step()) return stmt.column_int64(0);
+    } catch (const SqliteException& e) {
+        LOG_ERROR("[SqliteTradeRepo] get_trade_id_by_tag failed: " << e.what());
+    }
+    return -1;
+}
+
 // ============================================================
 // insert_trade_open
 // ============================================================
@@ -196,7 +208,8 @@ bool SqliteTradeRepository::update_trade_close(const Events::TradeCloseEvent& ev
         "  gross_pnl=?, brokerage=?, net_pnl=?,"
         "  bars_in_trade=?, trade_status='CLOSED',"
         "  updated_at=datetime('now','localtime')"
-        " WHERE order_tag=?";
+        " WHERE order_tag=?"
+        "   AND trade_status!='CLOSED'";
 
     try {
         auto stmt = conn_.prepare(SQL);
@@ -213,8 +226,8 @@ bool SqliteTradeRepository::update_trade_close(const Events::TradeCloseEvent& ev
         int rows = stmt.execute();
 
         if (rows == 0) {
-            LOG_WARN("[SqliteTradeRepo] update_trade_close: no row for tag="
-                     << evt.order_tag);
+            LOG_INFO("[SqliteTradeRepo] update_trade_close: skipped"
+                     << " (already closed or missing) tag=" << evt.order_tag);
         } else {
             LOG_INFO("[SqliteTradeRepo] Trade closed: " << evt.order_tag
                      << " pnl=" << evt.net_pnl
@@ -251,7 +264,11 @@ bool SqliteTradeRepository::append_equity_point(const std::string& symbol,
         stmt.bind_double(4, peak_equity);
         stmt.bind_double(5, drawdown);
         stmt.bind_double(6, drawdown_pct);
-        stmt.bind_int64(7,  trade_id);
+        if (trade_id > 0) {
+            stmt.bind_int64(7, trade_id);
+        } else {
+            stmt.bind_null(7);
+        }
         stmt.execute();
         return true;
     } catch (const SqliteException& e) {

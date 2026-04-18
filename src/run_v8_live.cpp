@@ -342,6 +342,8 @@ int main(int argc, char* argv[]) {
 
                     if      (k == "bar_validation_enabled")
                         val_cfg.enabled               = is_yes(v);
+                    else if (k == "bar_validation_tier1_structural_enabled")
+                        val_cfg.tier1_structural_enabled = is_yes(v);
                     else if (k == "bar_validation_max_gap_pct")
                         val_cfg.max_gap_pct           = std::stod(v);
                     else if (k == "bar_validation_atr_spike")
@@ -361,10 +363,14 @@ int main(int argc, char* argv[]) {
                          << " — using built-in bar validation defaults");
             }
 
-            if (!val_cfg.enabled) {
-                LOG_INFO("[V8] Bar validation: DISABLED (tier-2/3 bypassed, tier-1 structural always active)");
+            if (!val_cfg.enabled && !val_cfg.tier1_structural_enabled) {
+                LOG_INFO("[V8] Bar validation: FULLY DISABLED (tier-1/2/3 bypassed)");
+            } else if (!val_cfg.enabled) {
+                LOG_INFO("[V8] Bar validation: PARTIAL (tier-2/3 bypassed, tier-1="
+                         << (val_cfg.tier1_structural_enabled ? "ON" : "OFF") << ")");
             } else {
                 LOG_INFO("[V8] Bar validation: ENABLED"
+                         << " tier1=" << (val_cfg.tier1_structural_enabled ? "ON" : "OFF")
                          << " gap=" << val_cfg.max_gap_pct << "%"
                          << " atr=" << val_cfg.atr_spike_multiplier << "x"
                          << " vol=" << val_cfg.max_volume_spike_mult << "x"
