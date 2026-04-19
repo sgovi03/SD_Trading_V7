@@ -5,7 +5,7 @@
   "system": {
     "root_directory": "D:/SD_System/SD_Volume_OI/Scanner/SD_Trading_V8",
     "environment": "PRODUCTION",
-    "log_level": "ERROR"
+    "log_level": "INFO"
   },
   
   "directories": {

@@ -120,86 +120,63 @@ double PerformanceTracker::calculate_max_drawdown() const {
 double PerformanceTracker::calculate_sharpe_ratio() const {
     if (all_trades.size() < 2) return 0.0;
 
-    // ⭐ FIX ISSUE-1: Sharpe now computed on R-multiples (pnl / risk_amount)
-    // rather than on return_pct (pnl / total_capital).
+    // ⭐ SHARPE FIX: Use daily equity returns, annualised with sqrt(252).
     //
-    // Previous bug: using trade.return_pct = pnl/capital produced values like
-    // 0.055 (5.5%) per trade — tiny magnitudes where floating-point noise in
-    // the mean could flip the sign of the Sharpe ratio between runs.
-    // Annualising with sqrt(trades_per_year) further amplified the instability,
-    // giving values like -0.668 even when the strategy was clearly profitable.
+    // Previous implementation used R-multiples (pnl/risk_amount) per trade.
+    // That is incorrect here because:
+    //   1. Winners typically exit via TRAIL_SL at <1R; losers exit at full -1R.
+    //      Mean R is therefore systematically negative even in profitable strategies,
+    //      making R-multiple Sharpe unreliable as a strategy quality metric.
+    //   2. Date parsing used "%Y-%m-%d %H:%M:%S" but trade dates are ISO 8601
+    //      format ("2025-09-03T12:15:00+05:30"), so std::get_time always failed,
+    //      and trades_per_year always fell back to sqrt(52) — wrong annualisation.
     //
-    // R-multiple = pnl / risk_amount is the correct unit for trading Sharpe:
-    //   - Scale-invariant (same value regardless of position size or capital)
-    //   - Directly interpretable: mean R / stddev R
-    //   - Standard in institutional trading performance reporting
-    //   - Positive when strategy earns more than 1R on average winners vs losers
-    //
-    // Annualisation: scale by sqrt(trades_per_year) using actual date range.
-    // Falls back to sqrt(52) (weekly frequency) if date parsing fails.
-    // Risk-free rate = 0 (appropriate for futures day-trading).
+    // Correct approach: build a daily P&L series, compute daily return as
+    //   r_day = daily_pnl / equity_at_start_of_day
+    // then annualise: Sharpe = mean(r_daily) / std(r_daily) * sqrt(252).
+    // Risk-free rate = 0 (appropriate for Indian futures intraday simulation).
 
-    std::vector<double> r_multiples;
-    r_multiples.reserve(all_trades.size());
-
+    // Accumulate daily P&L by exit date (trades close on exit date)
+    std::map<std::string, double> daily_pnl;
     for (const auto& trade : all_trades) {
-        if (trade.risk_amount > 0.01) {
-            // Normal trade: R = actual P&L / risk staked
-            r_multiples.push_back(trade.pnl / trade.risk_amount);
-        } else if (trade.reward_amount > 0.01) {
-            // Fallback: use reward_amount as denominator if risk_amount is zero
-            // (can happen when stop_distance rounds to zero at breakeven)
-            r_multiples.push_back(trade.pnl / trade.reward_amount);
-        } else {
-            // Last resort: normalise by starting_capital so at least the
-            // trade contributes a sensible relative weight
-            double denom = (starting_capital > 0.01) ? starting_capital : 1.0;
-            r_multiples.push_back(trade.pnl / denom);
-        }
+        // exit_date is ISO 8601: "2025-09-03T12:15:00+05:30" — take first 10 chars
+        std::string date = trade.exit_date.substr(0, 10);
+        daily_pnl[date] += trade.pnl;
     }
 
-    if (r_multiples.size() < 2) return 0.0;
+    if (daily_pnl.size() < 2) return 0.0;
 
-    // Mean R
+    // Build daily return series
+    std::vector<double> daily_returns;
+    daily_returns.reserve(daily_pnl.size());
+    double running_capital = (starting_capital > 0.01) ? starting_capital : 300000.0;
+
+    for (const auto& kv : daily_pnl) {   // map is sorted by date string
+        double ret = kv.second / running_capital;
+        daily_returns.push_back(ret);
+        running_capital += kv.second;
+    }
+
+    if (daily_returns.size() < 2) return 0.0;
+
+    // Mean daily return
     double mean_r = 0.0;
-    for (double r : r_multiples) mean_r += r;
-    mean_r /= static_cast<double>(r_multiples.size());
+    for (double r : daily_returns) mean_r += r;
+    mean_r /= static_cast<double>(daily_returns.size());
 
-    // Sample standard deviation of R
+    // Sample standard deviation
     double variance = 0.0;
-    for (double r : r_multiples) {
+    for (double r : daily_returns) {
         double diff = r - mean_r;
         variance += diff * diff;
     }
-    variance /= static_cast<double>(r_multiples.size() - 1);
+    variance /= static_cast<double>(daily_returns.size() - 1);
     double std_dev = std::sqrt(variance);
 
-    // Per-trade Sharpe (risk-free rate = 0)
-    double sharpe_per_trade = (std_dev > 0.00001) ? (mean_r / std_dev) : 0.0;
+    if (std_dev < 0.00001) return 0.0;
 
-    // Annualise using actual calendar duration of the backtest
-    std::string start_date = all_trades.front().entry_date;
-    std::string end_date   = all_trades.back().exit_date;
-
-    std::tm tm_start = {};
-    std::tm tm_end   = {};
-    std::istringstream ss_start(start_date);
-    std::istringstream ss_end(end_date);
-    ss_start >> std::get_time(&tm_start, "%Y-%m-%d %H:%M:%S");
-    ss_end   >> std::get_time(&tm_end,   "%Y-%m-%d %H:%M:%S");
-
-    double trades_per_year = 52.0;  // default: ~weekly frequency
-    if (!ss_start.fail() && !ss_end.fail()) {
-        std::time_t time_start = std::mktime(&tm_start);
-        std::time_t time_end   = std::mktime(&tm_end);
-        double seconds = std::difftime(time_end, time_start);
-        double years   = seconds / (365.25 * 24.0 * 3600.0);
-        if (years > 0.01) {
-            trades_per_year = static_cast<double>(all_trades.size()) / years;
-        }
-    }
-
-    return sharpe_per_trade * std::sqrt(trades_per_year);
+    // Annualised Sharpe = (mean_daily / std_daily) * sqrt(252)
+    return (mean_r / std_dev) * std::sqrt(252.0);
 }
 
 PerformanceMetrics PerformanceTracker::calculate_metrics() const {

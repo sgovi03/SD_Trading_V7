@@ -1011,6 +1011,31 @@ public:
     double rsi_hard_block_high          = 72.0;   // Block entry if RSI > this (overbought extreme)
     double rsi_hard_block_low           = 28.0;   // Block entry if RSI < this (oversold extreme)
 
+    // MACD Histogram momentum filter — direction-aware.
+    // LONG  rejected when MACD Histogram < -macd_histogram_threshold (momentum against long).
+    // SHORT rejected when MACD Histogram > +macd_histogram_threshold (momentum against short).
+    bool   enable_macd_histogram_filter  = false;  // Master toggle
+    double macd_histogram_threshold      = 15.0;   // Symmetric threshold (default ±15)
+
+    // Second configurable time block (e.g., midday chop zone 11:00–12:00).
+    // Independent of entry_block_start/end_time so both can be active together.
+    bool   enable_entry_block2           = false;
+    std::string entry_block2_start_time  = "";  // HH:MM
+    std::string entry_block2_end_time    = "";  // HH:MM
+
+    // Zone quality cap — reject zones scoring ABOVE this threshold.
+    // Validated: BankNifty score 30-39 outperforms 40+ (55% WR vs 33%).
+    // High scores attract obvious retail levels that institutions sweep.
+    // Set to 0 (default) to disable.
+    double zone_quality_maximum_score    = 0.0;  // 0 = disabled
+
+    // Standalone Bollinger Bandwidth range filter.
+    // Validated: BankNifty sweet spot is BB [0.60–1.00).
+    // Below 0.60 = compression/chop, above 1.00 = overextended momentum.
+    bool   enable_bb_bandwidth_filter    = false;
+    double bb_bandwidth_min              = 0.60;  // Reject if BB < this
+    double bb_bandwidth_max              = 1.00;  // Reject if BB >= this
+
     // Priority 2c: Freshness + BB Bandwidth compound block (Regime Filter 3)
     // Validated on 81 live trades (Sep 2025–Mar 2026):
     //   FP=20%, net save +₹1,48,048, WR lifts 56.8% → 68.9%, PF 1.69 → 2.55.

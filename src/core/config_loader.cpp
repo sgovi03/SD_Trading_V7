@@ -879,6 +879,24 @@ bool ConfigLoader::parse_section_trade_and_runtime_extended(const std::string& k
             config.zone_bootstrap_ttl_hours = std::stoi(value);
         } else if (key == "zone_bootstrap_refresh_time") {
             config.zone_bootstrap_refresh_time = value;
+        } else if (key == "enable_macd_histogram_filter") {
+            config.enable_macd_histogram_filter = parse_bool(value);
+        } else if (key == "macd_histogram_threshold") {
+            config.macd_histogram_threshold = std::stod(value);
+        } else if (key == "enable_entry_block2") {
+            config.enable_entry_block2 = parse_bool(value);
+        } else if (key == "entry_block2_start_time") {
+            config.entry_block2_start_time = value;
+        } else if (key == "entry_block2_end_time") {
+            config.entry_block2_end_time = value;
+        } else if (key == "zone_quality_maximum_score") {
+            config.zone_quality_maximum_score = std::stod(value);
+        } else if (key == "enable_bb_bandwidth_filter") {
+            config.enable_bb_bandwidth_filter = parse_bool(value);
+        } else if (key == "bb_bandwidth_min") {
+            config.bb_bandwidth_min = std::stod(value);
+        } else if (key == "bb_bandwidth_max") {
+            config.bb_bandwidth_max = std::stod(value);
         } else {
             return false;
         }

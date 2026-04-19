@@ -339,6 +339,9 @@ std::set<std::string> ConfigCascadeResolver::apply_file_overlay(
         {"enable_entry_time_block",      [](const Config& s, Config& d){ d.enable_entry_time_block = s.enable_entry_time_block; }},
         {"entry_block_start_time",       [](const Config& s, Config& d){ d.entry_block_start_time = s.entry_block_start_time; }},
         {"entry_block_end_time",         [](const Config& s, Config& d){ d.entry_block_end_time = s.entry_block_end_time; }},
+        {"enable_entry_block2",          [](const Config& s, Config& d){ d.enable_entry_block2 = s.enable_entry_block2; }},
+        {"entry_block2_start_time",      [](const Config& s, Config& d){ d.entry_block2_start_time = s.entry_block2_start_time; }},
+        {"entry_block2_end_time",        [](const Config& s, Config& d){ d.entry_block2_end_time = s.entry_block2_end_time; }},
 
         // ---- HTF Regime ----
         {"use_htf_regime_filter",        [](const Config& s, Config& d){ d.use_htf_regime_filter = s.use_htf_regime_filter; }},
@@ -450,10 +453,16 @@ std::set<std::string> ConfigCascadeResolver::apply_file_overlay(
         {"rsi_period",                   [](const Config& s, Config& d){ d.rsi_period = s.rsi_period; }},
         {"bb_period",                    [](const Config& s, Config& d){ d.bb_period = s.bb_period; }},
         {"bb_stddev",                    [](const Config& s, Config& d){ d.bb_stddev = s.bb_stddev; }},
+        {"enable_bb_bandwidth_filter",   [](const Config& s, Config& d){ d.enable_bb_bandwidth_filter = s.enable_bb_bandwidth_filter; }},
+        {"bb_bandwidth_min",             [](const Config& s, Config& d){ d.bb_bandwidth_min = s.bb_bandwidth_min; }},
+        {"bb_bandwidth_max",             [](const Config& s, Config& d){ d.bb_bandwidth_max = s.bb_bandwidth_max; }},
         {"adx_period",                   [](const Config& s, Config& d){ d.adx_period = s.adx_period; }},
         {"macd_fast_period",             [](const Config& s, Config& d){ d.macd_fast_period = s.macd_fast_period; }},
         {"macd_slow_period",             [](const Config& s, Config& d){ d.macd_slow_period = s.macd_slow_period; }},
         {"macd_signal_period",           [](const Config& s, Config& d){ d.macd_signal_period = s.macd_signal_period; }},
+        {"enable_macd_histogram_filter", [](const Config& s, Config& d){ d.enable_macd_histogram_filter = s.enable_macd_histogram_filter; }},
+        {"macd_histogram_threshold",     [](const Config& s, Config& d){ d.macd_histogram_threshold = s.macd_histogram_threshold; }},
+        {"zone_quality_maximum_score",   [](const Config& s, Config& d){ d.zone_quality_maximum_score = s.zone_quality_maximum_score; }},
 
         // ---- Logging & Debug ----
         {"enable_debug_logging",         [](const Config& s, Config& d){ d.enable_debug_logging = s.enable_debug_logging; }},
@@ -700,6 +709,9 @@ std::vector<std::string> ConfigCascadeResolver::compare_configs(
     // Session
     CMP_FIELD(close_eod);
     CMP_FIELD(session_end_time);
+    CMP_FIELD(enable_entry_block2);
+    CMP_FIELD(entry_block2_start_time);
+    CMP_FIELD(entry_block2_end_time);
 
     // V6.0
     CMP_FIELD(enable_volume_entry_filters);
@@ -720,6 +732,14 @@ std::vector<std::string> ConfigCascadeResolver::compare_configs(
     CMP_DOUBLE(base_score_weight);
     CMP_DOUBLE(volume_score_weight);
     CMP_DOUBLE(oi_score_weight);
+    CMP_DOUBLE(zone_quality_maximum_score);
+
+    // Extra Entry Filters
+    CMP_FIELD(enable_macd_histogram_filter);
+    CMP_DOUBLE(macd_histogram_threshold);
+    CMP_FIELD(enable_bb_bandwidth_filter);
+    CMP_DOUBLE(bb_bandwidth_min);
+    CMP_DOUBLE(bb_bandwidth_max);
 
     #undef CMP_FIELD
     #undef CMP_DOUBLE
@@ -770,6 +790,9 @@ std::string ConfigCascadeResolver::serialize_config_to_json(const Config& c) {
     ss << "  \"max_loss_per_trade\": "            << c.max_loss_per_trade            << ",\n";
     ss << "  \"close_eod\": "                     << (c.close_eod ? 1 : 0)           << ",\n";
     ss << "  \"session_end_time\": \""            << c.session_end_time              << "\",\n";
+    ss << "  \"enable_entry_block2\": "          << (c.enable_entry_block2 ? 1 : 0)      << ",\n";
+    ss << "  \"entry_block2_start_time\": \""    << c.entry_block2_start_time         << "\",\n";
+    ss << "  \"entry_block2_end_time\": \""      << c.entry_block2_end_time           << "\",\n";
     ss << "  \"enable_volume_entry_filters\": "   << (c.enable_volume_entry_filters ? 1 : 0) << ",\n";
     ss << "  \"enable_oi_entry_filters\": "       << (c.enable_oi_entry_filters ? 1 : 0)     << ",\n";
     ss << "  \"enable_volume_exit_signals\": "    << (c.enable_volume_exit_signals ? 1 : 0)  << ",\n";
@@ -778,6 +801,12 @@ std::string ConfigCascadeResolver::serialize_config_to_json(const Config& c) {
     ss << "  \"use_relaxed_live_detection\": "    << (c.use_relaxed_live_detection ? 1 : 0)  << ",\n";
     ss << "  \"live_min_zone_width_atr\": "       << c.live_min_zone_width_atr       << ",\n";
     ss << "  \"live_min_zone_strength\": "        << c.live_min_zone_strength        << ",\n";
+    ss << "  \"enable_bb_bandwidth_filter\": "   << (c.enable_bb_bandwidth_filter ? 1 : 0) << ",\n";
+    ss << "  \"bb_bandwidth_min\": "             << c.bb_bandwidth_min             << ",\n";
+    ss << "  \"bb_bandwidth_max\": "             << c.bb_bandwidth_max             << ",\n";
+    ss << "  \"enable_macd_histogram_filter\": " << (c.enable_macd_histogram_filter ? 1 : 0) << ",\n";
+    ss << "  \"macd_histogram_threshold\": "     << c.macd_histogram_threshold     << ",\n";
+    ss << "  \"zone_quality_maximum_score\": "   << c.zone_quality_maximum_score   << ",\n";
     ss << "  \"base_score_weight\": "             << c.base_score_weight             << ",\n";
     ss << "  \"volume_score_weight\": "           << c.volume_score_weight           << ",\n";
     ss << "  \"oi_score_weight\": "               << c.oi_score_weight               << "\n";

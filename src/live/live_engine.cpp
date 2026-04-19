@@ -1765,26 +1765,31 @@ void LiveEngine::process_zones() {
             continue;  // Skip zones from already-scanned bars
         }
         
-        // Dedup against BOTH active AND inactive zones.
-        // Zones filtered to inactive are re-detected each scan → duplicates.
+        // Dedup against BOTH active AND inactive zones using PRICE-LEVEL overlap.
+        // Previously used exact formation_bar match, which failed after merge_into_existing_zone
+        // updated formation_bar — causing the same zone to be added repeatedly as "new".
+        // Fix: match by price range overlap (same as find_existing_zone_at_level) so that
+        // a zone already represented at that price level is correctly identified as duplicate
+        // regardless of whether its formation_bar changed due to a prior merge.
         bool already_active = false;
         auto zone_exists_in = [&](const std::vector<Zone>& pool) -> bool {
+            double cand_lo = std::min(zone.proximal_line, zone.distal_line);
+            double cand_hi = std::max(zone.proximal_line, zone.distal_line);
             for (const auto& z : pool) {
-                if (zone.type          == z.type          &&
-                    zone.formation_bar == z.formation_bar &&
-                    std::abs(zone.proximal_line - z.proximal_line) < 1.0 &&
-                    std::abs(zone.distal_line   - z.distal_line)   < 1.0) {
-                    return true;
-                }
+                if (z.type != zone.type) continue;
+                double z_lo = std::min(z.proximal_line, z.distal_line);
+                double z_hi = std::max(z.proximal_line, z.distal_line);
+                // Overlap: ranges intersect
+                if (cand_hi >= z_lo && cand_lo <= z_hi) return true;
             }
             return false;
         };
         already_active = zone_exists_in(active_zones) ||
                          zone_exists_in(inactive_zones);
         if (already_active) {
-            LOG_DEBUG("process_zones: zone at bar " << zone.formation_bar
+            LOG_INFO("[DEDUP] process_zones: zone at bar " << zone.formation_bar
                      << " [" << zone.distal_line << "-" << zone.proximal_line
-                     << "] exists in active/inactive — skipping duplicate");
+                     << "] price-overlap match — skipping duplicate");
         }
         
         if (!already_active) {
@@ -2530,6 +2535,111 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             }
         }
 
+        // ⭐ MACD Histogram momentum filter — REGIME FILTER 3.
+        // Rejects entries where short-term momentum (MACD histogram) is working
+        // directly against the zone direction.
+        //   LONG  trade rejected if histogram < -threshold  (bearish momentum dominates)
+        //   SHORT trade rejected if histogram > +threshold  (bullish momentum dominates)
+        // Threshold ±15 validated on 124 NIFTY trades: turns −₹60,467 → +₹21,645.
+        // Eliminates 62 trades (35.5% WR, 28 SL) while keeping 62 (40.3% WR, 15 SL).
+        // ±10 gives max P&L (+₹84,691); ±15 preferred for better trade frequency.
+        if (config.enable_macd_histogram_filter) {
+            auto macd_vals = MarketAnalyzer::calculate_macd(
+                bar_history,
+                config.macd_fast_period,
+                config.macd_slow_period,
+                config.macd_signal_period,
+                current_index);
+            double hist = macd_vals.histogram;
+            if (direction == "LONG" && hist < -config.macd_histogram_threshold) {
+                zones_rejected++;
+                LOG_INFO("[NO] Zone " << zone.zone_id
+                         << ": MACD histogram block (LONG, hist="
+                         << std::fixed << std::setprecision(2) << hist
+                         << " < -" << config.macd_histogram_threshold << ")");
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": MACD histogram block LONG hist="
+                          << std::fixed << std::setprecision(2) << hist << "\n";
+                continue;
+            }
+            if (direction == "SHORT" && hist > config.macd_histogram_threshold) {
+                zones_rejected++;
+                LOG_INFO("[NO] Zone " << zone.zone_id
+                         << ": MACD histogram block (SHORT, hist="
+                         << std::fixed << std::setprecision(2) << hist
+                         << " > +" << config.macd_histogram_threshold << ")");
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": MACD histogram block SHORT hist="
+                          << std::fixed << std::setprecision(2) << hist << "\n";
+                continue;
+            }
+        } else {
+			std::cout << "  config.enable_macd_histogram_filter : " << config.enable_macd_histogram_filter << "\n";
+		}
+
+        // ⭐ FILTER: Second configurable time block (e.g., 11:00–12:00 midday chop).
+        // Validated on BankNifty: 11AM hour WR=25.9%, 20L/7W, P&L=−₹247k.
+        // Also confirmed on NIFTY: 11AM WR=25.9%, P&L=−₹86k.
+        // Uses same HH:MM string comparison as the primary entry_block.
+        if (config.enable_entry_block2 &&
+            !config.entry_block2_start_time.empty() &&
+            !config.entry_block2_end_time.empty()) {
+            std::string hhmm2 = current_bar.datetime.substr(11, 5);
+            if (hhmm2 >= config.entry_block2_start_time &&
+                hhmm2 <  config.entry_block2_end_time) {
+                zones_rejected++;
+                LOG_INFO("[NO] Zone " << zone.zone_id
+                         << ": secondary time block ("
+                         << hhmm2 << " in "
+                         << config.entry_block2_start_time << "-"
+                         << config.entry_block2_end_time << ")");
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": midday time block (" << hhmm2 << ")\n";
+                continue;
+            }
+        }
+
+        // ⭐ FILTER: Zone quality cap — reject zones scoring ABOVE maximum.
+        // Validated on BankNifty: score 30-39 WR=54%, score 40+ WR≤33%.
+        // High scores correlate with obvious retail levels swept by institutions.
+        // Only active when zone_quality_maximum_score > 0.
+        if (config.zone_quality_maximum_score > 0.0) {
+            double raw_score = zone.zone_score.total_score;
+            if (raw_score > config.zone_quality_maximum_score) {
+                zones_rejected++;
+                LOG_INFO("[NO] Zone " << zone.zone_id
+                         << ": score cap (score="
+                         << std::fixed << std::setprecision(1) << raw_score
+                         << " > max=" << config.zone_quality_maximum_score << ")");
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": score cap (score=" << std::fixed
+                          << std::setprecision(1) << raw_score << ")\n";
+                continue;
+            }
+        }
+
+        // ⭐ FILTER: Bollinger Bandwidth range filter.
+        // Validated on BankNifty: BB [0.60–1.00) = +₹87,760 vs BB<0.60 = −₹94,553.
+        // Below min = compression/chop, above max = overextended (no room to run).
+        // Uses same calculate_bollinger_bands call pattern as freshness_bb_block.
+        if (config.enable_bb_bandwidth_filter) {
+            auto bb_vals = MarketAnalyzer::calculate_bollinger_bands(
+                bar_history, config.bb_period, config.bb_stddev, current_index);
+            double bw = bb_vals.bandwidth;
+            if (bw < config.bb_bandwidth_min || bw >= config.bb_bandwidth_max) {
+                zones_rejected++;
+                LOG_INFO("[NO] Zone " << zone.zone_id
+                         << ": BB bandwidth out of range (BB_BW="
+                         << std::fixed << std::setprecision(3) << bw
+                         << ", required ["
+                         << config.bb_bandwidth_min << ", "
+                         << config.bb_bandwidth_max << "))");
+                std::cout << "  [NO] Zone " << zone.zone_id
+                          << ": BB bandwidth block (BB_BW="
+                          << std::fixed << std::setprecision(3) << bw << ")\n";
+                continue;
+            }
+        }
 
         // ⭐ FIX 9: Use config params for regime detection — parity with V7.
         // V7 uses htf_lookback_bars and htf_trending_threshold.
@@ -4712,25 +4822,27 @@ void LiveEngine::run(int duration_minutes) {
                             // Fix: mirror the same boundary+formation_bar check that
                             // process_zones() uses before accepting a zone.
                             // Dedup against active AND inactive zones.
+                            // Dedup by price-level overlap — same fix as process_zones.
+                            // Exact formation_bar match failed after merge updated formation_bar.
                             bool already_active = false;
                             auto periodic_zone_exists = [&](const std::vector<Zone>& pool) -> bool {
+                                double cand_lo = std::min(zone.proximal_line, zone.distal_line);
+                                double cand_hi = std::max(zone.proximal_line, zone.distal_line);
                                 for (const auto& z : pool) {
-                                    if (zone.type          == z.type          &&
-                                        zone.formation_bar == z.formation_bar &&
-                                        std::abs(zone.proximal_line - z.proximal_line) < 1.0 &&
-                                        std::abs(zone.distal_line   - z.distal_line)   < 1.0) {
-                                        return true;
-                                    }
+                                    if (z.type != zone.type) continue;
+                                    double z_lo = std::min(z.proximal_line, z.distal_line);
+                                    double z_hi = std::max(z.proximal_line, z.distal_line);
+                                    if (cand_hi >= z_lo && cand_lo <= z_hi) return true;
                                 }
                                 return false;
                             };
                             already_active = periodic_zone_exists(active_zones) ||
                                              periodic_zone_exists(inactive_zones);
                             if (already_active) {
-                                LOG_DEBUG("Periodic: zone at bar " << zone.formation_bar
+                                LOG_INFO("[DEDUP] Periodic: zone bar=" << zone.formation_bar
                                          << " [" << zone.distal_line << "-"
                                          << zone.proximal_line
-                                         << "] already exists — skipping");
+                                         << "] price-overlap match — skipping");
                             }
                             if (already_active) continue;
 
@@ -4822,8 +4934,11 @@ void LiveEngine::run(int duration_minutes) {
                             }
                         }
 
-                        LOG_INFO("✅ Zone detection complete: " << new_zones.size()
-                                << " detected, " << added_count << " added");
+                        int secondary_skipped = static_cast<int>(new_zones.size()) - added_count;
+                        LOG_INFO("✅ Zone scan: detector=" << new_zones.size()
+                                << " secondary_skipped=" << secondary_skipped
+                                << " added=" << added_count
+                                << " total_active=" << active_zones.size());
                     } else {
                         // ⭐ DIAGNOSTIC LOGGING: Why no zones?
                         LOG_INFO("❌ No new zones detected in last " << bars_since_detection << " bars");
@@ -5078,21 +5193,21 @@ void LiveEngine::export_trade_journal() {
         metrics.total_bars = bar_history.size();
         
         // Export trade log
-        bool trades_ok = reporter.export_trades(trades, "trades.csv");
+        bool trades_ok = reporter.export_trades(trades, trading_symbol + "_trades.csv");
         if (trades_ok) {
-            LOG_INFO("✅ Trade log exported: " << output_dir_ << "/trades.csv (" << trades.size() << " trades)");
+            LOG_INFO("✅ Trade log exported: " << output_dir_ << "/" << trading_symbol << "_trades.csv (" << trades.size() << " trades)");
         }
         
         // Export performance metrics
-        bool metrics_ok = reporter.export_metrics(metrics, "metrics.csv");
+        bool metrics_ok = reporter.export_metrics(metrics, trading_symbol + "_metrics.csv");
         if (metrics_ok) {
-            LOG_INFO("✅ Metrics exported: " << output_dir_ << "/metrics.csv");
+            LOG_INFO("✅ Metrics exported: " << output_dir_ << "/" << trading_symbol << "_metrics.csv");
         }
         
         // Export equity curve
-        bool equity_ok = reporter.export_equity_curve(trades, config.starting_capital, "equity_curve.csv");
+        bool equity_ok = reporter.export_equity_curve(trades, config.starting_capital, trading_symbol + "_equity_curve.csv");
         if (equity_ok) {
-            LOG_INFO("✅ Equity curve exported: " << output_dir_ << "/equity_curve.csv");
+            LOG_INFO("✅ Equity curve exported: " << output_dir_ << "/" << trading_symbol << "_equity_curve.csv");
         }
         
         // ⭐ Update last exported count AFTER successful export
@@ -5353,7 +5468,7 @@ void LiveEngine::log_order_to_csv(const std::string& entry_time,
         fs::create_directories(output_path);
         
         // Path to simulated_orders.csv
-        fs::path csv_file = output_path / "simulated_orders.csv";
+        fs::path csv_file = output_path / (trading_symbol + "_simulated_orders.csv");
         
         // Create header if file doesn't exist
         if (!fs::exists(csv_file)) {
