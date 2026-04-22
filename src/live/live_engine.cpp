@@ -1933,6 +1933,133 @@ void LiveEngine::process_zones() {
     LOG_DEBUG("Active zones: " << active_zones.size());
 }
 
+
+// ============================================================
+// apply_entry_filters — shared entry filter method
+// ============================================================
+// Configurable per-zone entry filters extracted from check_for_entries().
+// Defined ONCE here and called by both live_engine.cpp and v8.cpp.
+// Returns: true  = zone passes all filters → proceed with entry
+//          false = zone rejected           → caller must `continue`
+// All filters are config-gated; defaults are off = no behaviour change.
+// ============================================================
+
+bool LiveEngine::apply_entry_filters(
+    const Zone&        zone,
+    const std::string& direction,
+    const Bar&         current_bar,
+    int                current_index,
+    int&               zones_rejected)
+{
+    // ⭐ MACD Histogram momentum filter — REGIME FILTER 3.
+    // Rejects entries where short-term momentum (MACD histogram) is working
+    // directly against the zone direction.
+    //   LONG  trade rejected if histogram < -threshold  (bearish momentum dominates)
+    //   SHORT trade rejected if histogram > +threshold  (bullish momentum dominates)
+    // Threshold ±15 validated on 124 NIFTY trades: turns −₹60,467 → +₹21,645.
+    // Eliminates 62 trades (35.5% WR, 28 SL) while keeping 62 (40.3% WR, 15 SL).
+    // ±10 gives max P&L (+₹84,691); ±15 preferred for better trade frequency.
+    if (config.enable_macd_histogram_filter) {
+        auto macd_vals = MarketAnalyzer::calculate_macd(
+            bar_history,
+            config.macd_fast_period,
+            config.macd_slow_period,
+            config.macd_signal_period,
+            current_index);
+        double hist = macd_vals.histogram;
+        if (direction == "LONG" && hist < -config.macd_histogram_threshold) {
+            zones_rejected++;
+            LOG_INFO("[NO] Zone " << zone.zone_id
+                     << ": MACD histogram block (LONG, hist="
+                     << std::fixed << std::setprecision(2) << hist
+                     << " < -" << config.macd_histogram_threshold << ")");
+            std::cout << "  [NO] Zone " << zone.zone_id
+                      << ": MACD histogram block LONG hist="
+                      << std::fixed << std::setprecision(2) << hist << "\n";
+            return false;  // zone rejected
+        }
+        if (direction == "SHORT" && hist > config.macd_histogram_threshold) {
+            zones_rejected++;
+            LOG_INFO("[NO] Zone " << zone.zone_id
+                     << ": MACD histogram block (SHORT, hist="
+                     << std::fixed << std::setprecision(2) << hist
+                     << " > +" << config.macd_histogram_threshold << ")");
+            std::cout << "  [NO] Zone " << zone.zone_id
+                      << ": MACD histogram block SHORT hist="
+                      << std::fixed << std::setprecision(2) << hist << "\n";
+            return false;  // zone rejected
+        }
+    } else {
+			std::cout << "  config.enable_macd_histogram_filter : " << config.enable_macd_histogram_filter << "\n";
+		}
+
+    // ⭐ FILTER: Second configurable time block (e.g., 11:00–12:00 midday chop).
+    // Validated on BankNifty: 11AM hour WR=25.9%, 20L/7W, P&L=−₹247k.
+    // Also confirmed on NIFTY: 11AM WR=25.9%, P&L=−₹86k.
+    // Uses same HH:MM string comparison as the primary entry_block.
+    if (config.enable_entry_block2 &&
+        !config.entry_block2_start_time.empty() &&
+        !config.entry_block2_end_time.empty()) {
+        std::string hhmm2 = current_bar.datetime.substr(11, 5);
+        if (hhmm2 >= config.entry_block2_start_time &&
+            hhmm2 <  config.entry_block2_end_time) {
+            zones_rejected++;
+            LOG_INFO("[NO] Zone " << zone.zone_id
+                     << ": secondary time block ("
+                     << hhmm2 << " in "
+                     << config.entry_block2_start_time << "-"
+                     << config.entry_block2_end_time << ")");
+            std::cout << "  [NO] Zone " << zone.zone_id
+                      << ": midday time block (" << hhmm2 << ")\n";
+            return false;  // zone rejected
+        }
+    }
+
+    // ⭐ FILTER: Zone quality cap — reject zones scoring ABOVE maximum.
+    // Validated on BankNifty: score 30-39 WR=54%, score 40+ WR≤33%.
+    // High scores correlate with obvious retail levels swept by institutions.
+    // Only active when zone_quality_maximum_score > 0.
+    if (config.zone_quality_maximum_score > 0.0) {
+        double raw_score = zone.zone_score.total_score;
+        if (raw_score > config.zone_quality_maximum_score) {
+            zones_rejected++;
+            LOG_INFO("[NO] Zone " << zone.zone_id
+                     << ": score cap (score="
+                     << std::fixed << std::setprecision(1) << raw_score
+                     << " > max=" << config.zone_quality_maximum_score << ")");
+            std::cout << "  [NO] Zone " << zone.zone_id
+                      << ": score cap (score=" << std::fixed
+                      << std::setprecision(1) << raw_score << ")\n";
+            return false;  // zone rejected
+        }
+    }
+
+    // ⭐ FILTER: Bollinger Bandwidth range filter.
+    // Validated on BankNifty: BB [0.60–1.00) = +₹87,760 vs BB<0.60 = −₹94,553.
+    // Below min = compression/chop, above max = overextended (no room to run).
+    // Uses same calculate_bollinger_bands call pattern as freshness_bb_block.
+    if (config.enable_bb_bandwidth_filter) {
+        auto bb_vals = MarketAnalyzer::calculate_bollinger_bands(
+            bar_history, config.bb_period, config.bb_stddev, current_index);
+        double bw = bb_vals.bandwidth;
+        if (bw < config.bb_bandwidth_min || bw >= config.bb_bandwidth_max) {
+            zones_rejected++;
+            LOG_INFO("[NO] Zone " << zone.zone_id
+                     << ": BB bandwidth out of range (BB_BW="
+                     << std::fixed << std::setprecision(3) << bw
+                     << ", required ["
+                     << config.bb_bandwidth_min << ", "
+                     << config.bb_bandwidth_max << "))");
+            std::cout << "  [NO] Zone " << zone.zone_id
+                      << ": BB bandwidth block (BB_BW="
+                      << std::fixed << std::setprecision(3) << bw << ")\n";
+            return false;  // zone rejected
+        }
+    }
+
+    return true;  // all filters passed
+}
+
 void LiveEngine::check_for_entries() {
     if (historical_mode_) {
         LOG_DEBUG("[HISTORICAL MODE] Skipping entry check — zone-build phase.");
@@ -2535,110 +2662,11 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             }
         }
 
-        // ⭐ MACD Histogram momentum filter — REGIME FILTER 3.
-        // Rejects entries where short-term momentum (MACD histogram) is working
-        // directly against the zone direction.
-        //   LONG  trade rejected if histogram < -threshold  (bearish momentum dominates)
-        //   SHORT trade rejected if histogram > +threshold  (bullish momentum dominates)
-        // Threshold ±15 validated on 124 NIFTY trades: turns −₹60,467 → +₹21,645.
-        // Eliminates 62 trades (35.5% WR, 28 SL) while keeping 62 (40.3% WR, 15 SL).
-        // ±10 gives max P&L (+₹84,691); ±15 preferred for better trade frequency.
-        if (config.enable_macd_histogram_filter) {
-            auto macd_vals = MarketAnalyzer::calculate_macd(
-                bar_history,
-                config.macd_fast_period,
-                config.macd_slow_period,
-                config.macd_signal_period,
-                current_index);
-            double hist = macd_vals.histogram;
-            if (direction == "LONG" && hist < -config.macd_histogram_threshold) {
-                zones_rejected++;
-                LOG_INFO("[NO] Zone " << zone.zone_id
-                         << ": MACD histogram block (LONG, hist="
-                         << std::fixed << std::setprecision(2) << hist
-                         << " < -" << config.macd_histogram_threshold << ")");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": MACD histogram block LONG hist="
-                          << std::fixed << std::setprecision(2) << hist << "\n";
-                continue;
-            }
-            if (direction == "SHORT" && hist > config.macd_histogram_threshold) {
-                zones_rejected++;
-                LOG_INFO("[NO] Zone " << zone.zone_id
-                         << ": MACD histogram block (SHORT, hist="
-                         << std::fixed << std::setprecision(2) << hist
-                         << " > +" << config.macd_histogram_threshold << ")");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": MACD histogram block SHORT hist="
-                          << std::fixed << std::setprecision(2) << hist << "\n";
-                continue;
-            }
-        } else {
-			std::cout << "  config.enable_macd_histogram_filter : " << config.enable_macd_histogram_filter << "\n";
-		}
-
-        // ⭐ FILTER: Second configurable time block (e.g., 11:00–12:00 midday chop).
-        // Validated on BankNifty: 11AM hour WR=25.9%, 20L/7W, P&L=−₹247k.
-        // Also confirmed on NIFTY: 11AM WR=25.9%, P&L=−₹86k.
-        // Uses same HH:MM string comparison as the primary entry_block.
-        if (config.enable_entry_block2 &&
-            !config.entry_block2_start_time.empty() &&
-            !config.entry_block2_end_time.empty()) {
-            std::string hhmm2 = current_bar.datetime.substr(11, 5);
-            if (hhmm2 >= config.entry_block2_start_time &&
-                hhmm2 <  config.entry_block2_end_time) {
-                zones_rejected++;
-                LOG_INFO("[NO] Zone " << zone.zone_id
-                         << ": secondary time block ("
-                         << hhmm2 << " in "
-                         << config.entry_block2_start_time << "-"
-                         << config.entry_block2_end_time << ")");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": midday time block (" << hhmm2 << ")\n";
-                continue;
-            }
-        }
-
-        // ⭐ FILTER: Zone quality cap — reject zones scoring ABOVE maximum.
-        // Validated on BankNifty: score 30-39 WR=54%, score 40+ WR≤33%.
-        // High scores correlate with obvious retail levels swept by institutions.
-        // Only active when zone_quality_maximum_score > 0.
-        if (config.zone_quality_maximum_score > 0.0) {
-            double raw_score = zone.zone_score.total_score;
-            if (raw_score > config.zone_quality_maximum_score) {
-                zones_rejected++;
-                LOG_INFO("[NO] Zone " << zone.zone_id
-                         << ": score cap (score="
-                         << std::fixed << std::setprecision(1) << raw_score
-                         << " > max=" << config.zone_quality_maximum_score << ")");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": score cap (score=" << std::fixed
-                          << std::setprecision(1) << raw_score << ")\n";
-                continue;
-            }
-        }
-
-        // ⭐ FILTER: Bollinger Bandwidth range filter.
-        // Validated on BankNifty: BB [0.60–1.00) = +₹87,760 vs BB<0.60 = −₹94,553.
-        // Below min = compression/chop, above max = overextended (no room to run).
-        // Uses same calculate_bollinger_bands call pattern as freshness_bb_block.
-        if (config.enable_bb_bandwidth_filter) {
-            auto bb_vals = MarketAnalyzer::calculate_bollinger_bands(
-                bar_history, config.bb_period, config.bb_stddev, current_index);
-            double bw = bb_vals.bandwidth;
-            if (bw < config.bb_bandwidth_min || bw >= config.bb_bandwidth_max) {
-                zones_rejected++;
-                LOG_INFO("[NO] Zone " << zone.zone_id
-                         << ": BB bandwidth out of range (BB_BW="
-                         << std::fixed << std::setprecision(3) << bw
-                         << ", required ["
-                         << config.bb_bandwidth_min << ", "
-                         << config.bb_bandwidth_max << "))");
-                std::cout << "  [NO] Zone " << zone.zone_id
-                          << ": BB bandwidth block (BB_BW="
-                          << std::fixed << std::setprecision(3) << bw << ")\n";
-                continue;
-            }
+        // ⭐ REGIME FILTERS: MACD histogram, time block2, zone score cap, BB bandwidth.
+        // Single definition in apply_entry_filters() (live_engine.cpp).
+        // Shared with v8.cpp via live_engine.h — no code duplication.
+        if (!apply_entry_filters(zone, direction, current_bar, current_index, zones_rejected)) {
+            continue;
         }
 
         // ⭐ FIX 9: Use config params for regime detection — parity with V7.

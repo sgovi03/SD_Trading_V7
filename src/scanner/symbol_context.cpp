@@ -102,6 +102,12 @@ SymbolContext::SymbolContext(
         output_dir,
         "");   // no CSV — V8 bootstraps from SQLite below
 
+    // ⚠️  FIX: LiveEngine constructor builds its own OrderSubmitter from system_config.json
+    // for backwards compatibility, ignoring the order_cfg passed from run_v8_live.cpp.
+    // Override it immediately with the authoritative config from Core::SystemConfig
+    // (which correctly reads order_submitter.enabled from the user's system_config.json).
+    engine_->set_order_submit_config(order_cfg);
+
     // ── Step 4: Bootstrap bar_history from SQLite ─────────────
     // Load previously persisted bars so LiveEngine can detect zones
     // on restart without needing AFL to replay historical data.

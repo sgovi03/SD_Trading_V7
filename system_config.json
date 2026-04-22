@@ -160,8 +160,8 @@
   },
   
   "order_submitter": {
-    "enabled": false,              
-    "base_url": "http://localhost:8086/trade",
+    "enabled": true,              
+    "base_url": "http://localhost:8080/trade",
     "long_strategy_number": 13,
     "short_strategy_number": 14,
     "timeout_seconds": 10

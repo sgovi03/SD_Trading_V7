@@ -96,19 +96,22 @@ void SignalConsumer::on_signal(const Events::SignalEvent& evt) {
             std::lock_guard<std::mutex> lock(tags_mutex_);
             submitted_tags_.insert(evt.order_tag);
         }
-        LOG_INFO("[SignalConsumer] [DRY-RUN] Would submit:"
-                 << " " << evt.direction
-                 << " " << evt.lot_size << " lot(s)"
-                 << " " << evt.symbol
-                 << " @" << evt.entry_price
-                 << " SL=" << evt.stop_loss
-                 << " TP=" << evt.target_1
+        // ⚠️  FIX: Add console output so dry-run is unmissable, not just LOG_INFO.
+        LOG_WARN("[SignalConsumer] ⚠️  DRY-RUN — Signal NOT sent to Spring Boot/Fyers: "
+                 << evt.direction << " " << evt.lot_size << " lot(s)"
+                 << " " << evt.symbol << " @" << evt.entry_price
                  << " tag=" << evt.order_tag);
-        // Still publish TradeOpenEvent so DB records the signal
+        std::cout << "\n⚠️  [SIGNAL CONSUMER DRY-RUN] Order NOT sent to Spring Boot!\n"
+                  << "    Symbol:    " << evt.symbol << "\n"
+                  << "    Direction: " << evt.direction << "  Lots: " << evt.lot_size << "\n"
+                  << "    Tag:       " << evt.order_tag << "\n"
+                  << "    Fix: Remove --dry-run flag from the command line.\n\n";
+        std::cout.flush();
+        // Still publish TradeOpenEvent so DB records the signal for analysis
         Live::OrderSubmitResult fake_result;
         fake_result.success = true;
-        fake_result.http_status = 200;
-        fake_result.response_body = "{\"s\":\"ok\",\"message\":\"DRY_RUN\"}";
+        fake_result.http_status = 0;   // ⚠️  FIX: Use 0 (not 200) to clearly show no HTTP was made
+        fake_result.response_body = "{\"s\":\"ok\",\"message\":\"DRY_RUN_NO_HTTP\"}";
         publish_trade_open(evt, fake_result);
         return;
     }
@@ -137,19 +140,37 @@ void SignalConsumer::on_signal(const Events::SignalEvent& evt) {
             std::lock_guard<std::mutex> lock(tags_mutex_);
             submitted_tags_.insert(evt.order_tag);
         }
-        LOG_INFO("[SignalConsumer] Order accepted by Spring Boot:"
-                 << " tag=" << evt.order_tag
-                 << " http=" << result.http_status);
+        // ⚠️  FIX: Was "Order accepted" even when http_status=0 (connection failure).
+        //    Now clearly states real HTTP status and warns if http != 200.
+        if (result.http_status >= 200 && result.http_status < 300) {
+            LOG_INFO("[SignalConsumer] ✅ Order confirmed by Spring Boot:"
+                     << " tag=" << evt.order_tag
+                     << " http=" << result.http_status);
+        } else {
+            LOG_WARN("[SignalConsumer] ⚠️  Spring Boot returned unexpected status:"
+                     << " tag=" << evt.order_tag
+                     << " http=" << result.http_status
+                     << " body=" << result.response_body.substr(0, 80));
+        }
         publish_trade_open(evt, result);
     } else {
         ++orders_failed_;
-        LOG_ERROR("[SignalConsumer] Order REJECTED by Spring Boot:"
+        // ⚠️  FIX: Was possible to reach here with http=0 (curl never connected).
+        //    Added explicit message for connection failure vs server rejection.
+        std::string fail_reason = (result.http_status == 0)
+            ? "Connection failed (http=0) — is Spring Boot running at the configured URL?"
+            : "Server rejected order (http=" + std::to_string(result.http_status) + ")";
+        LOG_ERROR("[SignalConsumer] ❌ Order NOT submitted to Fyers:"
                   << " tag=" << evt.order_tag
-                  << " http=" << result.http_status
+                  << " reason=" << fail_reason
                   << " error=" << result.error_message);
+        std::cout << "\n❌ [ORDER FAILED] Not submitted to Fyers!\n"
+                  << "   Tag:    " << evt.order_tag << "\n"
+                  << "   Reason: " << fail_reason << "\n"
+                  << "   Check: Is Spring Boot running? Is the URL correct?\n\n";
+        std::cout.flush();
         publish_alert(Events::AlertSeverity::ERROR,
-            "Order rejected: " + evt.order_tag
-            + " | " + result.error_message,
+            "Order failed: " + evt.order_tag + " | " + fail_reason,
             evt.symbol);
     }
 }

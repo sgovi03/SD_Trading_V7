@@ -601,6 +601,21 @@ public:
             std::string entry_block_end_time;   // e.g. "09:45"
         // Entry Volume Score Filter (V6.0)
         int min_volume_entry_score = 10;  // Activated - reject entries with volume score < 10
+
+        // PVR range filter — hard gate on the pullback volume ratio of the entry bar.
+        // Validated on 50 BankNifty trades: PVR 0.50–0.70 bucket is the worst
+        // (WR=16.7%, 5 SL hits, -₹25,816). It represents ambiguous volume — not dry
+        // enough to confirm clean pullback, not strong enough to confirm institutional
+        // defence. Filtering it out by requiring EITHER dry (<min) OR strong (>min)
+        // improves selectivity.
+        //
+        // Recommended config:
+        //   min_pullback_vol_ratio = 0.70   → keeps dry (<0.70) AND strong (>0.70)
+        //                                      skips the ambiguous 0.50-0.70 band
+        //   max_pullback_vol_ratio = 99.0   → no upper cap (high vol = institutional)
+        //   Set min=0.0 (default) to disable the lower gate entirely.
+        double min_pullback_vol_ratio = 0.0;   // 0.0 = disabled; e.g. 0.70 to skip ambiguous band
+        double max_pullback_vol_ratio = 99.0;  // 99.0 = disabled; hard upper cap if needed
     // Capital & Risk
     double starting_capital;
     double risk_per_trade_pct;

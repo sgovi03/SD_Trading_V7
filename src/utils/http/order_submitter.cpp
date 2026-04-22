@@ -113,9 +113,17 @@ OrderSubmitResult OrderSubmitter::submit_order(
     
     // Check if enabled
     if (!config_.enable_submission) {
-        result.success = true;  // Consider it success since submission is disabled
+        result.success = true;  // Treat as success (caller proceeds without real order)
         result.error_message = "Order submission disabled in config";
-        LOG_INFO("📝 [DRY-RUN] Order would be submitted: " << direction << " " << quantity << " lots");
+        // ⚠️  FIX: Use LOG_WARN so this is unmissable in log output.
+        //    LOG_INFO was silently hiding the fact that NO real order was placed.
+        LOG_WARN("⚠️  [ORDER SUBMITTER DISABLED] Order NOT sent to broker: "
+                 << direction << " " << quantity << " lots. "
+                 << "Set order_submitter.enabled=true in system_config.json to enable live trading.");
+        std::cout << "\n⚠️  [ORDER SUBMITTER DISABLED] Order NOT sent to broker!\n"
+                  << "    Direction: " << direction << "  Qty: " << quantity << " lots\n"
+                  << "    Fix: Set \"enabled\": true in system_config.json → order_submitter\n\n";
+        std::cout.flush();
         return result;
     }
     

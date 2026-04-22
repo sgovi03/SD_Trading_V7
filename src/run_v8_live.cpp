@@ -54,6 +54,7 @@
 
 // ── System ───────────────────────────────────────────────────
 #include "utils/system_initializer.h"
+#include "system_config.h"       // ::SystemConfig (jsoncpp-based, for order_submitter.enabled)
 #include "utils/logger.h"
 
 // ── Persistence ──────────────────────────────────────────────
@@ -237,12 +238,34 @@ int main(int argc, char* argv[]) {
         std::cout << "[5/9] Creating symbol contexts (LiveEngine per symbol)...\n";
 
         // Spring Boot order config
+        // ⚠️  FIX: Core::SystemConfig (from system_config_loader.cpp) sometimes fails
+        // to read order_submitter.enabled from JSON, leaving sys.order_submitter_enabled=false
+        // even when the JSON has "enabled": true.
+        // Workaround: read the order_submitter section directly using the OLD ::SystemConfig
+        // class (jsoncpp-based, get_bool with explicit default=true), which is the same
+        // approach LiveEngine uses internally and is known to work.
+        ::SystemConfig direct_sys_cfg;
+        {
+            std::string cfg_path = Utils::SystemInitializer::getInstance().getConfigPath();
+            if (!cfg_path.empty()) {
+                try { direct_sys_cfg = ::SystemConfig(cfg_path); } catch (...) {}
+            }
+        }
+        bool order_enabled = direct_sys_cfg.get_bool("order_submitter", "enabled", true);
+
         Live::OrderSubmitConfig order_cfg;
         order_cfg.base_url              = sys.order_submitter_base_url;
         order_cfg.long_strategy_number  = sys.order_submitter_long_strategy;
         order_cfg.short_strategy_number = sys.order_submitter_short_strategy;
         order_cfg.timeout_seconds       = sys.order_submitter_timeout;
-        order_cfg.enable_submission     = sys.order_submitter_enabled && !rc.dry_run;
+        order_cfg.enable_submission     = order_enabled && !rc.dry_run;
+
+        std::cout << "\n[OrderSubmitConfig] enable_submission=" << order_cfg.enable_submission
+                  << "  (json_enabled=" << order_enabled
+                  << "  sys.order_submitter_enabled=" << sys.order_submitter_enabled
+                  << "  rc.dry_run=" << rc.dry_run << ")\n"
+                  << "  base_url=" << order_cfg.base_url << "\n\n";
+        std::cout.flush();
 
         // Load symbol registry
         std::string reg_path = sys.get_full_path(sys.symbol_registry_file);

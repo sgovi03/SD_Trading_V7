@@ -145,20 +145,49 @@ SystemConfig SystemConfigLoader::load_from_json(
         // ---- zone_bootstrap ----
         std::string zone_bootstrap_obj = extract_json_object(json, "zone_bootstrap");
         if (!zone_bootstrap_obj.empty()) {
-            config.zone_bootstrap_enabled          = extract_json_bool(zone_bootstrap_obj, "enabled");
+            // ⚠️  FIX: only assign zone_bootstrap_enabled if key is present in JSON
+            if (zone_bootstrap_obj.find("\"enabled\"") != std::string::npos)
+                config.zone_bootstrap_enabled = extract_json_bool(zone_bootstrap_obj, "enabled");
             config.zone_bootstrap_ttl_hours        = extract_json_int(zone_bootstrap_obj, "ttl_hours");
             config.zone_bootstrap_refresh_time     = extract_json_string(zone_bootstrap_obj, "refresh_time");
             config.zone_bootstrap_force_regenerate = extract_json_bool(zone_bootstrap_obj, "force_regenerate");
         }
 
         // ---- order_submitter ----
+        // ⚠️  FIX: extract_json_bool returns false when a key is absent or malformed.
+        //    This was silently overwriting the constructor default (true) with false
+        //    whenever "enabled" was missing from the JSON, causing orders to never reach Fyers.
+        //    Fix: only overwrite when the JSON object AND the key are both present.
+        //    For non-bool fields (url, ints) the existing pattern is safe because their
+        //    defaults are empty-string / 0 which is equally harmless when not set.
         std::string order_submitter_obj = extract_json_object(json, "order_submitter");
         if (!order_submitter_obj.empty()) {
-            config.order_submitter_enabled        = extract_json_bool(order_submitter_obj, "enabled");
-            config.order_submitter_base_url       = extract_json_string(order_submitter_obj, "base_url");
-            config.order_submitter_long_strategy  = extract_json_int(order_submitter_obj, "long_strategy_number");
-            config.order_submitter_short_strategy = extract_json_int(order_submitter_obj, "short_strategy_number");
-            config.order_submitter_timeout        = extract_json_int(order_submitter_obj, "timeout_seconds");
+            // Only assign bool if the key "enabled" is explicitly present in the JSON.
+            // Searching for the raw string ""enabled"" in the extracted sub-object
+            // is safe because extract_json_object already isolated this section.
+            if (order_submitter_obj.find("\"enabled\"") != std::string::npos) {
+                config.order_submitter_enabled = extract_json_bool(order_submitter_obj, "enabled");
+                LOG_INFO("[SystemConfig] order_submitter.enabled = "
+                         << (config.order_submitter_enabled ? "true" : "false")
+                         << " (read from system_config.json)");
+            } else {
+                LOG_INFO("[SystemConfig] order_submitter.enabled not found in JSON — "
+                         << "keeping default: "
+                         << (config.order_submitter_enabled ? "true" : "false"));
+            }
+            // Non-bool fields: empty string / 0 defaults are safe to overwrite
+            std::string url = extract_json_string(order_submitter_obj, "base_url");
+            if (!url.empty()) config.order_submitter_base_url = url;
+            int ls = extract_json_int(order_submitter_obj, "long_strategy_number");
+            if (ls != 0) config.order_submitter_long_strategy  = ls;
+            int ss = extract_json_int(order_submitter_obj, "short_strategy_number");
+            if (ss != 0) config.order_submitter_short_strategy = ss;
+            int to = extract_json_int(order_submitter_obj, "timeout_seconds");
+            if (to != 0) config.order_submitter_timeout = to;
+        } else {
+            LOG_INFO("[SystemConfig] order_submitter section not found in system_config.json — "
+                     << "using defaults (enabled="
+                     << (config.order_submitter_enabled ? "true" : "false") << ")");
         }
 
         // ---- V8 section (delegated to private method) ----

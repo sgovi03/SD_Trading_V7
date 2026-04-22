@@ -846,6 +846,13 @@ bool ConfigLoader::parse_section_trade_and_runtime_extended(const std::string& k
     else if (key == "min_volume_entry_score") {
         config.min_volume_entry_score = std::stoi(value);
     }
+    // PVR range filter
+    else if (key == "min_pullback_vol_ratio") {
+        config.min_pullback_vol_ratio = std::stod(value);
+    }
+    else if (key == "max_pullback_vol_ratio") {
+        config.max_pullback_vol_ratio = std::stod(value);
+    }
     // Volume Exit Signals (extended)
     else if (key == "volume_drying_up_threshold") {
         config.volume_drying_up_threshold = std::stod(value);

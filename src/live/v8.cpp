@@ -2504,6 +2504,13 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
         }
 
 
+        // ⭐ REGIME FILTERS: MACD histogram, time block2, score cap, BB bandwidth.
+        // Defined in live_engine.cpp::apply_entry_filters() and shared via live_engine.h.
+        // All filters are config-gated (defaults off = no behaviour change without config).
+        if (!apply_entry_filters(zone, direction, current_bar, current_index, zones_rejected)) {
+            continue;
+        }
+
         // Detect market regime for scoring and entry logic
         MarketRegime regime = MarketAnalyzer::detect_regime(bar_history, 50, 5.0);
         // Score the zone

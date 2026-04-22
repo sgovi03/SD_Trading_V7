@@ -190,7 +190,20 @@ protected:
      * Check for entry opportunities
      */
     void check_for_entries();
-    
+
+    /**
+     * @brief Apply configurable entry filters for a single zone candidate.
+     * Defined in live_engine.cpp; shared with v8.cpp via this declaration.
+     * Returns true = zone passes (proceed), false = zone rejected (caller continues).
+     * Filters: MACD histogram, time block2, zone score cap, BB bandwidth.
+     * All config-gated — defaults off means no behaviour change without config.
+     */
+    bool apply_entry_filters(const Zone&        zone,
+                             const std::string& direction,
+                             const Bar&         current_bar,
+                             int                current_index,
+                             int&               zones_rejected);
+
     /**
      * Manage open position using TradeManager
      */
@@ -463,6 +476,27 @@ public:
      * @return true if position open
      */
     bool is_in_position() const { return trade_mgr.is_in_position(); }
+
+    /**
+     * @brief Override the OrderSubmitter with an externally-configured instance.
+     *
+     * The LiveEngine constructor builds its own OrderSubmitter from system_config.json
+     * for backwards compatibility. In V8 multi-symbol mode, run_v8_live.cpp constructs
+     * an authoritative OrderSubmitConfig from Core::SystemConfig and passes it through
+     * SymbolContext. Call this setter immediately after constructing LiveEngine to
+     * replace the internally-built submitter with the correct one.
+     *
+     * This is the fix for: order_submitter.enabled=true in system_config.json being
+     * ignored because LiveEngine read a different JSON path than the one the user edited.
+     */
+    void set_order_submit_config(const Live::OrderSubmitConfig& cfg) {
+        order_submitter_ = std::make_unique<Live::OrderSubmitter>(cfg);
+        // Note: LOG_INFO unavailable in header — use std::cout for this diagnostic line.
+        std::cout << "[LiveEngine:" << trading_symbol
+                  << "] OrderSubmitter overridden — enable_submission="
+                  << (cfg.enable_submission ? "true" : "false")
+                  << " url=" << cfg.base_url << "\n";
+    }
     
     /**
      * Get current trade info

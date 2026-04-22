@@ -144,6 +144,9 @@ bool PipeBroker::is_entry_allowed() {
 
 bool PipeBroker::connect() {
     connected_.store(true);
+    if (!order_submitter_.initialize()) {
+        LOG_WARN("[PipeBroker:" << symbol_ << "] OrderSubmitter init failed — HTTP orders will fail.");
+    }
     LOG_INFO("[PipeBroker:" << symbol_ << "] Connected (pipe-mode).");
     return true;
 }
@@ -195,8 +198,11 @@ OrderResponse PipeBroker::place_market_order(
            << std::setw(2) << tm_info.tm_sec
            << (direction == "BUY" ? "L" : "S");
 
+    // OrderSubmitter::validate_order_params requires "LONG"/"SHORT" not "BUY"/"SELL"
+    const std::string submit_direction = (direction == "BUY") ? "LONG" : "SHORT";
+
     OrderSubmitResult result = order_submitter_.submit_order(
-        direction,          // "BUY" or "SELL"
+        submit_direction,   // "LONG" or "SHORT"
         quantity,           // lot count
         0,                  // zone_id (not known at this level)
         0.0,                // zone_score

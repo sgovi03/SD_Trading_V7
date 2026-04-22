@@ -39,6 +39,42 @@ EntryVolumeMetrics EntryDecisionEngine::calculate_entry_volume_metrics(
     // ── PULLBACK VOLUME: the bar currently hitting the zone ──────────────
     metrics.pullback_volume_ratio = current_bar.volume / baseline;
 
+    // ⭐ PVR RANGE GATE — hard rejection before scoring.
+    // Rejects the ambiguous 0.50–0.70 band (validated: WR=16.7%, -₹25,816 on 50 BNK trades).
+    // Logic: we want EITHER a dry pullback (<min) OR strong institutional defence (>min).
+    // The band in between is retail re-entry with no institutional commitment — the
+    // worst-performing group across all volume buckets.
+    //
+    // Controlled by:
+    //   min_pullback_vol_ratio = 0.70  → reject if pvr is in [0.70, 0.70) — i.e. blocks
+    //                                    the 0.50–0.70 ambiguous band when set to 0.70.
+    //   max_pullback_vol_ratio = 99.0  → no upper cap (default).
+    //   Both default to 0.0 / 99.0 (disabled) — no change to existing behaviour.
+    //
+    // Note: this gate sets a flag in metrics; the calling function (calculate_entry)
+    // reads metrics.rejection_reason and returns early if pvr_rejected is true.
+    if (config.min_pullback_vol_ratio > 0.0 &&
+        metrics.pullback_volume_ratio > 0.0 &&   // skip if volume data unavailable
+        metrics.pullback_volume_ratio < config.min_pullback_vol_ratio) {
+        metrics.rejection_reason = "PVR too low: " +
+            std::to_string(metrics.pullback_volume_ratio).substr(0, 4) +
+            "x < min " +
+            std::to_string(config.min_pullback_vol_ratio).substr(0, 4) + "x";
+        metrics.volume_score = -50;   // ensures min_volume_entry_score gate also fires
+        LOG_INFO("PVR gate: REJECTED — " + metrics.rejection_reason);
+        return metrics;
+    }
+    if (config.max_pullback_vol_ratio < 99.0 &&
+        metrics.pullback_volume_ratio > config.max_pullback_vol_ratio) {
+        metrics.rejection_reason = "PVR too high: " +
+            std::to_string(metrics.pullback_volume_ratio).substr(0, 4) +
+            "x > max " +
+            std::to_string(config.max_pullback_vol_ratio).substr(0, 4) + "x";
+        metrics.volume_score = -50;
+        LOG_INFO("PVR gate: REJECTED — " + metrics.rejection_reason);
+        return metrics;
+    }
+
     // ⭐ FIX 1: Removed hardcoded early-exit (score=-50, return) for high pullback vol.
     //
     // The old block treated pullback_volume_ratio > 1.8 as automatic rejection

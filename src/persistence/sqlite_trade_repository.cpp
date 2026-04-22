@@ -181,14 +181,23 @@ bool SqliteTradeRepository::insert_trade_open(const Events::TradeOpenEvent& evt)
         stmt.bind_int(9,    evt.lots);
         stmt.bind_double(10, evt.stop_loss);
         stmt.bind_double(11, evt.take_profit);
-        stmt.execute();
+        int rows_affected = stmt.execute();
 
         // Mark signal as acted upon
         mark_signal_acted(evt.order_tag);
 
-        LOG_INFO("[SqliteTradeRepo] Trade opened: " << evt.order_tag
-                 << " " << evt.symbol << " " << evt.direction
-                 << " @" << evt.entry_price << " lots=" << evt.lots);
+        // ⚠️  FIX: INSERT OR IGNORE means the second call (from SignalConsumer after
+        //    LiveEngine already published TradeOpenEvent) silently inserts nothing.
+        //    rows_affected=0 means the row already existed — log at DEBUG not INFO
+        //    to avoid the confusing duplicate "[SqliteTradeRepo] Trade opened" log lines.
+        if (rows_affected > 0) {
+            LOG_INFO("[SqliteTradeRepo] Trade opened: " << evt.order_tag
+                     << " " << evt.symbol << " " << evt.direction
+                     << " @" << evt.entry_price << " lots=" << evt.lots);
+        } else {
+            LOG_DEBUG("[SqliteTradeRepo] Trade open duplicate skipped (INSERT OR IGNORE): "
+                      << evt.order_tag);
+        }
         return true;
     } catch (const SqliteException& e) {
         LOG_ERROR("[SqliteTradeRepo] insert_trade_open failed: " << e.what());

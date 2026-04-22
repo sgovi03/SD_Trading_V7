@@ -409,6 +409,8 @@ std::set<std::string> ConfigCascadeResolver::apply_file_overlay(
         {"allow_low_volume_if_score_above",[](const Config& s, Config& d){ d.allow_low_volume_if_score_above = s.allow_low_volume_if_score_above; }},
         {"elite_institutional_threshold",[](const Config& s, Config& d){ d.elite_institutional_threshold = s.elite_institutional_threshold; }},
         {"min_volume_entry_score",       [](const Config& s, Config& d){ d.min_volume_entry_score = s.min_volume_entry_score; }},
+        {"min_pullback_vol_ratio",       [](const Config& s, Config& d){ d.min_pullback_vol_ratio = s.min_pullback_vol_ratio; }},
+        {"max_pullback_vol_ratio",       [](const Config& s, Config& d){ d.max_pullback_vol_ratio = s.max_pullback_vol_ratio; }},
 
         // ---- V6.0 OI ----
         {"enable_oi_entry_filters",      [](const Config& s, Config& d){ d.enable_oi_entry_filters = s.enable_oi_entry_filters; }},
