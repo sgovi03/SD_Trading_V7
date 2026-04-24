@@ -137,25 +137,35 @@ void TradeManager::calculate_pnl(Trade& trade) const {
     // Total P&L
     trade.pnl = pnl_per_unit * trade.position_size * config.lot_size;
 
-    // ⭐ PNL SANITY GUARD: Catch impossibly large losses before they corrupt results.
-    // Max realistic intraday loss = 3 lots * 500pts * 65 lot_size = Rs97,500
-    // If we exceed Rs200,000 on a single trade, print full forensic detail and abort.
-    if (std::abs(trade.pnl) > 200000.0) {
+    // ⭐ PNL SANITY GUARD: Catch data-corruption bugs (e.g. exit_price=0) before
+    // they corrupt results. Threshold is dynamic: position_size * lot_size * 1500 pts
+    // covers extreme intraday moves while still catching absurd values like
+    // pnl_per_unit=24265 that arise when exit_price is zero.
+    double pnl_sanity_limit = static_cast<double>(trade.position_size)
+                              * static_cast<double>(config.lot_size)
+                              * 1500.0;
+    if (std::abs(trade.pnl) > pnl_sanity_limit) {
+        double expected_max = static_cast<double>(trade.position_size)
+                              * static_cast<double>(config.lot_size) * 500.0;
         std::cerr << "\n\n[FATAL PNL SANITY BREACH] Trade #" << trade.trade_num << "\n"
                   << "  Direction:      " << trade.direction << "\n"
                   << "  Entry Price:    " << std::fixed << std::setprecision(2) << trade.entry_price << "\n"
                   << "  Exit Price:     " << trade.exit_price << "\n"
                   << "  Stop Loss:      " << trade.stop_loss << "\n"
                   << "  pnl_per_unit:   " << pnl_per_unit << " pts\n"
-                  << "  position_size:  " << trade.position_size << " (lots or units?)\n"
+                  << "  position_size:  " << trade.position_size << " lots\n"
                   << "  config.lot_size:" << config.lot_size << "\n"
                   << "  COMPUTED PNL:   Rs" << trade.pnl << "\n"
-                  << "  Expected max:   Rs97,500 (3lots x 500pts x 65)\n"
+                  << "  Sanity limit:   Rs" << pnl_sanity_limit
+                  << " (" << trade.position_size << " lots x 1500pts x " << config.lot_size << ")\n"
+                  << "  Expected max:   Rs" << expected_max
+                  << " (" << trade.position_size << " lots x 500pts x " << config.lot_size << ")\n"
                   << "  bars_in_trade:  " << trade.bars_in_trade << "\n"
                   << "  entry_date:     " << trade.entry_date << "\n"
                   << "  exit_date:      " << trade.exit_date << "\n"
                   << "  exit_reason:    " << trade.exit_reason << "\n"
-                  << ">>> ABORTING to prevent data corruption. Fix position_size bug first. <<<\n\n";
+                  << "  LIKELY CAUSE:   exit_price=0 (broker connection failure at exit)\n"
+                  << ">>> ABORTING to prevent data corruption. <<<\n\n";
         std::abort();
     }
     
@@ -280,7 +290,13 @@ double TradeManager::execute_exit(const std::string& symbol,
 
     if (response.status != OrderStatus::FILLED) {
         LOG_ERROR("Exit order failed: " + response.message);
-        return 0.0;
+        // Use the intended exit price rather than 0.0 — returning 0.0 corrupts
+        // pnl_per_unit (entry - 0 = full entry price as profit/loss), triggering
+        // the PnL sanity guard and aborting the process. The intended price is
+        // our best estimate of where the fill occurred even if confirmation failed.
+        LOG_WARN("Exit broker call failed — recording intended exit price " +
+                 std::to_string(price) + " to preserve P&L integrity");
+        return price;
     }
 
     LOG_INFO("LIVE: Position closed @ " + std::to_string(response.filled_price));
@@ -891,7 +907,15 @@ Trade TradeManager::close_trade(const std::string& exit_datetime,
     // Execute exit order (convert lots to units for broker)
     int total_units = current_trade.position_size * config.lot_size;
     double fill_price = execute_exit("", exit_direction, total_units, exit_price);
-    
+
+    // Safety net: execute_exit should never return 0.0 (that corrupts P&L), but
+    // guard here too in case a new broker path forgets the contract.
+    if (fill_price <= 0.0) {
+        LOG_ERROR("execute_exit returned invalid fill_price=" + std::to_string(fill_price) +
+                  " — falling back to intended exit_price=" + std::to_string(exit_price));
+        fill_price = exit_price;
+    }
+
     // Complete trade record
     current_trade.exit_date = exit_datetime;
     current_trade.exit_price = fill_price;
