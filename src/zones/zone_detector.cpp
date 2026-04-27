@@ -376,6 +376,9 @@ ZoneDetector::ZoneDecision ZoneDetector::evaluate_zone_candidate(
 
 void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidate) {
     bool formation_bar_updated = false;
+    // RC-2: snapshot boundaries before merge so we can detect changes
+    const double old_proximal = existing.proximal_line;
+    const double old_distal   = existing.distal_line;
 
     switch (config.merge_strategy) {
         case ZoneMergeStrategy::UPDATE_IF_STRONGER:
@@ -457,6 +460,16 @@ void ZoneDetector::merge_into_existing_zone(Zone& existing, const Zone& candidat
     }
     // Do NOT add candidate.touch_count in any case — it double-counts bars already
     // seen by update_zone_states.
+
+    // RC-2 fix: if boundaries changed, state_history belongs to the old zone geometry
+    if (config.fix_rc2_merge_clears_history) {
+        bool bounds_changed = (std::abs(existing.proximal_line - old_proximal) > 0.01 ||
+                               std::abs(existing.distal_line   - old_distal)   > 0.01);
+        if (bounds_changed) {
+            existing.state_history.clear();
+            LOG_DEBUG("merge_into_existing_zone: boundaries changed → state_history cleared");
+        }
+    }
 
     existing.is_elite = existing.is_elite || candidate.is_elite;
 }
@@ -551,6 +564,19 @@ std::vector<Zone> ZoneDetector::detect_zones_no_duplicates(
             }
             zone.formation_bar = i;
             zone.formation_datetime = bars[i].datetime;
+            // RC-1 fix: pin formation_bar to the bar that actually sets distal_line
+            if (config.fix_rc1_formation_bar_pin && len > 1) {
+                int distal_bar = i;
+                if (zone.type == ZoneType::SUPPLY) {
+                    for (int k = i + 1; k < i + len; k++)
+                        if (bars[k].high > bars[distal_bar].high) distal_bar = k;
+                } else {
+                    for (int k = i + 1; k < i + len; k++)
+                        if (bars[k].low < bars[distal_bar].low) distal_bar = k;
+                }
+                zone.formation_bar = distal_bar;
+                zone.formation_datetime = bars[distal_bar].datetime;
+            }
             zone.state = ZoneState::FRESH;
             zone.touch_count = calculate_initial_touch_count(zone, bars, i);
 
@@ -883,9 +909,22 @@ std::vector<Zone> ZoneDetector::detect_zones_full() {
             zone.proximal_line = (zone.type == ZoneType::DEMAND) ? high : low;
             zone.formation_bar = i;
             zone.formation_datetime = bars[i].datetime;
+            // RC-1 fix: pin formation_bar to the bar that actually sets distal_line
+            if (config.fix_rc1_formation_bar_pin && len > 1) {
+                int distal_bar = i;
+                if (zone.type == ZoneType::SUPPLY) {
+                    for (int k = i + 1; k < i + len; k++)
+                        if (bars[k].high > bars[distal_bar].high) distal_bar = k;
+                } else {
+                    for (int k = i + 1; k < i + len; k++)
+                        if (bars[k].low < bars[distal_bar].low) distal_bar = k;
+                }
+                zone.formation_bar = distal_bar;
+                zone.formation_datetime = bars[distal_bar].datetime;
+            }
             zone.state = ZoneState::FRESH;
             zone.touch_count = calculate_initial_touch_count(zone, bars, i);
-            
+
             // ⭐ HYBRID: Zone width filter - dual threshold (ATR-based OR absolute minimum)
             // Width calculation depends on zone type:
             // DEMAND: width = proximal_line - distal_line (high - low)
@@ -1063,16 +1102,33 @@ int ZoneDetector::calculate_initial_touch_count(const Zone& zone,
         
         // A bar is "inside" the zone if it overlaps the zone body
         bool is_inside = false;
-        if (zone.type == ZoneType::SUPPLY) {
-            // SUPPLY zone: price enters from below, touches proximal_line (low boundary)
-            is_inside = (bar.high >= zone.proximal_line && bar.low <= zone.distal_line + 
-                         (zone.distal_line - zone.proximal_line) * 0.5);
+        if (config.fix_rc5_initial_touch_formula) {
+            // RC-5 fix: match live_engine overlap formula (no 50% boundary extension)
+            // and require correct approach direction on the first bar of each episode
+            if (zone.type == ZoneType::SUPPLY) {
+                is_inside = (bar.low <= zone.distal_line && bar.high >= zone.proximal_line);
+                if (is_inside && !was_inside && i > formation_index + 1) {
+                    // SUPPLY entry must rally up from below proximal
+                    if (bars[i - 1].close >= zone.proximal_line) is_inside = false;
+                }
+            } else {
+                is_inside = (bar.high >= zone.distal_line && bar.low <= zone.proximal_line);
+                if (is_inside && !was_inside && i > formation_index + 1) {
+                    // DEMAND entry must pull back from above proximal
+                    if (bars[i - 1].close <= zone.proximal_line) is_inside = false;
+                }
+            }
         } else {
-            // DEMAND zone: price enters from above, touches proximal_line (high boundary)
-            is_inside = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line - 
-                         (zone.proximal_line - zone.distal_line) * 0.5);
+            // Original formula preserved
+            if (zone.type == ZoneType::SUPPLY) {
+                is_inside = (bar.high >= zone.proximal_line && bar.low <= zone.distal_line +
+                             (zone.distal_line - zone.proximal_line) * 0.5);
+            } else {
+                is_inside = (bar.low <= zone.proximal_line && bar.high >= zone.distal_line -
+                             (zone.proximal_line - zone.distal_line) * 0.5);
+            }
         }
-        
+
         // Count a touch only on the FIRST bar entering the zone (transition: outside → inside)
         if (is_inside && !was_inside) {
             touch_count++;

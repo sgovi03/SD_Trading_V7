@@ -1100,9 +1100,16 @@ public:
     double vol_exhaustion_drift_max_ratio = 0.6;
     double vol_exhaustion_drift_min_loss_atr = 0.5;
     double vol_exhaustion_max_loss_pct = 0.70;
-	
-	
-	
+
+    // ============================================================
+    // Bug-Fix Feature Flags (all OFF by default — enable to activate each fix)
+    // ============================================================
+    bool fix_rc1_formation_bar_pin     = false; // RC-1: pin formation_bar to the bar that defines distal_line
+    bool fix_rc2_merge_clears_history  = false; // RC-2: clear state_history when merge changes zone boundaries
+    bool fix_rc3_touch_direction_check = false; // RC-3: require correct approach direction for touch counting
+    bool fix_rc4_entry_direction_check = false; // RC-4: require correct approach direction for entry signals
+    bool fix_rc5_initial_touch_formula = false; // RC-5: fix initial touch count formula to match live_engine
+
     // Constructor with defaults
 
     Config()

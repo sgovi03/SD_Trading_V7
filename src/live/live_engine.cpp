@@ -201,6 +201,8 @@ LiveEngine::LiveEngine(
 		order_config.short_strategy_number = system_config.get_int("order_submitter", "short_strategy_number", 14);
 		order_config.timeout_seconds = system_config.get_int("order_submitter", "timeout_seconds", 10);
 		order_config.enable_submission = system_config.get_bool("order_submitter", "enabled", true);
+		order_config.week_num = system_config.get_int("order_submitter", "week_num", 0);
+		order_config.month_num = system_config.get_int("order_submitter", "month_num", 0);
 		order_submitter_ = std::make_unique<OrderSubmitter>(order_config);
 		
 		// ✅ V6.0: Initialize V6.0 components
@@ -787,6 +789,15 @@ void LiveEngine::update_zone_states(const Bar& current_bar) {
         } else {
             // SUPPLY: distal_line is the TOP (higher price); proximal_line is the BOTTOM (lower price)
             price_in_zone = (current_bar.low <= zone.distal_line && current_bar.high >= zone.proximal_line);
+        }
+        // RC-3 fix: require correct approach direction for touch counting
+        if (price_in_zone && !zone.was_in_zone_prev && config.fix_rc3_touch_direction_check &&
+            bar_history.size() >= 2) {
+            const Bar& prev = bar_history[bar_history.size() - 2];
+            bool correct_approach = (zone.type == ZoneType::SUPPLY)
+                ? (prev.close < zone.proximal_line)   // must rally up from below
+                : (prev.close > zone.proximal_line);  // must pull back from above
+            if (!correct_approach) price_in_zone = false;
         }
 
         if (price_in_zone) {
@@ -2495,6 +2506,17 @@ if (zone.state == ZoneState::VIOLATED && config.skip_retest_after_gap_over) {
             price_in_zone = (current_bar.high  >= zone.proximal_line &&
                              current_bar.low   <= zone.distal_line   &&
                              current_bar.close <= zone.distal_line);
+        }
+        // RC-4 fix: require correct approach direction before allowing an entry signal
+        if (price_in_zone && config.fix_rc4_entry_direction_check && bar_history.size() >= 2) {
+            const Bar& prev = bar_history[bar_history.size() - 2];
+            bool correct_approach = (zone.type == ZoneType::SUPPLY)
+                ? (prev.close < zone.proximal_line)   // SUPPLY: must rally up from below proximal
+                : (prev.close > zone.proximal_line);  // DEMAND: must pull back from above proximal
+            if (!correct_approach) {
+                zones_price_not_in++;
+                price_in_zone = false;
+            }
         }
         if (!price_in_zone) {
             zones_price_not_in++;

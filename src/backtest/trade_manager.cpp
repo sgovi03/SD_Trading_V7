@@ -241,33 +241,15 @@ double TradeManager::execute_entry(const std::string& symbol,
         return price;
     }
 
-    if (!broker) {
-        LOG_ERROR("Broker not available for live execution");
-        return 0.0;
-    }
-
-    // ⭐ GAP-1 FIX: Use place_limit_order() instead of place_market_order().
-    // place_market_order() ignored the intended entry price entirely, filling at
-    // bar.close (CsvSimulatorBroker) or market price (real broker). This caused
-    // fills 5–70 pts past the proximal line, triggering SL rescue and degrading RR.
-    //
-    // place_limit_order() passes the intended entry price (decision.entry_price =
-    // proximal ± aggressiveness × zone_height) to the broker:
-    //   CsvSimulatorBroker: clamps fill to bar range, rejects if bar never reached price
-    //   FyersAdapter:       submits actual limit order at the specified price
-    //
-    // This makes LT entry fills identical to BT: at the limit price or better,
-    // never deep inside the zone at bar.close.
-    OrderResponse response = broker->place_limit_order(symbol, direction, quantity, price);
-
-    if (response.status != OrderStatus::FILLED) {
-        LOG_INFO("LIVE: Limit order not filled (rejected or bar did not reach price): "
-                 + response.message);
-        return 0.0;
-    }
-
-    LOG_INFO("LIVE: Limit order filled @ " + std::to_string(response.filled_price));
-    return response.filled_price;
+    // In LIVE mode the actual entry order is submitted by LiveEngine via the
+    // SignalConsumer path (correct quantity in lots, with zone metadata).
+    // Calling broker->place_limit_order() here submits a SECOND duplicate order via
+    // multipleOrderSubmit with raw units (lots × lot_size) instead of lots, which
+    // causes the broker to receive the wrong quantity. Skip the broker call and
+    // return the intended entry price directly; the fill is confirmed via the
+    // SignalConsumer submission.
+    LOG_INFO("LIVE: Limit order filled @ " + std::to_string(price));
+    return price;
 }
 
 double TradeManager::execute_exit(const std::string& symbol,
@@ -276,31 +258,18 @@ double TradeManager::execute_exit(const std::string& symbol,
                                   double price) {
     if (mode == ExecutionMode::BACKTEST) {
         // Simulated execution
-        LOG_INFO("SIMULATED: Exit " + direction + " " + std::to_string(quantity) + 
+        LOG_INFO("SIMULATED: Exit " + direction + " " + std::to_string(quantity) +
                 " @ " + std::to_string(price));
         return price;  // Perfect fill in backtest
     }
 
-    if (!broker) {
-        LOG_ERROR("Broker not available for live execution");
-        return 0.0;
-    }
-
-    OrderResponse response = broker->place_market_order(symbol, direction, quantity);
-
-    if (response.status != OrderStatus::FILLED) {
-        LOG_ERROR("Exit order failed: " + response.message);
-        // Use the intended exit price rather than 0.0 — returning 0.0 corrupts
-        // pnl_per_unit (entry - 0 = full entry price as profit/loss), triggering
-        // the PnL sanity guard and aborting the process. The intended price is
-        // our best estimate of where the fill occurred even if confirmation failed.
-        LOG_WARN("Exit broker call failed — recording intended exit price " +
-                 std::to_string(price) + " to preserve P&L integrity");
-        return price;
-    }
-
-    LOG_INFO("LIVE: Position closed @ " + std::to_string(response.filled_price));
-    return response.filled_price;
+    // In LIVE mode the actual exit (squareOff) is submitted by LiveEngine via
+    // order_submitter_->submit_exit_order(). Calling broker->place_market_order()
+    // here would submit a SECOND order via multipleOrderSubmit, which creates an
+    // unintended new opposing position on the broker (e.g. a new LONG opened while
+    // closing a SHORT). The fill price is corrected by fix_exit_price() in LiveEngine.
+    LOG_INFO("LIVE: Position closed @ " + std::to_string(price));
+    return price;
 }
 
 bool TradeManager::enter_trade(const EntryDecision& decision,

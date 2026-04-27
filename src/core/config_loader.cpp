@@ -904,6 +904,16 @@ bool ConfigLoader::parse_section_trade_and_runtime_extended(const std::string& k
             config.bb_bandwidth_min = std::stod(value);
         } else if (key == "bb_bandwidth_max") {
             config.bb_bandwidth_max = std::stod(value);
+        } else if (key == "fix_rc1_formation_bar_pin") {
+            config.fix_rc1_formation_bar_pin = parse_bool(value);
+        } else if (key == "fix_rc2_merge_clears_history") {
+            config.fix_rc2_merge_clears_history = parse_bool(value);
+        } else if (key == "fix_rc3_touch_direction_check") {
+            config.fix_rc3_touch_direction_check = parse_bool(value);
+        } else if (key == "fix_rc4_entry_direction_check") {
+            config.fix_rc4_entry_direction_check = parse_bool(value);
+        } else if (key == "fix_rc5_initial_touch_formula") {
+            config.fix_rc5_initial_touch_formula = parse_bool(value);
         } else {
             return false;
         }

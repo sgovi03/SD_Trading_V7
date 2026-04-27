@@ -1,0 +1,1 @@
+ython live_sim_v8.py --csv ..\data\LiveTest\test_nifty_fut_5mins.csv --symbol NIFTY-FUT --interval .05
