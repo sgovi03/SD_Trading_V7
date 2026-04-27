@@ -1,0 +1,1 @@
+g++ -std=c++17 -O2 -o ZonesToCsv.exe ZonesToCsv.cpp

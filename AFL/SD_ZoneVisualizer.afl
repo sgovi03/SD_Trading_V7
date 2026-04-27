@@ -1,0 +1,208 @@
+// =============================================================================
+// SD_ZoneVisualizer.afl
+// SD Trading V8 — Supply Demand Zone Visualizer
+// Reads zones_export.csv and draws zone boxes on the AmiBroker chart.
+//
+// How it works:
+//   - SetBarsRequired forces AFL to re-run on every new bar close (5-min)
+//   - fopen/fgets reads the CSV line by line
+//   - styleCloud fills zone bands, Plot draws border lines, GfxTextOut labels
+//
+// Setup:
+//   1. Run ZonesToCsv.exe (keeps CSV fresh every 5 min)
+//   2. Apply this AFL to your NIFTY-FUT 5-min chart
+//   3. Zones auto-refresh on every bar close
+//
+// CSV columns (0-based index):
+//   0=zone_id  1=type     2=proximal       3=distal      4=state
+//   5=touch    6=score    7=is_elite(0/1)  8=formation   9=rr
+//  10=rationale           11=departure_imbalance
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Parameters — all use Param() to avoid type errors
+// ---------------------------------------------------------------------------
+CSV_PATH      = ParamStr( "CSV Path", "D:\\SD_System\\SD_Volume_OI\\Scanner\\SD_Trading_V8\\results\\live_trades\\Nifty_FUT_zones_export.csv" );
+
+PRICE_WINDOW  = Param( "Price window pts", 600, 50, 3000, 50 );
+SHOW_TESTED   = Param( "Show TESTED   (1=Yes 0=No)", 1, 0, 1, 1 );
+SHOW_FRESH    = Param( "Show FRESH    (1=Yes 0=No)", 1, 0, 1, 1 );
+SHOW_VIOLATED = Param( "Show VIOLATED (1=Yes 0=No)", 0, 0, 1, 1 );
+ELITE_ONLY    = Param( "Elite only    (1=Yes 0=No)", 0, 0, 1, 1 );
+MIN_SCORE     = Param( "Min score filter", 0, 0, 100, 5 );
+ZONE_OPACITY  = Param( "Zone fill opacity (1=light 10=solid)", 3, 1, 10, 1 );
+LABEL_MODE    = Param( "Label detail (0=Score 1=+Touch 2=Full)", 1, 0, 2, 1 );
+
+// ---------------------------------------------------------------------------
+// Force re-run on every bar close
+// ---------------------------------------------------------------------------
+SetBarsRequired( sbrAll, 0 );
+
+// ---------------------------------------------------------------------------
+// Colour helpers
+// ---------------------------------------------------------------------------
+function ZoneFillColor( ztype, state, opacity )
+{
+    local factor, clr;
+    factor = 1 - ( opacity / 10 );
+
+    if ( state == "VIOLATED" )
+        clr = ColorBlend( ColorRGB(150,150,150), colorWhite, factor );
+    else if ( ztype == "SUPPLY" )
+        clr = ColorBlend( ColorRGB(220, 80, 50), colorWhite, factor );
+    else
+        clr = ColorBlend( ColorRGB( 80,180, 80), colorWhite, factor );
+
+    return clr;
+}
+
+function ZoneBorderColor( ztype, state, is_elite )
+{
+    local clr;
+
+    if ( state == "VIOLATED" )
+        clr = ColorRGB(160,160,160);
+    else if ( state == "FRESH" )
+        clr = ColorRGB( 30,100,200);
+    else if ( is_elite == 1 AND ztype == "SUPPLY" )
+        clr = ColorRGB(180, 30, 10);
+    else if ( is_elite == 1 )
+        clr = ColorRGB( 20,140, 20);
+    else if ( ztype == "SUPPLY" )
+        clr = ColorRGB(200, 80, 50);
+    else
+        clr = ColorRGB( 60,160, 60);
+
+    return clr;
+}
+
+// ---------------------------------------------------------------------------
+// Label builder
+// LABEL_MODE: 0=score only  1=score+touch  2=full
+// ---------------------------------------------------------------------------
+function BuildLabel( zid, ztype, state, score, touch, rr, rationale, dep_imbal, is_elite )
+{
+    local lbl;
+    lbl = "#" + NumToStr( zid, 1, 0 ) + " " + ztype
+              + " S:" + NumToStr( score, 1, 1 );
+
+    if ( LABEL_MODE >= 1 )
+        lbl = lbl + " T:" + NumToStr( touch, 1, 0 );
+
+    if ( LABEL_MODE >= 2 )
+        lbl = lbl + " RR:" + NumToStr( rr,       1, 2 )
+                  + " DI:" + NumToStr( dep_imbal, 1, 2 )
+                  + " "    + rationale;
+
+    if ( is_elite == 1 )
+        lbl = lbl + " *ELITE*";
+
+    return lbl;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+ltp     = LastValue( Close );
+priceHi = ltp + PRICE_WINDOW;
+priceLo = ltp - PRICE_WINDOW;
+
+fh = fopen( CSV_PATH, "r" );
+
+if ( fh == 0 )
+{
+    GfxSelectFont( "Arial", 12, 700 );
+    GfxSetTextColor( colorRed );
+    GfxTextOut( "zones_export.csv not found — is ZonesToCsv.exe running?", 20, 40 );
+}
+else
+{
+    zonesDrawn = 0;
+
+    while ( ! feof(fh) )
+    {
+        line = fgets(fh);
+
+        // Skip blank, comment and header lines
+        if ( StrLen(line) < 5 )              continue;
+        if ( StrLeft(line, 1) == "#" )        continue;
+        if ( StrLeft(line, 7) == "zone_id" )  continue;
+
+        // ---- Parse columns ----
+        zid       = StrToNum( StrExtract(line,  0) );
+        ztype     =           StrExtract(line,  1);
+        proximal  = StrToNum( StrExtract(line,  2) );
+        distal    = StrToNum( StrExtract(line,  3) );
+        state     =           StrExtract(line,  4);
+        touch     = StrToNum( StrExtract(line,  5) );
+        score     = StrToNum( StrExtract(line,  6) );
+        is_elite  = StrToNum( StrExtract(line,  7) );
+        fdate     =           StrExtract(line,  8);
+        rr        = StrToNum( StrExtract(line,  9) );
+        rationale =           StrExtract(line, 10);
+        dep_imbal = StrToNum( StrExtract(line, 11) );
+
+        // ---- Filters ----
+        if ( ELITE_ONLY == 1  AND  is_elite == 0 ) continue;
+        if ( score < MIN_SCORE )                   continue;
+
+        if ( state == "FRESH"    AND  SHOW_FRESH    == 0 ) continue;
+        if ( state == "TESTED"   AND  SHOW_TESTED   == 0 ) continue;
+        if ( state == "VIOLATED" AND  SHOW_VIOLATED == 0 ) continue;
+
+        // ---- Price window filter ----
+        zmid = ( proximal + distal ) / 2;
+        if ( zmid > priceHi OR zmid < priceLo ) continue;
+
+        // ---- Normalise top / bottom ----
+        zTop    = Max( proximal, distal );
+        zBottom = Min( proximal, distal );
+
+        // ---- Draw filled zone band ----
+        fillClr   = ZoneFillColor(   ztype, state, ZONE_OPACITY );
+        borderClr = ZoneBorderColor( ztype, state, is_elite );
+
+        zTopArr    = IIf( True, zTop,    zTop    );
+        zBottomArr = IIf( True, zBottom, zBottom );
+
+        PlotOHLC(
+            zTopArr, zTopArr, zBottomArr, zBottomArr,
+            "",
+            fillClr,
+            styleCloud | styleNoLabel,
+            zBottomArr, zTopArr
+        );
+
+        // ---- Border lines (proximal and distal price levels) ----
+        Plot( zTopArr,    "", borderClr, styleLine | styleNoLabel, 0, 0, 0, -1, 1 );
+        Plot( zBottomArr, "", borderClr, styleLine | styleNoLabel, 0, 0, 0, -1, 1 );
+
+        // ---- Zone label using PlotText (native price/bar coordinates) ----
+        lbl = BuildLabel( zid, ztype, state, score, touch, rr, rationale, dep_imbal, is_elite );
+
+        txtColor = borderClr;
+        if ( state == "VIOLATED" ) txtColor = ColorRGB(130,130,130);
+
+        // PlotText( text, bar, price, color, bgColor )
+        // Anchor label 3 bars before last visible bar, just above zone top
+        labelBar = Status("lastvisiblebar") - 3;
+        PlotText( lbl, labelBar, zTop + 2, txtColor, colorBlack );
+
+        zonesDrawn = zonesDrawn + 1;
+    }
+
+    fclose(fh);
+
+    // ---- LTP dashed line ----
+    ltpArr = IIf( True, ltp, ltp );
+    Plot( ltpArr, "LTP", ColorRGB(30,100,200),
+          styleLine | styleDashed | styleNoLabel, 0, 0, 0, -1, 2 );
+
+    // ---- Title bar ----
+    Title = EncodeColor(colorWhite)  + "SD Zone Visualizer  "
+          + EncodeColor(colorYellow) + Name() + "  "
+          + EncodeColor(colorWhite)  + "LTP: "     + NumToStr(ltp, 1, 2)       + "  "
+          + EncodeColor(colorLime)   + "Zones: "   + NumToStr(zonesDrawn, 1, 0) + "  "
+          + EncodeColor(ColorRGB(128,128,128))   + "Window: ±" + PRICE_WINDOW + " pts";
+}

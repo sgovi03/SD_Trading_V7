@@ -1,0 +1,1 @@
+ZonesToCsv.exe ..\results\live_trades\zones_live_NIFTY_FUT_master.json ..\results\live_trades\Nifty_FUT_zones_export.csv 300
